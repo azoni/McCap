@@ -1,0 +1,32 @@
+services:
+  - type: worker                      # <- long-lived background process
+    name: mccap
+    env: python
+    plan: starter                     # pick the plan you want in the UI
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -u run.py   # -u = unbuffered logs
+    autoDeploy: true
+    scaling:
+      minInstances: 1
+      maxInstances: 1                 # avoid duplicate posts
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: DISCORD_TOKEN
+        sync: false                   # set in dashboard
+      - key: BITQUERY_API_KEY
+        sync: false                   # set in dashboard
+      - key: MORALIS_API_KEY
+        sync: false                   # set in dashboard
+      - key: GRADUATED_CHANNEL
+        value: "1315787669980319757"
+      - key: BITQUERY_STREAM_URL
+        value: "wss://streaming.bitquery.io/eap"
+      - key: GRAD_STREAM_ENABLE
+        value: "1"
+      - key: GRAD_STREAM_POST
+        value: "0"                    # set "1" to live-post every stream event
+      - key: MIN_MC_DISPLAY
+        value: "100000"
+      - key: BITQUERY_DEBUG
+        value: "1"
