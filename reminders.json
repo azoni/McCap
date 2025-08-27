@@ -1,0 +1,145 @@
+[
+  {
+    "ca": "ESBCnCXtEZDmX8QnHU6qMZXd9mvjSAZVoYaLKKADBAGS",
+    "target_mc": 10000000.0,
+    "direction": "above",
+    "channel_id": 1314739008760315925,
+    "creator_id": 264105570703900672,
+    "guild_id": 694669381812224000,
+    "name": "WIF HAT",
+    "symbol": "HAT",
+    "note": ""
+  },
+  {
+    "ca": "6AJcP7wuLwmRYLBNbi825wgguaPsWzPBEHcHndpRpump",
+    "target_mc": 30000000.0,
+    "direction": "below",
+    "channel_id": 1314739008760315925,
+    "creator_id": 264105570703900672,
+    "guild_id": 694669381812224000,
+    "name": "Vine Coin",
+    "symbol": "VINE",
+    "note": ""
+  },
+  {
+    "ca": "EfgEGG9PxLhyk1wqtqgGnwgfVC7JYic3vC9BCWLvpump",
+    "target_mc": 2000000.0,
+    "direction": "below",
+    "channel_id": 1315787669980319757,
+    "creator_id": 264105570703900672,
+    "guild_id": 1315787662027653231,
+    "name": "Gyat Coin",
+    "symbol": "GYAT",
+    "note": ""
+  },
+  {
+    "ca": "ESBCnCXtEZDmX8QnHU6qMZXd9mvjSAZVoYaLKKADBAGS",
+    "target_mc": 10000000.0,
+    "direction": "above",
+    "channel_id": 1315787669980319757,
+    "creator_id": 264105570703900672,
+    "guild_id": 1315787662027653231,
+    "name": "BUY THE HAT",
+    "symbol": "BTH",
+    "note": "big pump from somewhere <@377734473015623680>"
+  },
+  {
+    "ca": "0x0b3ae50babe7ffa4e1a50569cee6bdefd4ccaee0",
+    "target_mc": 3050000.0,
+    "direction": "below",
+    "channel_id": 1315787669980319757,
+    "creator_id": 377734473015623680,
+    "guild_id": 1315787662027653231,
+    "name": "717ai by Virtuals",
+    "symbol": "WIRE",
+    "note": ""
+  },
+  {
+    "ca": "HM1qfMccuwNsjPTLUY4bHiYF3bSYzn65hZ5vH1P2MiLL",
+    "target_mc": 2000000.0,
+    "direction": "above",
+    "channel_id": 1315787669980319757,
+    "creator_id": 264105570703900672,
+    "guild_id": 1315787662027653231,
+    "name": "Fishwheel",
+    "symbol": "FSHWHL",
+    "note": ""
+  },
+  {
+    "ca": "BnszRWbs9LxSzsCUUS57HMTNNtyDHFsnmZ1mVhAYdaos",
+    "target_mc": 2000000.0,
+    "direction": "below",
+    "channel_id": 1315787669980319757,
+    "creator_id": 377734473015623680,
+    "guild_id": 1315787662027653231,
+    "name": "Latina Language Model",
+    "symbol": "LLM",
+    "note": ""
+  },
+  {
+    "ca": "8kyNneQfnratCbwXVGGjaSHaTxuQqHvmiPhp4WTYbonk",
+    "target_mc": 500000.0,
+    "direction": "above",
+    "channel_id": 1315787669980319757,
+    "creator_id": 264105570703900672,
+    "guild_id": 1315787662027653231,
+    "name": "Emmy",
+    "symbol": "EMMY",
+    "note": ""
+  },
+  {
+    "ca": "HM1qfMccuwNsjPTLUY4bHiYF3bSYzn65hZ5vH1P2MiLL",
+    "target_mc": 100000.0,
+    "direction": "below",
+    "channel_id": 1315787669980319757,
+    "creator_id": 377734473015623680,
+    "guild_id": 1315787662027653231,
+    "name": "Fishwheel",
+    "symbol": "FSHWHL",
+    "note": "GENERATIONAL BUY,  BUY NOW"
+  },
+  {
+    "ca": "5EkcKr582FkAPVnRmaDdnkekTtnNRzNNSxmQxqrFpump",
+    "target_mc": 100000.0,
+    "direction": "below",
+    "channel_id": 1315787669980319757,
+    "creator_id": 264105570703900672,
+    "guild_id": 1315787662027653231,
+    "name": "aqc",
+    "symbol": "AQC",
+    "note": ""
+  },
+  {
+    "ca": "zGh48JtNHVBb5evgoZLXwgPD2Qu4MhkWdJLGDAupump",
+    "target_mc": 5700000.0,
+    "direction": "below",
+    "channel_id": 1315787669980319757,
+    "creator_id": 377734473015623680,
+    "guild_id": 1315787662027653231,
+    "name": "The Last Play",
+    "symbol": "retire",
+    "note": "do it"
+  },
+  {
+    "ca": "GNHW5JetZmW85vAU35KyoDcYoSd3sNWtx5RPMTDJpump",
+    "target_mc": 3000000.0,
+    "direction": "below",
+    "channel_id": 1315787669980319757,
+    "creator_id": 377734473015623680,
+    "guild_id": 1315787662027653231,
+    "name": "Goatcoin",
+    "symbol": "GOAT",
+    "note": ""
+  },
+  {
+    "ca": "EfgEGG9PxLhyk1wqtqgGnwgfVC7JYic3vC9BCWLvpump",
+    "target_mc": 4000000.0,
+    "direction": "below",
+    "channel_id": 1315787669980319757,
+    "creator_id": 264105570703900672,
+    "guild_id": 1315787662027653231,
+    "name": "Gyat Coin",
+    "symbol": "GYAT",
+    "note": ""
+  }
+]
