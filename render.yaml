@@ -1,18 +1,17 @@
 services:
   - type: worker
     name: mccap
-    env: python
+    runtime: python
     plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: python -u main.py
     autoDeploy: true
-    scaling:
-      numInstances: 1        # ✅ fixed, no autoscaling (prevents duplicate posts)
+    numInstances: 1        # ✅ fixed single instance (prevents duplicate posts)
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"
       - key: DISCORD_TOKEN
-        sync: false          # set in Render dashboard
+        sync: false
       - key: BITQUERY_API_KEY
         sync: false
       - key: MORALIS_API_KEY
@@ -24,7 +23,7 @@ services:
       - key: GRAD_STREAM_ENABLE
         value: "1"
       - key: GRAD_STREAM_POST
-        value: "0"           # set "1" to live-post each stream event
+        value: "0"
       - key: MIN_MC_DISPLAY
         value: "100000"
       - key: BITQUERY_DEBUG
