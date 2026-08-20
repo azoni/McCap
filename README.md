@@ -37,18 +37,40 @@ pytest -q
 
 ## Deploying on Railway
 
-1. **Create the service** from this repo. `railway.json` selects the `Dockerfile`
-   builder and sets `restartPolicyType: ALWAYS`.
-2. **Add a volume** and mount it at `/data`. This is the important step — Railway's
-   filesystem is ephemeral, so without a volume every deploy starts with an empty
-   alert list. `DATA_DIR` already defaults to `/data` in the Dockerfile.
-3. **Set variables** (see `.env.example`). Only `MCCAP_TOKEN` is strictly required;
-   `DISCORD_TOKEN` works as an alias.
-4. **Keep one replica.** Two instances means duplicate alert posts.
+`railway.json` selects the `Dockerfile` builder and sets `restartPolicyType: ALWAYS`.
 
-To carry over existing alerts, upload the current `reminders.json`, `payments.json`
-and `alerts.json` into the mounted volume before the first boot. The loader
-backfills ids for records written by older versions, so no manual migration is needed.
+```bash
+railway init --name mccap                       # create the project
+railway add --service mccap --repo azoni/McCap --branch main
+railway volume add -m /data -s mccap            # REQUIRED, see below
+```
+
+Then set the variables. Pipe secrets through stdin so they never land in your
+shell history:
+
+```bash
+printf %s "$TOKEN" | railway variable set MCCAP_TOKEN --stdin -s mccap --skip-deploys
+railway variable set DATA_DIR=/data LOG_LEVEL=INFO -s mccap
+```
+
+`.env.example` lists everything that's read. Only `MCCAP_TOKEN` is strictly
+required (`DISCORD_TOKEN` works as an alias).
+
+**The volume is not optional.** Railway's filesystem is ephemeral, so without one
+every deploy starts from an empty alert list. `DATA_DIR` already defaults to
+`/data` in the Dockerfile.
+
+**Keep one replica.** Two instances means every alert posts twice.
+
+To carry existing alerts over, upload the JSON files into the volume before first
+boot:
+
+```bash
+railway volume files upload -v <volume> reminders.json alerts.json payments.json
+```
+
+Records written by older versions are missing the stable alert `id`; the loader
+backfills those on first read and rewrites the file, so no manual migration is needed.
 
 ## How alert polling works
 
