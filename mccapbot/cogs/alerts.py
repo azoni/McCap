@@ -8,9 +8,10 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from .. import history
+from .. import gecko, history
 from ..cache import TOKEN_CACHE_LOCK, token_cache, update_cache
 from ..config import MOVE_DEFAULT_COOLDOWN
+from ..logging_setup import log
 from ..dex import build_token_url, choose_consensus_pair, fetch_dex_token, get_image_url, resolve_mc_value
 from ..helpers import (
     RelativeTargetError,
@@ -103,12 +104,24 @@ class AlertsCog(commands.Cog):
     # ---------------- helpers ----------------
 
     @staticmethod
-    def _scoped(guild_id: int) -> List[Reminder]:
-        return [r for r in reminders if r.guild_id == guild_id]
+    def _scoped(inter: discord.Interaction) -> List[Reminder]:
+        """Alerts visible in this context.
+
+        In a server that means the server's alerts. When the app is invoked
+        from a user installation (a DM, or a server the bot isn't in) there is
+        no guild, so scope to the caller's own alerts across every server —
+        falling back to guild_id 0 would pool every user's private alerts
+        together and show them to each other.
+        """
+        if inter.guild_id:
+            return [r for r in reminders if r.guild_id == inter.guild_id]
+        return [r for r in reminders if r.creator_id == inter.user.id]
 
     @staticmethod
-    def _scoped_moves(guild_id: int) -> List[MoveAlert]:
-        return [m for m in move_alerts if m.guild_id == guild_id]
+    def _scoped_moves(inter: discord.Interaction) -> List[MoveAlert]:
+        if inter.guild_id:
+            return [m for m in move_alerts if m.guild_id == inter.guild_id]
+        return [m for m in move_alerts if m.creator_id == inter.user.id]
 
     @staticmethod
     def _can_manage(user: discord.abc.User) -> bool:
@@ -259,36 +272,53 @@ class AlertsCog(commands.Cog):
         move_alerts.append(mv)
         await save_moves()
 
+        # Seed from historical candles so the alert is live now rather than
+        # half a window from now.
+        armed = False
+        try:
+            if info["mc"]:
+                await gecko.backfill(ca, window_sec, info["mc"])
+                armed = history.pct_change(ca, window_sec, time.time()) is not None
+        except Exception:
+            log.debug("Backfill failed for %s", ca, exc_info=True)
+
         label = {"up": "pumps", "down": "dumps", "both": "moves"}[dir_val]
         every = interval_for_move(mv)
+        readiness = (
+            "✅ Armed now — seeded with historical data."
+            if armed
+            else f"_Warming up: needs about {human_window(window_sec // 2)} of history before it can trigger._"
+        )
         await inter.followup.send(
             f"📊 Momentum alert set for **{info['name']} ({info['symbol']})** — "
             f"fires when it {label} **{percent:g}%** within **{human_window(window_sec)}** "
             f"(now ${humanize(info['mc'])}).\n"
             f"🆔 `{mv.id}` · sampling every {every}s · re-arms after {human_window(cooldown_sec)}\n"
-            f"_Needs about {human_window(window_sec // 2)} of history before it can trigger._"
+            f"{readiness}"
         )
 
     # ---------------- /mc_list ----------------
 
-    @app_commands.command(name="mc_list", description="List this server's alerts")
+    @app_commands.command(name="mc_list", description="List active alerts")
     @app_commands.describe(
         user="Only show alerts created by this user",
         public="Show to everyone (True) or only you (False)",
     )
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     async def mc_list(self, inter: discord.Interaction, user: Optional[discord.User] = None, public: bool = True):
         await inter.response.defer(thinking=True, ephemeral=not public)
 
-        gid = inter.guild_id or 0
-        sr = self._scoped(gid)
-        mv = self._scoped_moves(gid)
+        sr = self._scoped(inter)
+        mv = self._scoped_moves(inter)
         if user:
             sr = [r for r in sr if r.creator_id == user.id]
             mv = [m for m in mv if m.creator_id == user.id]
 
+        where = "in this server" if inter.guild_id else "on your account"
         if not sr and not mv:
             await inter.followup.send(
-                "No active alerts in this server." + (f" (filtered by {user.display_name})" if user else ""),
+                f"No active alerts {where}." + (f" (filtered by {user.display_name})" if user else ""),
                 ephemeral=not public,
             )
             return
@@ -306,7 +336,7 @@ class AlertsCog(commands.Cog):
             color=0x2B90D9,
         )
 
-        pos = {r.id: i for i, r in enumerate(self._scoped(gid), 1)}
+        pos = {r.id: i for i, r in enumerate(self._scoped(inter), 1)}
         headers = ["#", "ID", "Token", "Target", "Current", "By"]
         aligns = ["r", "l", "l", "r", "r", "l"]
         rows_ge, rows_le = [], []
@@ -344,18 +374,17 @@ class AlertsCog(commands.Cog):
     # ---------------- /mc_remove ----------------
 
     async def _remove_autocomplete(self, inter: discord.Interaction, current: str):
-        gid = inter.guild_id or 0
         q = (current or "").lower().strip()
         can_manage = self._can_manage(inter.user)
         out = []
-        for r in self._scoped(gid):
+        for r in self._scoped(inter):
             if not (r.creator_id == inter.user.id or can_manage):
                 continue
             label = f"{r.symbol or r.name} {'≥' if r.direction == 'above' else '≤'} ${humanize(r.target_mc)} ({r.id})"
             if q and q not in label.lower() and q not in r.ca.lower():
                 continue
             out.append(app_commands.Choice(name=label[:100], value=r.id))
-        for m in self._scoped_moves(gid):
+        for m in self._scoped_moves(inter):
             if not (m.creator_id == inter.user.id or can_manage):
                 continue
             arrow = {"up": "▲", "down": "▼", "both": "±"}[m.direction]
@@ -371,11 +400,10 @@ class AlertsCog(commands.Cog):
     async def mc_remove(self, inter: discord.Interaction, alerts: str):
         await inter.response.defer(thinking=False)
 
-        gid = inter.guild_id or 0
-        scoped = self._scoped(gid)
-        scoped_moves = self._scoped_moves(gid)
+        scoped = self._scoped(inter)
+        scoped_moves = self._scoped_moves(inter)
         if not scoped and not scoped_moves:
-            await inter.followup.send("There are no active alerts in this server.")
+            await inter.followup.send("There are no active alerts here.")
             return
 
         # Move alerts are id-only (they aren't numbered in /mc_list).
@@ -448,6 +476,8 @@ class AlertsCog(commands.Cog):
         user="Only alerts created by this user",
         public="Show to everyone (True) or only you (False)",
     )
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     async def mc_recent(
         self,
         inter: discord.Interaction,
@@ -456,8 +486,10 @@ class AlertsCog(commands.Cog):
         public: Optional[bool] = True,
     ):
         await inter.response.defer(thinking=True, ephemeral=not public)
-        gid = inter.guild_id or 0
-        evs = [e for e in alert_events if e.guild_id == gid]
+        if inter.guild_id:
+            evs = [e for e in alert_events if e.guild_id == inter.guild_id]
+        else:
+            evs = [e for e in alert_events if e.creator_id == inter.user.id]
         if user:
             evs = [e for e in evs if e.creator_id == user.id]
         evs.sort(key=lambda e: e.ts, reverse=True)
@@ -480,9 +512,10 @@ class AlertsCog(commands.Cog):
     # ---------------- /mc_status ----------------
 
     @app_commands.command(name="mc_status", description="What the watcher is doing right now")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     async def mc_status(self, inter: discord.Interaction):
         await inter.response.defer(thinking=True, ephemeral=True)
-        gid = inter.guild_id or 0
 
         addresses = list({r.ca for r in reminders} | {m.ca for m in move_alerts})
         async with TOKEN_CACHE_LOCK:
@@ -508,7 +541,8 @@ class AlertsCog(commands.Cog):
                 f"over **{len(addresses)}** token(s)\n"
                 f"≈ **{rate:.0f}** DexScreener req/min (limit 300)\n"
                 f"**{warming}** momentum alert(s) still filling their window\n"
-                f"**{len(self._scoped(gid))}** level alert(s) in this server"
+                f"**{len(self._scoped(inter))}** level alert(s) "
+                f"{'in this server' if inter.guild_id else 'on your account'}"
             ),
             inline=False,
         )

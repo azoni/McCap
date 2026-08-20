@@ -4,7 +4,7 @@ from typing import Dict, Optional
 
 import discord
 
-from . import history
+from . import gecko, history
 from .cache import TOKEN_CACHE_LOCK, token_cache
 from .config import MAX_ALERT_EVENTS, POLL_TICK_SECONDS
 from .dex import build_token_url, choose_consensus_pair, fetch_dex_token, get_image_url, resolve_mc_value
@@ -197,9 +197,55 @@ async def _check_moves(client: discord.Client, snap_by_ca) -> bool:
     return changed
 
 
+async def backfill_move_history() -> None:
+    """Seed history for every momentum alert so a restart isn't blind.
+
+    Without this a restarted bot ignores its momentum alerts for roughly half
+    their window, because pct_change correctly refuses to answer until it has
+    enough span. One GeckoTerminal call per token closes that gap.
+    """
+    if not move_alerts:
+        return
+
+    # Longest window per token — it covers every shorter one for free.
+    want: Dict[str, int] = {}
+    for m in move_alerts:
+        if m.window_sec > want.get(m.ca, 0):
+            want[m.ca] = m.window_sec
+
+    # Needs a live market cap to scale candle prices against.
+    await asyncio.gather(*(_refresh(ca) for ca in want), return_exceptions=True)
+
+    async def one(ca: str, window: int):
+        snap = token_cache.get(ca)
+        if not snap or not snap.mc:
+            return 0
+        try:
+            return await gecko.backfill(ca, window, snap.mc)
+        except Exception:
+            log.debug("Backfill failed for %s", ca, exc_info=True)
+            return 0
+
+    results = await asyncio.gather(*(one(ca, w) for ca, w in want.items()), return_exceptions=True)
+    seeded = sum(r for r in results if isinstance(r, int))
+    ready = sum(
+        1 for m in move_alerts
+        if history.pct_change(m.ca, m.window_sec, time.time()) is not None
+    )
+    log.info(
+        "Seeded %d historical sample(s) across %d token(s); %d/%d momentum alert(s) armed immediately",
+        seeded, len(want), ready, len(move_alerts),
+    )
+
+
 async def watcher(client: discord.Client) -> None:
     await client.wait_until_ready()
     last_rate_log = 0.0
+
+    try:
+        await backfill_move_history()
+    except Exception:
+        log.exception("Momentum history backfill failed; alerts will warm up normally")
 
     while not client.is_closed():
         try:

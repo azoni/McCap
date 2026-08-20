@@ -28,6 +28,25 @@ Discord bot for Solana market-cap alerts and token watchlists.
 Watchlists are read-on-demand: tokens are fetched only when someone runs
 `/watch view`, so a long list costs nothing in the background.
 
+### Where commands work
+
+McCap is **user-installable** — install it to your account and the read-only
+commands work anywhere, including DMs and servers the bot isn't in.
+
+| Works anywhere | Server-only |
+|---|---|
+| `/mc_list`, `/mc_recent`, `/mc_status`, `/mc_lp`, all of `/watch` | `/mc`, `/mc_move`, `/mc_remove` |
+
+Alert *creation* stays server-only for a structural reason: an alert fires
+minutes or days later, and a bot can only post unprompted into a channel it is
+actually in. A `/mc` alert set in a server McCap isn't a member of could never
+be delivered, so the command isn't offered there.
+
+Outside a server there is no guild, so scoping switches from "this server's
+alerts" to "your alerts, across every server", and watchlists become personal
+rather than shared. Both are keyed on the caller — guildless records are *not*
+pooled under a shared id.
+
 ## Alert types
 
 **Level alerts** (`/mc`) fire once and are consumed. Relative targets are
@@ -36,15 +55,22 @@ target — `/mc_list` still shows `2x` so the intent stays readable.
 
 **Momentum alerts** (`/mc_move`) don't know their trigger price in advance. They
 compare the current market cap to a baseline from the past, and re-arm after
-firing rather than being consumed. Two consequences worth knowing:
+firing rather than being consumed (cooldown defaults to 30m, so a volatile token
+can't ping on every tick).
 
-- They need history before they can trigger. A `1h` alert stays quiet for
-  roughly the first 30 minutes. `/mc_status` shows how many are still warming up.
-- Each has a cooldown (default 30m) so a volatile token can't ping on every tick.
+They need history before they can trigger, which is why the bot **backfills from
+GeckoTerminal** — one call per token, on startup and whenever an alert is
+created. In practice that means an alert is armed immediately rather than blind
+for half its window. `/mc_status` shows any that are still warming up (a token
+with no GeckoTerminal pool falls back to collecting samples live).
 
-History is intentionally **not** persisted across restarts. A stale pre-restart
-baseline would report the bot's downtime as a price "move" and fire spuriously,
-so after a deploy momentum alerts simply refill their window.
+Candles are prices, not market caps, so each close is scaled against the live
+market cap from DexScreener's consensus — supply is effectively constant over an
+alert window.
+
+Live history is intentionally **not** persisted across restarts. A stale
+pre-restart baseline would report the bot's downtime as a price "move" and fire
+spuriously; refetching real candles is both correct and cheap.
 
 ## Local development
 
@@ -123,6 +149,17 @@ Tokens are fetched one address per request on purpose: DexScreener's
 multi-address form caps the response at 30 *pairs total* across the whole batch,
 so a token with many pools starves the others and they come back with no market
 cap at all.
+
+## Data sources
+
+| Source | Used for | Key | Limit |
+|---|---|---|---|
+| DexScreener | live MC, liquidity, 24h change, pairs | none | ~300 req/min |
+| GeckoTerminal | historical OHLCV to seed momentum alerts | none | ~30 req/min |
+
+They cross-validate: on a spot check GeckoTerminal's 1h candles over 23h gave
+BONK +8.79% against DexScreener's +9.53% h24. GeckoTerminal has its own rate
+limiter, deliberately separate so backfill can never starve the alert watcher.
 
 ## Data quality notes
 

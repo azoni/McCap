@@ -26,23 +26,47 @@ def _norm(name: Optional[str]) -> str:
     return (name or DEFAULT_LIST).strip().lower()[:32] or DEFAULT_LIST
 
 
-def entries(guild_id: int, list_name: str) -> List[WatchItem]:
-    return [w for w in watchlist if w.guild_id == guild_id and w.list_name == list_name]
+def _owns(w: WatchItem, guild_id: Optional[int], user_id: int) -> bool:
+    """Whether an entry belongs to the caller's current scope.
+
+    In a server, watchlists are shared by the server. Invoked from a user
+    installation there is no guild, so entries are personal — matching on
+    guild_id 0 alone would merge every user's private list into one.
+    """
+    if guild_id:
+        return w.guild_id == guild_id
+    return w.guild_id == 0 and w.added_by == user_id
 
 
-def list_names(guild_id: int) -> List[str]:
-    return sorted({w.list_name for w in watchlist if w.guild_id == guild_id})
+def entries(inter: discord.Interaction, list_name: str) -> List[WatchItem]:
+    return [
+        w for w in watchlist
+        if _owns(w, inter.guild_id, inter.user.id) and w.list_name == list_name
+    ]
+
+
+def list_names(inter: discord.Interaction) -> List[str]:
+    return sorted({w.list_name for w in watchlist if _owns(w, inter.guild_id, inter.user.id)})
 
 
 class WatchCog(commands.Cog):
-    watch = app_commands.Group(name="watch", description="Track a group of tokens in one view")
+    # Watchlists are pull-based — nothing needs to be posted later — so they are
+    # safe to use from a user installation anywhere, unlike alert creation.
+    watch = app_commands.Group(
+        name="watch",
+        description="Track a group of tokens in one view",
+        allowed_installs=app_commands.AppInstallationType(guild=True, user=True),
+        allowed_contexts=app_commands.AppCommandContext(
+            guild=True, dm_channel=True, private_channel=True
+        ),
+    )
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
     async def _list_autocomplete(self, inter: discord.Interaction, current: str):
         q = (current or "").lower()
-        names = list_names(inter.guild_id or 0) or [DEFAULT_LIST]
+        names = list_names(inter) or [DEFAULT_LIST]
         return [app_commands.Choice(name=n, value=n) for n in names if q in n][:25]
 
     # ---------------- /watch add ----------------
@@ -56,10 +80,10 @@ class WatchCog(commands.Cog):
         gid = inter.guild_id or 0
         name = _norm(list)
 
-        if any(w.ca == ca for w in entries(gid, name)):
+        if any(w.ca == ca for w in entries(inter, name)):
             await inter.followup.send(f"`{short_ca(ca)}` is already on **{name}**.")
             return
-        if len(entries(gid, name)) >= MAX_WATCH_PER_LIST:
+        if len(entries(inter, name)) >= MAX_WATCH_PER_LIST:
             await inter.followup.send(
                 f"**{name}** is full ({MAX_WATCH_PER_LIST} tokens). Remove one or start another list."
             )
@@ -79,7 +103,7 @@ class WatchCog(commands.Cog):
         await save_watchlist()
         await inter.followup.send(
             f"👁️ Added **{info['name']} ({info['symbol']})** to **{name}** "
-            f"— MC ${humanize(info['mc'])}, {len(entries(gid, name))} token(s) on this list."
+            f"— MC ${humanize(info['mc'])}, {len(entries(inter, name))} token(s) on this list."
         )
 
     # ---------------- /watch remove ----------------
@@ -88,7 +112,7 @@ class WatchCog(commands.Cog):
         q = (current or "").lower()
         out = []
         for w in watchlist:
-            if w.guild_id != (inter.guild_id or 0):
+            if not _owns(w, inter.guild_id, inter.user.id):
                 continue
             label = f"{w.symbol or w.name} ({w.list_name})"
             if q and q not in label.lower() and q not in w.ca.lower():
@@ -101,11 +125,10 @@ class WatchCog(commands.Cog):
     @app_commands.autocomplete(ca=_token_autocomplete, list=_list_autocomplete)
     async def remove(self, inter: discord.Interaction, ca: str, list: Optional[str] = None):
         await inter.response.defer(thinking=False)
-        gid = inter.guild_id or 0
         name = _norm(list)
         ca = ca.strip()
 
-        hit = next((w for w in entries(gid, name) if w.ca == ca), None)
+        hit = next((w for w in entries(inter, name) if w.ca == ca), None)
         if not hit:
             await inter.followup.send(f"`{short_ca(ca)}` isn't on **{name}**.")
             return
@@ -120,12 +143,11 @@ class WatchCog(commands.Cog):
     @app_commands.autocomplete(list=_list_autocomplete)
     async def view(self, inter: discord.Interaction, list: Optional[str] = None, public: bool = True):
         await inter.response.defer(thinking=True, ephemeral=not public)
-        gid = inter.guild_id or 0
         name = _norm(list)
-        items = entries(gid, name)
+        items = entries(inter, name)
 
         if not items:
-            avail = list_names(gid)
+            avail = list_names(inter)
             extra = f" Available: {', '.join(avail)}." if avail else ""
             await inter.followup.send(f"**{name}** is empty.{extra}", ephemeral=not public)
             return
@@ -176,12 +198,11 @@ class WatchCog(commands.Cog):
     @watch.command(name="lists", description="Show every watchlist in this server")
     async def lists(self, inter: discord.Interaction):
         await inter.response.defer(thinking=True, ephemeral=True)
-        gid = inter.guild_id or 0
-        names = list_names(gid)
+        names = list_names(inter)
         if not names:
             await inter.followup.send("No watchlists yet — create one with `/watch add`.", ephemeral=True)
             return
-        rows = [[n, str(len(entries(gid, n)))] for n in names]
+        rows = [[n, str(len(entries(inter, n)))] for n in names]
         embed = discord.Embed(title="Watchlists", color=0x2B90D9)
         embed.add_field(name="This server", value=fixed_table(["List", "Tokens"], rows, ["l", "r"]), inline=False)
         await inter.followup.send(embed=embed, ephemeral=True)

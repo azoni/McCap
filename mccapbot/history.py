@@ -29,6 +29,33 @@ def record(ca: str, mc: Optional[float], ts: float) -> None:
     s.append((ts, float(mc)))
 
 
+def seed(ca: str, points: Iterable[Tuple[float, float]]) -> int:
+    """Merge historical samples into a token's series, keeping it ordered.
+
+    Backfilled candles are older than anything already collected live, so they
+    cannot simply be appended — the series must stay sorted by timestamp or
+    ``baseline`` would read the wrong end. Existing live samples win on ties,
+    since they came from the same source the alerts are evaluated against.
+    """
+    existing = _series.get(ca)
+    merged: Dict[float, float] = {}
+
+    for ts, mc in points:
+        if mc is not None and mc > 0:
+            merged[float(ts)] = float(mc)
+    added = len(merged)
+
+    if existing:
+        for ts, mc in existing:
+            merged[ts] = mc  # live samples overwrite backfilled ones
+        added = len(merged) - len(existing)
+
+    ordered = sorted(merged.items())
+    s = _series[ca] = deque(maxlen=HISTORY_MAX_SAMPLES)
+    s.extend(ordered)
+    return max(0, added)
+
+
 def prune(ca: str, older_than_ts: float) -> None:
     """Drop samples older than a cutoff."""
     s = _series.get(ca)
