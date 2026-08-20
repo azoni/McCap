@@ -1,14 +1,13 @@
-"""Adaptive polling schedule for market-cap alerts.
+"""Adaptive polling schedule.
 
 The original watcher re-fetched every tracked token every 3 seconds. With 36
 tokens that is 720 requests/minute against a 300/minute limit, so DexScreener
 started refusing calls and alerts fired late or not at all.
 
-A token sitting at $40k with a $10M target does not need second-by-second
-polling; one that is 5% away does. These helpers grade each token by how close
-it is to firing and hand back a per-token refresh interval, which keeps the
-whole sweep comfortably inside the rate limit while making near-miss alerts
-*more* responsive than before.
+Level alerts are graded by how close the token is to firing — a token at $40k
+with a $10M target does not need second-by-second polling, one that is 5% away
+does. Momentum alerts instead need a steady sample rate fine enough to measure
+their window. Each token takes the shortest interval anything asks of it.
 
 Kept free of discord/aiohttp imports so it can be unit tested directly.
 """
@@ -17,6 +16,8 @@ from typing import Dict, Iterable, List, Optional
 
 from .config import (
     HOT_BAND,
+    MOVE_MIN_SECONDS,
+    MOVE_SAMPLE_DIVISOR,
     POLL_COLD_SECONDS,
     POLL_HOT_SECONDS,
     POLL_UNKNOWN_SECONDS,
@@ -54,27 +55,67 @@ def interval_for_reminder(reminder, current_mc: Optional[float]) -> int:
     return interval_for_progress(progress_to_target(reminder.direction, current_mc, reminder.target_mc))
 
 
+def interval_for_move(move) -> int:
+    """Sampling rate for a momentum alert.
+
+    A 1h window sampled once an hour can't detect anything, so sample several
+    times per window — but never faster than MOVE_MIN_SECONDS, or a handful of
+    short-window alerts would dominate the request budget.
+    """
+    return max(MOVE_MIN_SECONDS, int(move.window_sec // max(1, MOVE_SAMPLE_DIVISOR)))
+
+
+def move_ready(move, now: float) -> bool:
+    """False while a momentum alert is still inside its cooldown."""
+    return (now - move.last_fired_ts) >= move.cooldown_sec
+
+
+def move_triggered(direction: str, pct: float, change: Optional[float]) -> bool:
+    """Whether an observed percent change satisfies a momentum alert.
+
+    ``change`` is None when the window has not filled yet. That is explicitly
+    *not* a trigger and must never be coerced to 0.0, or a freshly restarted
+    bot would report "no movement" for every token.
+    """
+    if change is None:
+        return False
+    if direction == "up":
+        return change >= pct
+    if direction == "down":
+        return change <= -pct
+    return abs(change) >= pct
+
+
+def intervals_by_address(
+    reminders: Iterable,
+    moves: Iterable,
+    mc_by_ca: Dict[str, Optional[float]],
+) -> Dict[str, int]:
+    """Shortest refresh interval each address needs, across all its watchers."""
+    out: Dict[str, int] = {}
+
+    def want(ca: str, seconds: int) -> None:
+        cur = out.get(ca)
+        if cur is None or seconds < cur:
+            out[ca] = seconds
+
+    for r in reminders:
+        want(r.ca, interval_for_reminder(r, mc_by_ca.get(r.ca)))
+    for m in moves:
+        want(m.ca, interval_for_move(m))
+    return out
+
+
 def due_addresses(
     reminders: Iterable,
+    moves: Iterable,
     mc_by_ca: Dict[str, Optional[float]],
     last_checked: Dict[str, float],
     now: float,
 ) -> List[str]:
-    """Return the contract addresses whose refresh interval has elapsed.
-
-    Several alerts can watch the same token with different targets, so each
-    address takes the *shortest* interval any of its alerts asks for — the
-    closest-to-firing alert sets the pace and the rest ride along for free.
-    """
-    interval_by_ca: Dict[str, int] = {}
-    for r in reminders:
-        wanted = interval_for_reminder(r, mc_by_ca.get(r.ca))
-        current = interval_by_ca.get(r.ca)
-        if current is None or wanted < current:
-            interval_by_ca[r.ca] = wanted
-
+    """Return the contract addresses whose refresh interval has elapsed."""
     due: List[str] = []
-    for ca, interval in interval_by_ca.items():
+    for ca, interval in intervals_by_address(reminders, moves, mc_by_ca).items():
         seen = last_checked.get(ca)
         if seen is None or (now - seen) >= interval:
             due.append(ca)
@@ -82,7 +123,7 @@ def due_addresses(
 
 
 def describe_tiers(reminders: Iterable, mc_by_ca: Dict[str, Optional[float]]) -> Dict[str, int]:
-    """Count alerts per tier — used by /mc_status for operator visibility."""
+    """Count level alerts per tier — used by /mc_status for operator visibility."""
     tiers = {"hot": 0, "warm": 0, "cold": 0, "unknown": 0}
     for r in reminders:
         p = progress_to_target(r.direction, mc_by_ca.get(r.ca), r.target_mc)
@@ -97,12 +138,10 @@ def describe_tiers(reminders: Iterable, mc_by_ca: Dict[str, Optional[float]]) ->
     return tiers
 
 
-def estimated_requests_per_minute(reminders: Iterable, mc_by_ca: Dict[str, Optional[float]]) -> float:
+def estimated_requests_per_minute(
+    reminders: Iterable,
+    moves: Iterable,
+    mc_by_ca: Dict[str, Optional[float]],
+) -> float:
     """Projected outgoing request rate for the current alert set."""
-    interval_by_ca: Dict[str, int] = {}
-    for r in reminders:
-        wanted = interval_for_reminder(r, mc_by_ca.get(r.ca))
-        current = interval_by_ca.get(r.ca)
-        if current is None or wanted < current:
-            interval_by_ca[r.ca] = wanted
-    return sum(60.0 / i for i in interval_by_ca.values() if i > 0)
+    return sum(60.0 / i for i in intervals_by_address(reminders, moves, mc_by_ca).values() if i > 0)

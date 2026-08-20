@@ -39,7 +39,7 @@ jobs:
                   await bot.load_extension(ext)
               names = sorted(c.qualified_name for c in bot.tree.get_commands())
               print(f"{len(names)} commands:", ", ".join(names))
-              assert len(names) == 10, f"expected 10 slash commands, got {len(names)}"
+              assert len(names) == 8, f"expected 8 slash commands, got {len(names)}"
               await bot.close()
 
           asyncio.run(main())

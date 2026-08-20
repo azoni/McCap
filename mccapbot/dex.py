@@ -2,7 +2,7 @@ import math
 from typing import Dict, List, Optional, Tuple
 
 from .config import DEX_BLACKLIST, DEX_TOKEN_URL, SOLANA_USE_FDV
-from .constants import DEX_ALIASES, LP_VENUES
+from .constants import DEX_ALIASES, LP_VENUES, MAJOR_QUOTES
 from .helpers import _median, _percentile, humanize, is_solana_address
 from .http import dex_limiter, get_json
 
@@ -57,14 +57,26 @@ def _dex_alias(p: Dict) -> str:
     dex_id = (p.get("dexId") or "").lower()
     return DEX_ALIASES.get(dex_id, dex_id)
 
+def _own_pairs(pairs: List[Dict], ca: str) -> List[Dict]:
+    """Pools where this token is the base asset, excluding blacklisted DEXes.
+
+    DexScreener also returns pools where the address appears as the *quote*
+    token; counting those would mix in a different token's metrics.
+    """
+    if is_solana_address(ca):
+        out = [
+            p for p in pairs
+            if p.get("chainId") == "solana" and ((p.get("baseToken") or {}).get("address") == ca)
+        ]
+    else:
+        cal = ca.lower()
+        out = [p for p in pairs if ((p.get("baseToken") or {}).get("address", "").lower() == cal)]
+    return [p for p in out if _not_blacklisted(p)]
+
+
 def choose_consensus_pair(pairs: List[Dict], ca: str):
     if not pairs: return None, 0.0, []
-    if is_solana_address(ca):
-        filtered=[p for p in pairs if p.get("chainId")=="solana" and ((p.get("baseToken") or {}).get("address")==ca)]
-    else:
-        cal=ca.lower()
-        filtered=[p for p in pairs if ((p.get("baseToken") or {}).get("address","").lower()==cal)]
-    filtered=[p for p in filtered if _not_blacklisted(p)]
+    filtered = _own_pairs(pairs, ca)
     if not filtered: return None, 0.0, []
 
     cands=[]; valid=[]
@@ -97,17 +109,87 @@ def choose_consensus_pair(pairs: List[Dict], ca: str):
         if best is None or key<best_key: best,best_key=p,key
     return best, consensus, cands
 
+def _consensus_change_24h(own_pairs: List[Dict], total_liq: float) -> float:
+    """Median 24h price change across pools quoted in a major asset.
+
+    Liquidity alone is not a safe filter here. BONK's single deepest pool is
+    quoted in an obscure token and reports +542,339%, while every SOL/USDC pool
+    agrees on ~11.6%. A pair priced against a junk quote produces a junk price
+    change regardless of how much sits in it, so restrict to recognised quote
+    assets first and take the median of those.
+    """
+    def changes_for(pairs: List[Dict]) -> List[float]:
+        out = []
+        for p in pairs:
+            raw = (p.get("priceChange") or {}).get("h24")
+            if raw is None:
+                continue
+            try:
+                out.append(float(raw))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    major = [
+        p for p in own_pairs
+        if ((p.get("quoteToken") or {}).get("symbol") or "").upper() in MAJOR_QUOTES
+    ]
+    vals = changes_for(major) or changes_for(own_pairs)
+    if not vals:
+        return 0.0
+    return _median(vals)
+
+
+async def token_summary(ca: str) -> Optional[Dict]:
+    """One-shot lookup for display: name, symbol, MC, 24h change, liquidity.
+
+    Used by the watchlist, which is read-on-demand and drives no background
+    polling — so a big watchlist costs nothing until someone looks at it.
+    """
+    data = await fetch_dex_token(ca)
+    if not data or not data.get("pairs"):
+        return None
+    best, consensus, _ = choose_consensus_pair(data["pairs"], ca)
+    if not best:
+        return None
+    base = best.get("baseToken") or {}
+    mc, _src = resolve_mc_value(best, ca)
+
+    # The consensus pair is picked for market-cap accuracy, which can land on a
+    # thin pool — reporting its liquidity alone made BONK look like it had $8k.
+    # Liquidity and volume are therefore totals across every pool for this
+    # token, and the 24h change is resolved by consensus (see below).
+    own = _own_pairs(data["pairs"], ca)
+    liq = vol = 0.0
+    for p in own:
+        p_liq, p_vol, _tx = _liq_vol_tx(p)
+        liq += p_liq
+        vol += p_vol
+
+    change24 = _consensus_change_24h(own, liq)
+
+    return {
+        "ca": ca,
+        "name": base.get("name") or base.get("symbol") or "Token",
+        "symbol": base.get("symbol") or "",
+        "mc": mc,
+        "liq": liq,
+        "vol24": vol,
+        "change24": change24,
+        "pools": len(own),
+        "url": build_token_url(ca, best),
+        "image_url": get_image_url(best, ca),
+        "consensus": consensus,
+    }
+
+
 def build_token_url(ca: str, pair: Optional[Dict]) -> str:
     if is_solana_address(ca): return f"https://gmgn.ai/sol/token/{ca}"
     if pair and pair.get("url"): return pair["url"]
     return "https://dexscreener.com"
 
 def summarize_lp_venues(pairs: List[Dict], ca: str):
-    if is_solana_address(ca):
-        flt=[p for p in pairs if p.get("chainId")=="solana" and ((p.get("baseToken") or {}).get("address")==ca)]
-    else:
-        cal=ca.lower(); flt=[p for p in pairs if ((p.get("baseToken") or {}).get("address","").lower()==cal)]
-    flt=[p for p in flt if _not_blacklisted(p)]
+    flt = _own_pairs(pairs, ca)
     if not flt: return {}, None
 
     agg={}

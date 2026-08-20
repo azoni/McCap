@@ -4,21 +4,30 @@ from typing import Dict, Optional
 
 import discord
 
+from . import history
 from .cache import TOKEN_CACHE_LOCK, token_cache
 from .config import MAX_ALERT_EVENTS, POLL_TICK_SECONDS
 from .dex import build_token_url, choose_consensus_pair, fetch_dex_token, get_image_url, resolve_mc_value
-from .helpers import humanize, meets, username_from_id
+from .helpers import human_window, humanize, meets, username_from_id
 from .logging_setup import log
 from .models import AlertEvent, TokenSnapshot
-from .scheduler import due_addresses, estimated_requests_per_minute
-from .storage import alert_events, reminders, save_alerts, save_reminders
+from .scheduler import due_addresses, estimated_requests_per_minute, move_ready, move_triggered
+from .storage import (
+    alert_events,
+    move_alerts,
+    reminders,
+    save_alerts,
+    save_moves,
+    save_reminders,
+    watched_addresses,
+)
 
 # ca -> monotonic timestamp of last successful refresh
 _last_checked: Dict[str, float] = {}
 
 
 async def _refresh(ca: str) -> None:
-    """Fetch one token and write the result into the shared cache."""
+    """Fetch one token, update the cache, and append to its history series."""
     data = await fetch_dex_token(ca)
 
     mc_val: Optional[float] = None
@@ -34,11 +43,12 @@ async def _refresh(ca: str) -> None:
             quote = ((best.get("quoteToken") or {}).get("symbol") or "").upper()
             img = get_image_url(best, ca) or ""
 
+    now = time.time()
     async with TOKEN_CACHE_LOCK:
         token_cache[ca] = TokenSnapshot(
             mc=mc_val,
             url=(link or build_token_url(ca, None)),
-            updated_ts=time.time(),
+            updated_ts=now,
             source=src,
             dex=dex,
             chain=chain,
@@ -47,23 +57,48 @@ async def _refresh(ca: str) -> None:
             delta=(abs((mc_val or 0) - consensus) if mc_val and consensus else None),
             image_url=img,
         )
+    history.record(ca, mc_val, now)
 
 
-async def _fire(client: discord.Client, rem, current_mc: Optional[float], snap: Optional[TokenSnapshot]) -> None:
-    """Post the alert embed and record the event."""
+def _record_event(rem, current_mc, kind: str, direction: str, target: float) -> None:
+    alert_events.insert(
+        0,
+        AlertEvent(
+            ts=time.time(),
+            ca=rem.ca,
+            name=rem.name,
+            symbol=rem.symbol,
+            direction=direction,
+            target_mc=target,
+            current_mc=current_mc,
+            channel_id=rem.channel_id,
+            guild_id=rem.guild_id,
+            creator_id=rem.creator_id,
+            kind=kind,
+        ),
+    )
+    del alert_events[MAX_ALERT_EVENTS:]
+
+
+async def _fire_level(client: discord.Client, rem, current_mc, snap) -> None:
     ch = await client.fetch_channel(rem.channel_id)
-    url = snap.url if snap else build_token_url(rem.ca, None)
     color = 0x2ECC71 if rem.direction == "above" else 0xE74C3C
-    title = f"{rem.name} ({rem.symbol})"
     desc = (
         f"{'rose above' if rem.direction == 'above' else 'fell below'} "
         f"**${humanize(rem.target_mc)} MC**\nCurrent: **${humanize(current_mc)}**"
     )
+    if rem.spec:
+        desc += f"\nTarget was `{rem.spec}` from ${humanize(rem.anchor_mc)}"
     if rem.note:
         desc += f"\n\n📝 {rem.note}"
 
     user_name = await username_from_id(client, rem.creator_id)
-    embed = discord.Embed(title=title, description=desc, url=url, color=color)
+    embed = discord.Embed(
+        title=f"{rem.name} ({rem.symbol})",
+        description=desc,
+        url=(snap.url if snap else build_token_url(rem.ca, None)),
+        color=color,
+    )
     if snap and snap.image_url:
         embed.set_thumbnail(url=snap.image_url)
     embed.set_footer(text=f"Set by {user_name} • alert {rem.id}")
@@ -73,32 +108,93 @@ async def _fire(client: discord.Client, rem, current_mc: Optional[float], snap: 
         embed=embed,
         allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False, replied_user=False),
     )
-
-    alert_events.insert(
-        0,
-        AlertEvent(
-            ts=time.time(),
-            ca=rem.ca,
-            name=rem.name,
-            symbol=rem.symbol,
-            direction=rem.direction,
-            target_mc=rem.target_mc,
-            current_mc=current_mc,
-            channel_id=rem.channel_id,
-            guild_id=rem.guild_id,
-            creator_id=rem.creator_id,
-        ),
-    )
-    del alert_events[MAX_ALERT_EVENTS:]
-    await save_alerts()
+    _record_event(rem, current_mc, "level", rem.direction, rem.target_mc)
     log.info(
-        "Alert fired | %s | dir=%s target=%s curr=%s id=%s",
-        title,
-        rem.direction,
-        humanize(rem.target_mc),
-        humanize(current_mc),
-        rem.id,
+        "Alert fired | %s (%s) | dir=%s target=%s curr=%s id=%s",
+        rem.name, rem.symbol, rem.direction, humanize(rem.target_mc), humanize(current_mc), rem.id,
     )
+
+
+async def _fire_move(client: discord.Client, mv, change: float, current_mc, snap) -> None:
+    ch = await client.fetch_channel(mv.channel_id)
+    up = change >= 0
+    arrow = "📈" if up else "📉"
+    desc = (
+        f"{arrow} **{change:+.1f}%** in the last {human_window(mv.window_sec)}\n"
+        f"Current: **${humanize(current_mc)}**"
+    )
+    if mv.note:
+        desc += f"\n\n📝 {mv.note}"
+
+    user_name = await username_from_id(client, mv.creator_id)
+    embed = discord.Embed(
+        title=f"{mv.name} ({mv.symbol})",
+        description=desc,
+        url=(snap.url if snap else build_token_url(mv.ca, None)),
+        color=0x2ECC71 if up else 0xE74C3C,
+    )
+    if snap and snap.image_url:
+        embed.set_thumbnail(url=snap.image_url)
+    embed.set_footer(
+        text=f"Set by {user_name} • move {mv.id} • rearms in {human_window(mv.cooldown_sec)}"
+    )
+
+    await ch.send(
+        content=f"<@{mv.creator_id}>",
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False, replied_user=False),
+    )
+    _record_event(mv, current_mc, "move", "up" if up else "down", mv.pct)
+    log.info(
+        "Move fired | %s (%s) | %+.1f%% over %s id=%s",
+        mv.name, mv.symbol, change, human_window(mv.window_sec), mv.id,
+    )
+
+
+async def _check_levels(client: discord.Client, snap_by_ca) -> bool:
+    fired = []
+    for rem in list(reminders):
+        snap = snap_by_ca.get(rem.ca)
+        current = snap.mc if snap else None
+        if not meets(rem.direction, current, rem.target_mc):
+            continue
+        try:
+            await _fire_level(client, rem, current, snap)
+        except Exception:
+            log.exception("Failed to send alert for %s (%s)", rem.name, rem.id)
+        fired.append(rem)
+
+    if not fired:
+        return False
+    # Remove by identity; list positions shift as alerts fire.
+    fired_ids = {r.id for r in fired}
+    reminders[:] = [r for r in reminders if r.id not in fired_ids]
+    await save_reminders()
+    return True
+
+
+async def _check_moves(client: discord.Client, snap_by_ca) -> bool:
+    now = time.time()
+    changed = False
+    for mv in list(move_alerts):
+        if not move_ready(mv, now):
+            continue
+        change = history.pct_change(mv.ca, mv.window_sec, now)
+        if not move_triggered(mv.direction, mv.pct, change):
+            continue
+
+        snap = snap_by_ca.get(mv.ca)
+        try:
+            await _fire_move(client, mv, change, snap.mc if snap else None, snap)
+        except Exception:
+            log.exception("Failed to send move alert for %s (%s)", mv.name, mv.id)
+        mv.last_fired_ts = now
+        changed = True
+
+    if changed:
+        await save_moves()
+        await save_alerts()
+    return changed
 
 
 async def watcher(client: discord.Client) -> None:
@@ -107,57 +203,43 @@ async def watcher(client: discord.Client) -> None:
 
     while not client.is_closed():
         try:
-            if reminders:
+            addresses = watched_addresses()
+            if addresses:
                 async with TOKEN_CACHE_LOCK:
-                    mc_by_ca = {r.ca: (token_cache[r.ca].mc if r.ca in token_cache else None) for r in reminders}
+                    mc_by_ca = {ca: (token_cache[ca].mc if ca in token_cache else None) for ca in addresses}
 
-                now = time.monotonic()
-                due = due_addresses(reminders, mc_by_ca, _last_checked, now)
+                mono = time.monotonic()
+                due = due_addresses(reminders, move_alerts, mc_by_ca, _last_checked, mono)
 
                 if due:
                     results = await asyncio.gather(*(_refresh(ca) for ca in due), return_exceptions=True)
                     for ca, res in zip(due, results):
                         if isinstance(res, Exception):
                             log.debug("Refresh failed for %s: %s", ca, res)
-                        # Stamp regardless so a persistently failing token does not
-                        # get retried on every single tick.
-                        _last_checked[ca] = now
+                        # Stamp regardless so a persistently failing token does
+                        # not get retried on every single tick.
+                        _last_checked[ca] = mono
 
-                # Re-read the cache after refreshing so we compare against fresh data.
                 async with TOKEN_CACHE_LOCK:
-                    snap_by_ca = {r.ca: token_cache.get(r.ca) for r in reminders}
+                    snap_by_ca = {ca: token_cache.get(ca) for ca in addresses}
 
-                fired = []
-                for rem in list(reminders):
-                    snap = snap_by_ca.get(rem.ca)
-                    current = snap.mc if snap else None
-                    if not meets(rem.direction, current, rem.target_mc):
-                        continue
-                    try:
-                        await _fire(client, rem, current, snap)
-                    except Exception:
-                        log.exception("Failed to send alert for %s (%s)", rem.name, rem.id)
-                    fired.append(rem)
+                level_fired = await _check_levels(client, snap_by_ca)
+                await _check_moves(client, snap_by_ca)
 
-                if fired:
-                    # Remove by identity; list positions shift as alerts fire.
-                    fired_ids = {r.id for r in fired}
-                    reminders[:] = [r for r in reminders if r.id not in fired_ids]
-                    await save_reminders()
-                    # Drop schedule entries for tokens nobody watches anymore.
-                    live = {r.ca for r in reminders}
+                if level_fired:
+                    await save_alerts()
+                    live = set(watched_addresses())
                     for ca in [c for c in _last_checked if c not in live]:
                         _last_checked.pop(ca, None)
+                    history.forget(live)
 
-                if now - last_rate_log > 900:
-                    rate = estimated_requests_per_minute(reminders, mc_by_ca)
+                if mono - last_rate_log > 900:
+                    rate = estimated_requests_per_minute(reminders, move_alerts, mc_by_ca)
                     log.info(
-                        "Watching %d alert(s) across %d token(s) — ~%.0f req/min",
-                        len(reminders),
-                        len({r.ca for r in reminders}),
-                        rate,
+                        "Watching %d level + %d move alert(s) across %d token(s) — ~%.0f req/min",
+                        len(reminders), len(move_alerts), len(addresses), rate,
                     )
-                    last_rate_log = now
+                    last_rate_log = mono
         except asyncio.CancelledError:
             raise
         except Exception:

@@ -1,20 +1,30 @@
-from mccapbot.dex import choose_consensus_pair, resolve_mc_value, summarize_lp_venues
+import pytest
+
+from mccapbot.dex import (
+    _consensus_change_24h,
+    _own_pairs,
+    choose_consensus_pair,
+    resolve_mc_value,
+    summarize_lp_venues,
+)
 from mccapbot.tables import fixed_table
 
 SOL_CA = "So11111111111111111111111111111111111111112"
 
 
-def pair(mc=None, fdv=None, liq=0.0, vol=0.0, dex="raydium", chain="solana", ca=SOL_CA, buys=0, sells=0):
+def pair(mc=None, fdv=None, liq=0.0, vol=0.0, dex="raydium", chain="solana", ca=SOL_CA,
+         buys=0, sells=0, quote="SOL", change24=None):
     return {
         "chainId": chain,
         "dexId": dex,
         "baseToken": {"address": ca, "symbol": "TOK", "name": "Token"},
-        "quoteToken": {"symbol": "SOL"},
+        "quoteToken": {"symbol": quote},
         "marketCap": mc,
         "fdv": fdv,
         "liquidity": {"usd": liq},
         "volume": {"h24": vol},
         "txns": {"h24": {"buys": buys, "sells": sells}},
+        "priceChange": ({"h24": change24} if change24 is not None else {}),
         "url": "https://dexscreener.com/solana/x",
     }
 
@@ -68,6 +78,58 @@ def test_summarize_lp_picks_deepest_venue():
     assert best is not None
     assert best[0] == "raydium"
     assert agg["raydium"]["liq"] == 500_000
+
+
+# ---------------- 24h change consensus ----------------
+
+
+def test_junk_quote_pool_cannot_hijack_the_change():
+    """The real BONK case: its deepest pool is quoted in an obscure token and
+    reports +542,339%, while every SOL/USDC pool agrees on ~11.6%."""
+    pairs = [
+        pair(liq=1_481_594, quote="TrumpBucks", change24=542339),
+        pair(liq=108_575, quote="SOL", change24=11.21),
+        pair(liq=104_056, quote="SOL", change24=11.69),
+        pair(liq=102_227, quote="USDC", change24=11.67),
+        pair(liq=68_984, quote="USDC", change24=11.7),
+    ]
+    change = _consensus_change_24h(pairs, total_liq=sum(p["liquidity"]["usd"] for p in pairs))
+    assert 10 < change < 13, f"junk-quote pool leaked into the result: {change}"
+
+
+def test_change_falls_back_when_no_major_quote_exists():
+    """A token only paired against exotic quotes should still report something
+    rather than silently claiming 0%."""
+    pairs = [
+        pair(liq=100, quote="WEIRD", change24=20.0),
+        pair(liq=100, quote="ODD", change24=30.0),
+    ]
+    assert _consensus_change_24h(pairs, total_liq=200) == pytest.approx(25.0)
+
+
+def test_change_is_zero_when_no_data():
+    assert _consensus_change_24h([pair(liq=10, quote="SOL")], total_liq=10) == 0.0
+    assert _consensus_change_24h([], total_liq=0) == 0.0
+
+
+def test_change_median_ignores_a_single_outlier_major_pool():
+    pairs = [
+        pair(liq=100, quote="SOL", change24=10.0),
+        pair(liq=100, quote="SOL", change24=11.0),
+        pair(liq=100, quote="USDC", change24=9999.0),
+    ]
+    assert _consensus_change_24h(pairs, total_liq=300) == pytest.approx(11.0)
+
+
+# ---------------- pair ownership ----------------
+
+
+def test_own_pairs_excludes_other_tokens_and_blacklist():
+    mine = pair(fdv=1_000)
+    other = pair(fdv=1_000, ca="OtherMintAddress1111111111111111111111111")
+    banned = pair(fdv=1_000, dex="heaven")
+    out = _own_pairs([mine, other, banned], SOL_CA)
+    assert out == [mine]
 
 
 def test_fixed_table_autosizes_columns():

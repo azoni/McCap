@@ -4,19 +4,24 @@ import discord
 from discord.ext import commands
 
 from .alerts import watcher as alerts_watcher
-from .config import BALANCE_POLL_SECONDS, DEX_BLACKLIST, DONATION_WALLET, LOG_LEVEL
+from .config import DEX_BLACKLIST, LOG_LEVEL, PRESENCE_REFRESH_SECONDS
 from .http import close_session
 from .logging_setup import log
-from .payments import payments_watcher
-from .solana import get_solana_balance
-from .storage import load_alerts, load_invoices, load_reminders
+from .storage import (
+    load_alerts,
+    load_moves,
+    load_reminders,
+    load_watchlist,
+    move_alerts,
+    reminders,
+    watched_addresses,
+)
 
 # Cogs loaded at startup. Each module exposes `async def setup(bot)`.
 EXTENSIONS = (
     "mccapbot.cogs.alerts",
+    "mccapbot.cogs.watch",
     "mccapbot.cogs.lp",
-    "mccapbot.cogs.payments",
-    "mccapbot.cogs.graduated",
 )
 
 
@@ -31,28 +36,32 @@ class Bot(commands.Bot):
 
     # ---------------- background loops ----------------
 
-    async def _wallet_presence_loop(self):
+    async def _presence_loop(self):
+        """Show what the bot is actually tracking.
+
+        This used to display a donation wallet's SOL balance, which told nobody
+        anything useful now that payments are gone.
+        """
         await self.wait_until_ready()
-        if not DONATION_WALLET:
-            log.info("No valid DONATION_WALLET set; presence loop disabled.")
-            return
         while not self.is_closed():
-            bal = await get_solana_balance(DONATION_WALLET)
-            activity = discord.Activity(
-                type=discord.ActivityType.watching,
-                name=(f"💰 {bal:,.2f} SOL" if bal is not None else "💰 fetching SOL…"),
-            )
+            total = len(reminders) + len(move_alerts)
+            tokens = len(watched_addresses())
+            name = f"{total} alert(s) · {tokens} token(s)" if total else "for /mc alerts"
             try:
-                await self.change_presence(status=discord.Status.online, activity=activity)
+                await self.change_presence(
+                    status=discord.Status.online,
+                    activity=discord.Activity(type=discord.ActivityType.watching, name=name),
+                )
             except Exception:
                 log.exception("Failed to update presence")
-            await asyncio.sleep(BALANCE_POLL_SECONDS)
+            await asyncio.sleep(PRESENCE_REFRESH_SECONDS)
 
     # ---------------- lifecycle ----------------
 
     async def setup_hook(self):
         await load_reminders()
-        await load_invoices()
+        await load_moves()
+        await load_watchlist()
         await load_alerts()
 
         for ext in EXTENSIONS:
@@ -64,9 +73,8 @@ class Bot(commands.Bot):
                 log.exception("Failed to load extension %s", ext)
 
         self._bg_tasks = [
-            asyncio.create_task(self._wallet_presence_loop(), name="wallet-presence"),
+            asyncio.create_task(self._presence_loop(), name="presence"),
             asyncio.create_task(alerts_watcher(self), name="alerts-watcher"),
-            asyncio.create_task(payments_watcher(self), name="payments-watcher"),
         ]
 
         synced = await self.tree.sync()
@@ -82,11 +90,7 @@ class Bot(commands.Bot):
         guilds = ", ".join(f"{g.name}({g.id})" for g in self.guilds) or "none"
         log.info(
             "Logged in as %s (ID %s) | Guilds: [%s] | LOG_LEVEL=%s | DEX_BLACKLIST=%s",
-            self.user,
-            self.user.id,
-            guilds,
-            LOG_LEVEL,
-            sorted(DEX_BLACKLIST),
+            self.user, self.user.id, guilds, LOG_LEVEL, sorted(DEX_BLACKLIST),
         )
 
     async def on_guild_join(self, guild: discord.Guild):
@@ -99,9 +103,3 @@ class Bot(commands.Bot):
     async def sync_global(self, ctx: commands.Context):
         synced = await self.tree.sync()
         await ctx.send(f"🔄 Synced {len(synced)} global slash commands.")
-
-    @commands.command(name="sync_here")
-    @commands.is_owner()
-    async def sync_guild(self, ctx: commands.Context):
-        synced = await self.tree.sync(guild=ctx.guild)
-        await ctx.send(f"🔄 Synced {len(synced)} commands to this guild.")
