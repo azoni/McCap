@@ -1,20 +1,22 @@
-import math, aiohttp
+import math
 from typing import Dict, List, Optional, Tuple
-from .config import DEX_TOKEN_URL, SOLANA_USE_FDV, DEX_BLACKLIST
-from .helpers import is_solana_address
-from .constants import LP_VENUES
-from .helpers import humanize, _percentile, _median
+
+from .config import DEX_BLACKLIST, DEX_TOKEN_URL, SOLANA_USE_FDV
+from .constants import DEX_ALIASES, LP_VENUES
+from .helpers import _median, _percentile, humanize, is_solana_address
+from .http import dex_limiter, get_json
+
 
 async def fetch_dex_token(address: str):
+    """Fetch every pair DexScreener knows about for one token.
+
+    Deliberately one address per call: the multi-address form of this endpoint
+    caps the response at 30 *pairs total* across the whole batch, so a busy
+    token starves the others and they come back with no market cap at all.
+    Rate limiting is handled centrally by ``dex_limiter``.
+    """
     url = DEX_TOKEN_URL.format(address=address.strip())
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as s:
-            async with s.get(url) as r:
-                if r.status != 200:
-                    return None
-                return await r.json()
-    except Exception:
-        return None
+    return await get_json(url, limiter=dex_limiter)
 
 def resolve_mc_value(pair: Dict, ca: str) -> Tuple[Optional[float], str]:
     is_sol = (pair.get("chainId") == "solana") or is_solana_address(ca)
@@ -52,8 +54,8 @@ def _lp_score(liq: float, vol: float, tx: int) -> float:
     return (math.log10(1+liq)*0.5) + (math.log10(1+vol)*0.4) + (math.log10(1+tx)*0.2)
 
 def _dex_alias(p: Dict) -> str:
-    from .constants import DEX_ALIASES
-    return DEX_ALIASES.get((p.get("dexId") or "").lower(), (p.get("dexId") or "").lower())
+    dex_id = (p.get("dexId") or "").lower()
+    return DEX_ALIASES.get(dex_id, dex_id)
 
 def choose_consensus_pair(pairs: List[Dict], ca: str):
     if not pairs: return None, 0.0, []

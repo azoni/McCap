@@ -1,1 +1,13 @@
 .env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+bitquery_healthcheck.json
+
+# Runtime state. Lives on the Railway volume (DATA_DIR) in production and stays
+# local in development — these hold Discord user/guild ids and user-written
+# notes, so they should not be published to a public repo.
+reminders.json
+payments.json
+alerts.json

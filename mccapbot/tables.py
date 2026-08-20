@@ -30,12 +30,36 @@ def payments_table_with_users(items, name_by_id: Dict[int,str]) -> str:
     body="\n".join("  ".join(c(v,w,a) for v,w,a in zip(r,widths,aligns)) for r in rows) or "—"
     return f"```\n{head}\n{sep}\n{body}\n```"
 
-def fixed_table(headers: List[str], rows: List[List[str]]) -> str:
-    widths=[3,8,12,12,10]; aligns=["r","l","r","r","l"]
-    def c(v,w,a): s=str(v); s=s if len(s)<=w else s[:max(1,w-1)]+"…"; return s.rjust(w) if a=="r" else (s.center(w) if a=="c" else s.ljust(w))
-    head="  ".join(c(h,w,'l') for h,w in zip(headers,widths))
-    sep="  ".join("─"*w for w in widths)
-    body="\n".join("  ".join(c(v,w,a) for v,w,a in zip(r,widths,aligns)) for r in rows) or "—"
+def fixed_table(
+    headers: List[str],
+    rows: List[List[str]],
+    aligns: Optional[List[str]] = None,
+    max_width: int = 18,
+) -> str:
+    """Render a monospace table, sizing each column to its widest cell.
+
+    The old version hard-coded five column widths, so any table with a different
+    shape silently truncated or misaligned. Columns now auto-size (capped at
+    ``max_width``) and the alignment list defaults to left for text.
+    """
+    ncols = len(headers)
+    aligns = (aligns or ["l"] * ncols)[:ncols]
+    aligns += ["l"] * (ncols - len(aligns))
+
+    widths = []
+    for i in range(ncols):
+        longest = max([len(str(headers[i]))] + [len(str(r[i])) for r in rows if i < len(r)] or [0])
+        widths.append(min(max(1, longest), max_width))
+
+    def c(v, w, a):
+        s = str(v).replace("\n", " ")
+        if len(s) > w:
+            s = s[: max(1, w - 1)] + "…"
+        return s.rjust(w) if a == "r" else (s.center(w) if a == "c" else s.ljust(w))
+
+    head = "  ".join(c(h, w, "l") for h, w in zip(headers, widths))
+    sep = "  ".join("─" * w for w in widths)
+    body = "\n".join("  ".join(c(v, w, a) for v, w, a in zip(r, widths, aligns)) for r in rows) or "—"
     return f"```\n{head}\n{sep}\n{body}\n```"
 
 # Recent alerts table (one line, At = current cache MC)

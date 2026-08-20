@@ -1,7 +1,6 @@
 import asyncio
 from typing import Dict
 from .models import TokenSnapshot
-from .helpers import humanize
 from .dex import build_token_url
 
 token_cache: Dict[str, TokenSnapshot] = {}

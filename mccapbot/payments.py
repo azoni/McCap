@@ -1,15 +1,18 @@
 import asyncio
 import time
 from typing import Optional
+from urllib.parse import quote
+
 import discord
-from .storage import invoices, save_invoices
-from .config import PAY_EXPIRY_SEC, PAY_POLL_SEC, USDC_MINT, DONATION_WALLET
-from .solana import sol_rpc, _random_pubkey
-from .helpers import to_lamports, is_solana_address
+
+from .config import DONATION_WALLET, PAY_EXPIRY_SEC, PAY_POLL_SEC, USDC_MINT
+from .helpers import is_solana_address
 from .logging_setup import log
+from .solana import sol_rpc
+from .storage import invoices, save_invoices
+
 
 def solana_pay_link(recipient: str, amount: float, *, label: str="McCap", message: str="", reference: str="", spl_token: Optional[str]=None) -> str:
-    from urllib.parse import quote
     qs=[f"amount={amount:.9f}"]
     if reference: qs.append(f"reference={quote(reference)}")
     if label:     qs.append(f"label={quote(label)}")
@@ -18,11 +21,10 @@ def solana_pay_link(recipient: str, amount: float, *, label: str="McCap", messag
     return f"solana:{recipient}?{'&'.join(qs)}"
 
 def qr_url(data: str, size: int = 240) -> str:
-    from urllib.parse import quote
     return f"https://api.qrserver.com/v1/create-qr-code/?size={size}x{size}&data={quote(data)}"
 
-def _sum_usdc_delta_for_wallet(meta: dict, msg: dict, mint: str, owner_wallet: str) -> int:
-    keys = [k.get("pubkey") if isinstance(k, dict) else k for k in (msg.get("message") or {}).get("accountKeys", [])]
+def _sum_usdc_delta_for_wallet(meta: dict, mint: str, owner_wallet: str) -> int:
+    """Total SPL-token credit to owner_wallet for `mint` in one transaction."""
     pre = meta.get("preTokenBalances") or []; post= meta.get("postTokenBalances") or []
     def _tb_map(tbs):
         out={}; 
@@ -71,7 +73,7 @@ async def _find_matching_tx(reference: str, inv) -> Optional[str]:
                 if pre_bal is None or post_bal is None: continue
                 if post_bal - pre_bal >= inv.amount_base: return sig
             else:
-                delta=_sum_usdc_delta_for_wallet(meta, msg, inv.mint, DONATION_WALLET)
+                delta=_sum_usdc_delta_for_wallet(meta, inv.mint, DONATION_WALLET)
                 if delta >= inv.amount_base: return sig
         except Exception:
             continue
@@ -90,7 +92,7 @@ async def payments_watcher(client: discord.Client):
                     await ch.send(f"⌛ Payment `{inv.id}` expired.")
                     log.info(f"Payment expired | id={inv.id} user={inv.user_id} asset={inv.asset}")
                 except Exception:
-                    import logging; logging.exception("Failed to send payment expiry message")
+                    log.exception("Failed to send payment expiry message")
                 continue
             sig = await _find_matching_tx(inv.reference, inv)
             if sig:
@@ -103,7 +105,7 @@ async def payments_watcher(client: discord.Client):
                                   allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False, replied_user=False))
                     log.info(f"Payment confirmed | id={inv.id} user={inv.user_id} asset={inv.asset} sig={sig}")
                 except Exception:
-                    import logging; logging.exception("Failed to send payment confirmation")
+                    log.exception("Failed to send payment confirmation")
         if changed: await save_invoices()
         await asyncio.sleep(PAY_POLL_SEC)
 
@@ -112,6 +114,3 @@ def parse_asset_choice(s: Optional[str]) -> tuple[str,int,Optional[str]]:
     t=s.strip().upper()
     if t=="USDC": return ("USDC", 6, USDC_MINT)
     return ("SOL", 9, None)
-
-def new_invoice_id() -> str:
-    return _random_pubkey()[:6]

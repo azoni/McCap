@@ -1,7 +1,6 @@
 import re, math, time
-from typing import Optional, List, Dict
+from typing import Optional, List
 from .constants import LAMPORTS
-from .config import SOLANA_USE_FDV
 import discord
 
 def is_solana_address(addr: str) -> bool:

@@ -1,10 +1,10 @@
 import os
-import time
 import datetime as dt
 from typing import Any, Dict, List, Optional, Tuple, Set
 
 import aiohttp
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 import pytz
@@ -20,7 +20,22 @@ try:
 except Exception:
     _GQL_AVAILABLE = False
 
+from contextlib import asynccontextmanager
+
+from ..http import get_session
+from ..logging_setup import log
+
 load_dotenv()
+
+
+@asynccontextmanager
+async def _shared_session():
+    """Hand out the process-wide aiohttp session without closing it on exit.
+
+    Drop-in for `async with _shared_session() as session:` so these call
+    sites stop paying a TCP+TLS handshake per request.
+    """
+    yield await get_session()
 
 # ============================ ENV / CONFIG ============================
 
@@ -64,7 +79,7 @@ BAGS_UPDATE_AUTH    = "BAGSB9TpGrZxQbEsrEznv5jXXdwyP6AXerN8aVRiAmcv"   # Bags up
 HEAVEN_PROGRAM      = "HEAVENoP2qxoeuF8Dj2oT1GHEnu49U5mJYkdeC8BAX2o"   # Heaven DEX program
 
 # ----- Real-time stream controls -----
-GRAD_STREAM_ENABLE = os.getenv("GRAD_STREAM_ENABLE", "1").strip() not in ("0","false","False")
+GRAD_STREAM_ENABLE = os.getenv("GRAD_STREAM_ENABLE", "0").strip() in ("1","true","True")
 GRAD_STREAM_URL = _clean_env(os.getenv("BITQUERY_STREAM_URL")) or "wss://streaming.bitquery.io/eap"
 GRAD_STREAM_PROGRAM_ID = _clean_env(os.getenv("LB_PROGRAM_ID")) or RAYDIUM["launchlab"]
 GRAD_STREAM_POST = os.getenv("GRAD_STREAM_POST", "0").strip() in ("1","true","True")  # post live alerts? default off
@@ -89,14 +104,14 @@ def _parse_token_timestamp(t: Dict[str, Any]) -> Optional[dt.datetime]:
     try:
         if isinstance(ts_raw, (int, float)):
             if ts_raw > 1e12:  # ms
-                return dt.datetime.utcfromtimestamp(ts_raw / 1000).replace(tzinfo=dt.timezone.utc)
-            return dt.datetime.utcfromtimestamp(ts_raw).replace(tzinfo=dt.timezone.utc)
+                return dt.datetime.fromtimestamp(ts_raw / 1000, dt.timezone.utc)
+            return dt.datetime.fromtimestamp(ts_raw, dt.timezone.utc)
         s = str(ts_raw)
         if s.endswith("Z"):
             s = s[:-1] + "+00:00"
         return dt.datetime.fromisoformat(s).astimezone(dt.timezone.utc)
     except Exception as e:
-        print(f"[DEBUG] Failed to parse timestamp {ts_raw}: {e}")
+        log.debug(f"Failed to parse timestamp {ts_raw}: {e}")
         return None
 
 def human_money(x: float) -> str:
@@ -273,7 +288,7 @@ async def _bitquery_post(session: aiohttp.ClientSession, payload: Dict[str, Any]
     Prints detailed debug including which mode was used and rate-limit headers.
     """
     if not BITQUERY_API_VALUE:
-        print("[DEBUG] No BITQUERY_API_KEY value set.")
+        log.debug("No BITQUERY_API_KEY value set.")
         return 401, None
 
     url = BITQUERY_ENDPOINT
@@ -281,7 +296,7 @@ async def _bitquery_post(session: aiohttp.ClientSession, payload: Dict[str, Any]
     async def _once(headers: Dict[str, str], mode: str):
         try:
             if BITQUERY_DEBUG:
-                print(f"[DEBUG] Bitquery: POST {url} (mode={mode})")
+                log.debug(f"Bitquery: POST {url} (mode={mode})")
             async with session.post(url, json=payload, headers=headers, timeout=45) as r:
                 txt = await r.text()
                 if BITQUERY_DEBUG:
@@ -290,19 +305,19 @@ async def _bitquery_post(session: aiohttp.ClientSession, payload: Dict[str, Any]
                         "rem": r.headers.get("x-ratelimit-remaining") or r.headers.get("X-RateLimit-Remaining"),
                         "reset": r.headers.get("x-ratelimit-reset") or r.headers.get("X-RateLimit-Reset"),
                     }
-                    print(f"[DEBUG] Bitquery resp status={r.status} ratelimit={rl}")
+                    log.debug(f"Bitquery resp status={r.status} ratelimit={rl}")
                 if r.status != 200:
                     if BITQUERY_DEBUG:
-                        print(f"[DEBUG] Bitquery body (first 300): {txt[:300]}")
+                        log.debug(f"Bitquery body (first 300): {txt[:300]}")
                     return r.status, None
                 try:
                     data = json.loads(txt)
                     return r.status, data
                 except Exception as e:
-                    print(f"[DEBUG] Bitquery JSON parse error: {e}")
+                    log.warning(f"Bitquery JSON parse error: {e}")
                     return r.status, None
         except Exception as e:
-            print(f"[DEBUG] Bitquery POST exception ({mode}): {type(e).__name__}: {e}")
+            log.debug(f"Bitquery POST exception ({mode}): {type(e).__name__}: {e}")
             return 0, None
 
     # Prefer API key unless it looks like a bearer
@@ -312,15 +327,15 @@ async def _bitquery_post(session: aiohttp.ClientSession, payload: Dict[str, Any]
         status, data = await _once(_headers_api_key(BITQUERY_API_VALUE), "x-api-key")
         if status == 200:
             if BITQUERY_DEBUG:
-                print("[DEBUG] Bitquery success using X-API-KEY mode")
+                log.debug("Bitquery success using X-API-KEY mode")
             return status, data
         if status == 401:
-            print("[DEBUG] Bitquery 401 under X-API-KEY, retrying as Bearer")
+            log.debug("Bitquery 401 under X-API-KEY, retrying as Bearer")
 
     # Bearer fallback
     status, data = await _once(_headers_bearer(BITQUERY_API_VALUE), "bearer")
     if status == 200 and BITQUERY_DEBUG:
-        print("[DEBUG] Bitquery success using Bearer mode")
+        log.debug("Bitquery success using Bearer mode")
 
     # Retry on rate-limit or transient
     if status in (429, 500, 502, 503, 504, 0):
@@ -328,30 +343,30 @@ async def _bitquery_post(session: aiohttp.ClientSession, payload: Dict[str, Any]
         mode = "bearer" if (not tried_api or _is_probably_bearer(BITQUERY_API_VALUE)) else "x-api-key"
         headers = _headers_bearer(BITQUERY_API_VALUE) if mode == "bearer" else _headers_api_key(BITQUERY_API_VALUE)
         if BITQUERY_DEBUG:
-            print(f"[DEBUG] Bitquery retry after status {status} (mode={mode})")
+            log.debug(f"Bitquery retry after status {status} (mode={mode})")
         status, data = await _once(headers, mode)
     return status, data
 
 async def _bitquery_healthcheck() -> None:
     """Verify connectivity and log which auth mode works."""
     pv = BITQUERY_API_VALUE
-    print(f"[DEBUG] Bitquery endpoint: {BITQUERY_ENDPOINT}")
-    print(f"[DEBUG] Bitquery API value present: {bool(pv)}   shape: {'bearer-like' if _is_probably_bearer(pv) else 'apikey-like'}")
+    log.debug(f"Bitquery endpoint: {BITQUERY_ENDPOINT}")
+    log.debug(f"Bitquery API value present: {bool(pv)}   shape: {'bearer-like' if _is_probably_bearer(pv) else 'apikey-like'}")
     if not pv:
         return
     payload = {"query": "query HC { Solana { Blocks(limit: {count: 1}) { Time } } }", "variables": {}}
     try:
-        async with aiohttp.ClientSession() as session:
+        async with _shared_session() as session:
             s, d = await _bitquery_post(session, payload)
             if s == 200:
-                print("[DEBUG] Bitquery healthcheck OK ✅")
+                log.debug("Bitquery healthcheck OK ✅")
                 if BITQUERY_DEBUG_DUMP and d:
                     with open("bitquery_healthcheck.json", "w") as f:
                         json.dump(d, f, indent=2)
             else:
-                print(f"[DEBUG] Bitquery healthcheck failed with status {s}")
+                log.debug(f"Bitquery healthcheck failed with status {s}")
     except Exception as e:
-        print(f"[DEBUG] Bitquery healthcheck exception: {type(e).__name__}: {e}")
+        log.debug(f"Bitquery healthcheck exception: {type(e).__name__}: {e}")
 
 # ---------------------------------------------------------------------
 # Dexscreener metrics (for MC/Liq)
@@ -360,16 +375,16 @@ async def _bitquery_healthcheck() -> None:
 async def _dexscreener_info(ca: str) -> Dict[str, Any]:
     url = f"https://api.dexscreener.com/latest/dex/tokens/{ca}"
     try:
-        async with aiohttp.ClientSession() as session:
+        async with _shared_session() as session:
             async with session.get(url, timeout=12) as r:
                 if r.status != 200:
-                    print(f"[DEBUG] Dexscreener {ca} failed HTTP {r.status}")
+                    log.debug(f"Dexscreener {ca} failed HTTP {r.status}")
                     return {}
                 data = await r.json()
 
         pairs = data.get("pairs") or []
         if not pairs:
-            print(f"[DEBUG] Dexscreener {ca} returned no pairs")
+            log.debug(f"Dexscreener {ca} returned no pairs")
             return {}
 
         def score(p):
@@ -388,7 +403,7 @@ async def _dexscreener_info(ca: str) -> Dict[str, Any]:
             "name": (best.get("baseToken") or {}).get("name") or "—",
         }
     except Exception as e:
-        print(f"[DEBUG] Dexscreener error for {ca}: {e}")
+        log.warning(f"Dexscreener error for {ca}: {e}")
         return {}
 
 # ---------------------------------------------------------------------
@@ -402,28 +417,28 @@ async def _pumpfun_get_graduated(limit: int = 100) -> List[Dict[str, Any]]:
     path = "/token/mainnet/exchange/pumpfun/graduated"
     headers = {"X-API-Key": MORALIS_API_KEY}
     if not MORALIS_API_KEY:
-        print("[DEBUG] No MORALIS_API_KEY set")
+        log.debug("No MORALIS_API_KEY set")
         return []
 
-    async with aiohttp.ClientSession() as session:
+    async with _shared_session() as session:
         for base in (MORALIS_GW, MORALIS_DI):
             url = base + path
             try:
                 async with session.get(url, headers=headers, params={"limit": str(limit)}, timeout=20) as r:
                     if r.status != 200:
-                        print(f"[DEBUG] PumpFun Moralis {base} HTTP {r.status}")
+                        log.debug(f"PumpFun Moralis {base} HTTP {r.status}")
                         continue
                     data = await r.json()
                 if isinstance(data, list):
-                    print(f"[DEBUG] PumpFun Moralis {base} returned list len={len(data)}")
+                    log.debug(f"PumpFun Moralis {base} returned list len={len(data)}")
                     return data
                 if isinstance(data, dict):
                     arr = data.get("result") or data.get("results") or data.get("items") or data.get("data")
                     if isinstance(arr, list):
-                        print(f"[DEBUG] PumpFun Moralis {base} returned dict list len={len(arr)}")
+                        log.debug(f"PumpFun Moralis {base} returned dict list len={len(arr)}")
                         return arr
             except Exception as e:
-                print(f"[DEBUG] PumpFun Moralis failed {base}{path} -> {e}")
+                log.debug(f"PumpFun Moralis failed {base}{path} -> {e}")
                 continue
     return []
 
@@ -449,16 +464,16 @@ async def _bonk_get_graduated_bitquery(start_time: dt.datetime, end_time: dt.dat
                    (helps when trades accompany graduation)
     """
     if not BITQUERY_API_VALUE:
-        print("[DEBUG] No Bitquery value set in .env (BITQUERY_API_KEY).")
+        log.debug("No Bitquery value set in .env (BITQUERY_API_KEY).")
         return []
 
     start_iso = start_time.strftime("%Y-%m-%dT%H:%M:%S")
     end_iso = end_time.strftime("%Y-%m-%dT%H:%M:%S")
 
     if BITQUERY_DEBUG:
-        print("[DEBUG] === Bitquery LaunchLab Graduates ===")
-        print(f"[DEBUG] Window UTC:   {start_iso} -> {end_iso}")
-        print(f"[DEBUG] Window PT:    {start_time.astimezone(PACIFIC_TZ).isoformat()} -> {end_time.astimezone(PACIFIC_TZ).isoformat()}")
+        log.debug("=== Bitquery LaunchLab Graduates ===")
+        log.debug(f"Window UTC:   {start_iso} -> {end_iso}")
+        log.debug(f"Window PT:    {start_time.astimezone(PACIFIC_TZ).isoformat()} -> {end_time.astimezone(PACIFIC_TZ).isoformat()}")
 
     graduates: Dict[str, Dict[str, Any]] = {}
 
@@ -490,24 +505,24 @@ async def _bonk_get_graduated_bitquery(start_time: dt.datetime, end_time: dt.dat
     """
     variables = {"from": start_iso, "till": end_iso, "prog": RAYDIUM["launchlab"]}
 
-    async with aiohttp.ClientSession() as session:
+    async with _shared_session() as session:
         if BITQUERY_DEBUG:
-            print("[DEBUG] Query A: LaunchLab migrations (migrate_to_amm / migrate_to_cpswap)")
+            log.debug("Query A: LaunchLab migrations (migrate_to_amm / migrate_to_cpswap)")
         sA, dA = await _bitquery_post(session, {"query": instr_query, "variables": variables})
         rowsA = (((dA or {}).get("data") or {}).get("Solana") or {}).get("Instructions") or []
-        print(f"[DEBUG] Query A status={sA} rows={len(rowsA)} data_present={bool(dA)}")
+        log.debug(f"Query A status={sA} rows={len(rowsA)} data_present={bool(dA)}")
         if BITQUERY_DEBUG_DUMP and dA:
             with open("bitquery_launchlab_migrations.json", "w") as f:
                 json.dump(dA, f, indent=2)
 
         if rowsA:
             # show sample
-            print("[DEBUG] Query A sample (up to 5):")
+            log.debug("Query A sample (up to 5):")
             for r in rowsA[:5]:
                 method = ((r.get("Instruction") or {}).get("Program") or {}).get("Method")
                 ts = (r.get("Block") or {}).get("Time")
                 sig = (r.get("Transaction") or {}).get("Signature")
-                print(f"    - {ts} | {method} | tx={sig}")
+                log.debug(f"    - {ts} | {method} | tx={sig}")
 
             # extract mints from accounts
             for r in rowsA:
@@ -526,7 +541,7 @@ async def _bonk_get_graduated_bitquery(start_time: dt.datetime, end_time: dt.dat
         # --------- B) Fallback: broadened trades on launchpad/program address ---------
         if not graduates:
             if BITQUERY_DEBUG:
-                print("[DEBUG] No migrations found in window — trying trades fallback (protocol OR program)")
+                log.debug("No migrations found in window — trying trades fallback (protocol OR program)")
 
             trades_query = """
             query LaunchpadTrades($from: DateTime, $till: DateTime, $prog: String!) {
@@ -553,17 +568,17 @@ async def _bonk_get_graduated_bitquery(start_time: dt.datetime, end_time: dt.dat
             """
             sB, dB = await _bitquery_post(session, {"query": trades_query, "variables": variables})
             rowsB = (((dB or {}).get("data") or {}).get("Solana") or {}).get("DEXTradeByTokens") or []
-            print(f"[DEBUG] Query B status={sB} rows={len(rowsB)} data_present={bool(dB)}")
+            log.debug(f"Query B status={sB} rows={len(rowsB)} data_present={bool(dB)}")
             if BITQUERY_DEBUG_DUMP and dB:
                 with open("bitquery_launchpad_trades.json", "w") as f:
                     json.dump(dB, f, indent=2)
 
             if rowsB:
-                print("[DEBUG] Query B sample (up to 5):")
+                log.debug("Query B sample (up to 5):")
                 for r in rowsB[:5]:
                     cur = (r.get("Trade") or {}).get("Currency") or {}
                     dex = (r.get("Trade") or {}).get("Dex") or {}
-                    print(f"    - {r.get('Block',{}).get('Time')} | mint={cur.get('MintAddress')} sym={cur.get('Symbol')} proto={dex.get('ProtocolName')} prog={dex.get('ProgramAddress')}")
+                    log.debug(f"    - {r.get('Block',{}).get('Time')} | mint={cur.get('MintAddress')} sym={cur.get('Symbol')} proto={dex.get('ProtocolName')} prog={dex.get('ProgramAddress')}")
                 for r in rowsB:
                     cur = (r.get("Trade") or {}).get("Currency") or {}
                     mint = cur.get("MintAddress")
@@ -578,11 +593,11 @@ async def _bonk_get_graduated_bitquery(start_time: dt.datetime, end_time: dt.dat
                             "source": "launchpad_trades",
                         }
 
-    print(f"[DEBUG] Bonk (LaunchLab) unique tokens: {len(graduates)}")
+    log.debug(f"Bonk (LaunchLab) unique tokens: {len(graduates)}")
     if graduates and BITQUERY_DEBUG:
-        print("[DEBUG] Unique mint sample (up to 5):")
+        log.debug("Unique mint sample (up to 5):")
         for m, info in list(graduates.items())[:5]:
-            print(f"    - {info['timestamp']} | {m}")
+            log.debug(f"    - {info['timestamp']} | {m}")
 
     return list(graduates.values())
 
@@ -681,13 +696,13 @@ subscription HeavenPoolCreates($program: String!) {
 async def _bonk_stream_worker(discord_bot: Optional[discord.Client] = None):
     """Persistent WebSocket subscriber with backoff; stores graduations and optional live post."""
     if not GRAD_STREAM_ENABLE:
-        print("[DEBUG] BONK stream disabled via GRAD_STREAM_ENABLE=0")
+        log.debug("BONK stream disabled via GRAD_STREAM_ENABLE=0")
         return
     if not BITQUERY_API_VALUE:
-        print("[DEBUG] BONK stream not started: missing BITQUERY_API_KEY")
+        log.debug("BONK stream not started: missing BITQUERY_API_KEY")
         return
     if not _GQL_AVAILABLE:
-        print("[DEBUG] BONK stream not started: `gql[websockets]` not installed (`pip install gql[websockets]`)")
+        log.debug("BONK stream not started: `gql[websockets]` not installed (`pip install gql[websockets]`)")
         return
 
     backoff = 1
@@ -701,7 +716,7 @@ async def _bonk_stream_worker(discord_bot: Optional[discord.Client] = None):
                 pong_timeout=10,    # expect a pong within 10s
             )
             async with Client(transport=transport, fetch_schema_from_transport=False) as session:
-                print(f"[DEBUG] BONK stream connected to {GRAD_STREAM_URL}")
+                log.debug(f"BONK stream connected to {GRAD_STREAM_URL}")
                 query = gql(_BONK_SUBSCRIPTION)
                 variables = {"program": GRAD_STREAM_PROGRAM_ID}
                 async for msg in session.subscribe(query, variable_values=variables):
@@ -726,9 +741,9 @@ async def _bonk_stream_worker(discord_bot: Optional[discord.Client] = None):
                         await _bonk_stream_prune()
                         ts_dt = _parse_token_timestamp({"timestamp": ts_iso})
                         pt_str = ts_dt.astimezone(PACIFIC_TZ).strftime("%b %d, %Y • %I:%M:%S %p %Z") if ts_dt else ts_iso
-                        print(
-                            "[GRAD] BONK → Raydium | "
-                            f"method={method} | mint={mint} | tx={sig} | timePT={pt_str}"
+                        log.info(
+                            "BONK → Raydium | method=%s | mint=%s | tx=%s | timePT=%s",
+                            method, mint, sig, pt_str,
                         )
                         if GRAD_STREAM_POST and discord_bot is not None:
                             ch = discord_bot.get_channel(CHANNEL_ID)
@@ -748,27 +763,27 @@ async def _bonk_stream_worker(discord_bot: Optional[discord.Client] = None):
                                 try:
                                     await ch.send(msg_out)
                                 except Exception as e:
-                                    print(f"[DEBUG] BONK stream post error: {e}")
+                                    log.warning(f"BONK stream post error: {e}")
 
             backoff = 1  # reset on clean exit
         except asyncio.CancelledError:
-            print("[DEBUG] BONK stream task cancelled")
+            log.debug("BONK stream task cancelled")
             return
         except Exception as e:
-            print(f"[DEBUG] BONK stream error: {type(e).__name__}: {e}")
+            log.warning(f"BONK stream error: {type(e).__name__}: {e}")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
 async def _bags_stream_worker(discord_bot: Optional[discord.Client] = None):
     """Stream DBC migrations; keep only those that are BAGS (by update authority)."""
     if not GRAD_STREAM_ENABLE:
-        print("[DEBUG] BAGS stream disabled via GRAD_STREAM_ENABLE=0")
+        log.debug("BAGS stream disabled via GRAD_STREAM_ENABLE=0")
         return
     if not BITQUERY_API_VALUE:
-        print("[DEBUG] BAGS stream not started: missing BITQUERY_API_KEY")
+        log.debug("BAGS stream not started: missing BITQUERY_API_KEY")
         return
     if not _GQL_AVAILABLE:
-        print("[DEBUG] BAGS stream not started: `gql[websockets]` not installed (`pip install gql[websockets]`)")
+        log.debug("BAGS stream not started: `gql[websockets]` not installed (`pip install gql[websockets]`)")
         return
 
     backoff = 1
@@ -782,14 +797,14 @@ async def _bags_stream_worker(discord_bot: Optional[discord.Client] = None):
                 pong_timeout=10,
             )
             async with Client(transport=transport, fetch_schema_from_transport=False) as session:
-                print(f"[DEBUG] BAGS stream connected to {GRAD_STREAM_URL}")
+                log.debug(f"BAGS stream connected to {GRAD_STREAM_URL}")
                 query = gql(_BAGS_SUBSCRIPTION)
                 variables = {"program": METEORA_DBC_PROGRAM}
                 async for msg in session.subscribe(query, variable_values=variables):
                     rows = (((msg or {}).get("Solana") or {}).get("Instructions")) or []
                     if not rows:
                         continue
-                    async with aiohttp.ClientSession() as https:
+                    async with _shared_session() as https:
                         for r in rows:
                             ts_iso = (r.get("Block") or {}).get("Time") or _utc_now_iso()
                             sig = (r.get("Transaction") or {}).get("Signature") or ""
@@ -801,7 +816,7 @@ async def _bags_stream_worker(discord_bot: Optional[discord.Client] = None):
                                 try:
                                     is_bags = await _is_bags_mint(https, mint)
                                 except Exception as e:
-                                    print(f"[DEBUG] Bags authority check failed for {mint}: {e}")
+                                    log.debug(f"Bags authority check failed for {mint}: {e}")
                                     is_bags = False
                                 if not is_bags:
                                     continue
@@ -810,9 +825,9 @@ async def _bags_stream_worker(discord_bot: Optional[discord.Client] = None):
                                 await _bags_stream_prune()
                                 ts_dt = _parse_token_timestamp({"timestamp": ts_iso})
                                 pt_str = ts_dt.astimezone(PACIFIC_TZ).strftime("%b %d, %Y • %I:%M:%S %p %Z") if ts_dt else ts_iso
-                                print(
-                                    "[GRAD] BAGS → DAMM | "
-                                    f"method={method} | mint={mint} | tx={sig} | timePT={pt_str}"
+                                log.info(
+                                    "BAGS → DAMM | method=%s | mint=%s | tx=%s | timePT=%s",
+                                    method, mint, sig, pt_str,
                                 )
 
                                 if GRAD_STREAM_POST and discord_bot is not None:
@@ -828,27 +843,27 @@ async def _bags_stream_worker(discord_bot: Optional[discord.Client] = None):
                                         try:
                                             await ch.send(msg_out)
                                         except Exception as e:
-                                            print(f"[DEBUG] BAGS stream post error: {e}")
+                                            log.warning(f"BAGS stream post error: {e}")
 
             backoff = 1
         except asyncio.CancelledError:
-            print("[DEBUG] BAGS stream task cancelled")
+            log.debug("BAGS stream task cancelled")
             return
         except Exception as e:
-            print(f"[DEBUG] BAGS stream error: {type(e).__name__}: {e}")
+            log.warning(f"BAGS stream error: {type(e).__name__}: {e}")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
 async def _heaven_stream_worker(discord_bot: Optional[discord.Client] = None):
     """Stream Heaven pool creates; treat as 'go-live' graduations."""
     if not GRAD_STREAM_ENABLE:
-        print("[DEBUG] HEAVEN stream disabled via GRAD_STREAM_ENABLE=0")
+        log.debug("HEAVEN stream disabled via GRAD_STREAM_ENABLE=0")
         return
     if not BITQUERY_API_VALUE:
-        print("[DEBUG] HEAVEN stream not started: missing BITQUERY_API_KEY")
+        log.debug("HEAVEN stream not started: missing BITQUERY_API_KEY")
         return
     if not _GQL_AVAILABLE:
-        print("[DEBUG] HEAVEN stream not started: `gql[websockets]` not installed (`pip install gql[websockets]`)")
+        log.debug("HEAVEN stream not started: `gql[websockets]` not installed (`pip install gql[websockets]`)")
         return
 
     backoff = 1
@@ -862,7 +877,7 @@ async def _heaven_stream_worker(discord_bot: Optional[discord.Client] = None):
                 pong_timeout=10,
             )
             async with Client(transport=transport, fetch_schema_from_transport=False) as session:
-                print(f"[DEBUG] HEAVEN stream connected to {GRAD_STREAM_URL}")
+                log.debug(f"HEAVEN stream connected to {GRAD_STREAM_URL}")
                 query = gql(_HEAVEN_SUBSCRIPTION)
                 variables = {"program": HEAVEN_PROGRAM}
                 async for msg in session.subscribe(query, variable_values=variables):
@@ -879,9 +894,9 @@ async def _heaven_stream_worker(discord_bot: Optional[discord.Client] = None):
                             await _heaven_stream_prune()
                             ts_dt = _parse_token_timestamp({"timestamp": ts_iso})
                             pt_str = ts_dt.astimezone(PACIFIC_TZ).strftime("%b %d, %Y • %I:%M:%S %p %Z") if ts_dt else ts_iso
-                            print(
-                                "[GRAD] HEAVEN → Pool Created | "
-                                f"method={method} | mint={mint} | tx={sig} | timePT={pt_str}"
+                            log.info(
+                                "HEAVEN → Pool Created | method=%s | mint=%s | tx=%s | timePT=%s",
+                                method, mint, sig, pt_str,
                             )
 
                             if GRAD_STREAM_POST and discord_bot is not None:
@@ -897,14 +912,14 @@ async def _heaven_stream_worker(discord_bot: Optional[discord.Client] = None):
                                     try:
                                         await ch.send(msg_out)
                                     except Exception as e:
-                                        print(f"[DEBUG] HEAVEN stream post error: {e}")
+                                        log.warning(f"HEAVEN stream post error: {e}")
 
             backoff = 1
         except asyncio.CancelledError:
-            print("[DEBUG] HEAVEN stream task cancelled")
+            log.debug("HEAVEN stream task cancelled")
             return
         except Exception as e:
-            print(f"[DEBUG] HEAVEN stream error: {type(e).__name__}: {e}")
+            log.warning(f"HEAVEN stream error: {type(e).__name__}: {e}")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
@@ -915,15 +930,15 @@ async def _heaven_stream_worker(discord_bot: Optional[discord.Client] = None):
 async def _fetch_recent_graduates_all(start: dt.datetime, end: dt.datetime, limit: int = 100) -> Dict[str, List[Dict[str, Any]]]:
     results: Dict[str, List[Dict[str, Any]]] = {}
 
-    print("\n[DEBUG] === Fetching PumpFun tokens ===")
+    log.debug("=== Fetching PumpFun tokens ===")
     results["pumpfun"] = await _pumpfun_get_graduated(limit)
 
-    print("\n[DEBUG] === Fetching Bonk tokens (Raydium LaunchLab via Bitquery) ===")
+    log.debug("=== Fetching Bonk tokens (Raydium LaunchLab via Bitquery) ===")
     query_bonk = await _bonk_get_graduated_bitquery(start, end)
 
-    print("\n[DEBUG] === Snapshot Bonk tokens (stream buffer) ===")
+    log.debug("=== Snapshot Bonk tokens (stream buffer) ===")
     snap_bonk = await _bonk_stream_snapshot(start, end)
-    print(f"[DEBUG] BONK stream snapshot count in window: {len(snap_bonk)}")
+    log.debug(f"BONK stream snapshot count in window: {len(snap_bonk)}")
 
     # Deduplicate: prefer 'launchlab_migration' (query) over 'launchlab_stream'
     dedup: Dict[str, Dict[str, Any]] = {}
@@ -939,17 +954,17 @@ async def _fetch_recent_graduates_all(start: dt.datetime, end: dt.datetime, limi
 
     results["bonk"] = list(dedup.values())
 
-    print("\n[DEBUG] === Snapshot Bags tokens (stream buffer) ===")
+    log.debug("=== Snapshot Bags tokens (stream buffer) ===")
     results["bags"] = await _bags_stream_snapshot(start, end)
-    print(f"[DEBUG] BAGS stream snapshot count in window: {len(results['bags'])}")
+    log.debug(f"BAGS stream snapshot count in window: {len(results['bags'])}")
 
-    print("\n[DEBUG] === Snapshot Heaven tokens (stream buffer) ===")
+    log.debug("=== Snapshot Heaven tokens (stream buffer) ===")
     results["heaven"] = await _heaven_stream_snapshot(start, end)
-    print(f"[DEBUG] HEAVEN stream snapshot count in window: {len(results['heaven'])}")
+    log.debug(f"HEAVEN stream snapshot count in window: {len(results['heaven'])}")
 
-    print("\n[DEBUG] === Fetch Summary ===")
+    log.debug("=== Fetch Summary ===")
     for lp, tokens in results.items():
-        print(f"[DEBUG] {lp}: {len(tokens)} tokens fetched")
+        log.debug(f"{lp}: {len(tokens)} tokens fetched")
     return results
 
 # ---------------------------------------------------------------------
@@ -973,21 +988,54 @@ class GraduatedCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_ready(self):
-        pass
-        # Start real-time streams once
-        # if self._bonk_stream_task is None and GRAD_STREAM_ENABLE and BITQUERY_API_VALUE and _GQL_AVAILABLE:
-        #     self._bonk_stream_task = asyncio.create_task(_bonk_stream_worker(self.bot))
-        #     print("[DEBUG] BONK graduation stream task started.")
-        # if self._bags_stream_task is None and GRAD_STREAM_ENABLE and BITQUERY_API_VALUE and _GQL_AVAILABLE:
-        #     self._bags_stream_task = asyncio.create_task(_bags_stream_worker(self.bot))
-        #     print("[DEBUG] BAGS graduation stream task started.")
-        # if self._heaven_stream_task is None and GRAD_STREAM_ENABLE and BITQUERY_API_VALUE and _GQL_AVAILABLE:
-        #     self._heaven_stream_task = asyncio.create_task(_heaven_stream_worker(self.bot))
-        #     print("[DEBUG] HEAVEN go-live stream task started.")
+        """Start the real-time graduation streams, if enabled.
+
+        These were previously commented out, which silently made the Bags and
+        Heaven snapshots always return empty (they are fed *only* by the
+        streams). They are now behind GRAD_STREAM_ENABLE, which defaults off so
+        Bitquery quota is opt-in — set GRAD_STREAM_ENABLE=1 to turn them on.
+        """
+        if not GRAD_STREAM_ENABLE:
+            return
+        if not (BITQUERY_API_VALUE and _GQL_AVAILABLE):
+            log.warning(
+                "GRAD_STREAM_ENABLE is set but streams cannot start "
+                "(bitquery_key=%s, gql_installed=%s).",
+                bool(BITQUERY_API_VALUE),
+                _GQL_AVAILABLE,
+            )
+            return
+
+        for attr, worker, label in (
+            ("_bonk_stream_task", _bonk_stream_worker, "BONK"),
+            ("_bags_stream_task", _bags_stream_worker, "BAGS"),
+            ("_heaven_stream_task", _heaven_stream_worker, "HEAVEN"),
+        ):
+            if getattr(self, attr) is None:
+                setattr(self, attr, asyncio.create_task(worker(self.bot), name=f"grad-stream-{label.lower()}"))
+                log.info("%s graduation stream task started.", label)
+
+    # ---------------- /graduated_report ----------------
+
+    @app_commands.command(name="graduated_report", description="Show graduated tokens in the past X hours")
+    @app_commands.describe(hours="How many hours back to report (1-24)")
+    async def graduated_report(self, interaction: discord.Interaction, hours: int = 1):
+        hours = max(1, min(int(hours or 1), 24))
+        await interaction.response.defer(thinking=True)
+        # Floor to whole hours so manual runs line up with the hourly task.
+        end = dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0)
+        start = end - dt.timedelta(hours=hours)
+        try:
+            msg = await self.fetch_report(start, end)
+        except Exception as e:
+            log.exception("graduated_report failed")
+            msg = f"⚠️ Graduated report error: {type(e).__name__}: {e}"
+        # Discord caps a single message at 2000 chars.
+        await interaction.followup.send(msg[:1990] if len(msg) > 2000 else msg)
 
     @tasks.loop(hours=1)
     async def hourly_graduated_report(self):
-        print("\n[DEBUG] ========== Starting Hourly Graduated Report ==========")
+        log.debug("========== Starting Hourly Graduated Report ==========")
 
         if not self._healthcheck_done:
             await _bitquery_healthcheck()
@@ -996,24 +1044,24 @@ class GraduatedCog(commands.Cog):
         end = dt.datetime.now(dt.timezone.utc)
         start = end - dt.timedelta(hours=1)
 
-        print(f"[DEBUG] Report time window: {start.isoformat()} to {end.isoformat()}")
+        log.debug(f"Report time window: {start.isoformat()} to {end.isoformat()}")
 
         try:
             msg = await self.fetch_report(start, end)
         except Exception as e:
-            print(f"[DEBUG] Report generation error: {type(e).__name__}: {e}")
+            log.warning(f"Report generation error: {type(e).__name__}: {e}")
             import traceback
-            print(f"[DEBUG] Traceback: {traceback.format_exc()}")
+            log.debug(f"Traceback: {traceback.format_exc()}")
             msg = f"⚠️ Graduated report error: {e}"
 
         ch = self.bot.get_channel(CHANNEL_ID)
         if ch:
-            print(f"[DEBUG] Sending report to channel {CHANNEL_ID}")
+            log.debug(f"Sending report to channel {CHANNEL_ID}")
             await safe_send(ch, msg)
         else:
-            print(f"[DEBUG] ERROR: Could not find channel {CHANNEL_ID}")
+            log.warning(f"ERROR: Could not find channel {CHANNEL_ID}")
 
-        print("[DEBUG] ========== Report Complete ==========\n")
+        log.debug("========== Report Complete ==========\n")
 
     @hourly_graduated_report.before_loop
     async def _wait_ready(self):
@@ -1022,9 +1070,9 @@ class GraduatedCog(commands.Cog):
     async def get_recent_graduates(self, start: dt.datetime, end: dt.datetime) -> List[Dict[str, Any]]:
         tokens_by_lp = await _fetch_recent_graduates_all(start, end, limit=100)
 
-        print("\n[DEBUG] === Filtering tokens by time window ===")
+        log.debug("=== Filtering tokens by time window ===")
         for lp, tokens in tokens_by_lp.items():
-            print(f"[DEBUG] {lp}: {len(tokens)} raw tokens before time filtering")
+            log.debug(f"{lp}: {len(tokens)} raw tokens before time filtering")
 
         grads: List[Dict[str, Any]] = []
         for lp, tokens in tokens_by_lp.items():
@@ -1034,13 +1082,13 @@ class GraduatedCog(commands.Cog):
                 if ts and (start <= ts < end):
                     grads.append({**t, "launchpad": lp})
                     filtered_count += 1
-            print(f"[DEBUG] {lp}: {filtered_count} tokens after time filtering")
+            log.debug(f"{lp}: {filtered_count} tokens after time filtering")
 
-        print(f"[DEBUG] Total graduated tokens in window: {len(grads)}")
+        log.debug(f"Total graduated tokens in window: {len(grads)}")
         return grads
 
     async def fetch_report(self, start: dt.datetime, end: dt.datetime) -> str:
-        print("[DEBUG] Fetching graduated tokens...")
+        log.debug("Fetching graduated tokens...")
         grads = await self.get_recent_graduates(start, end)
 
         window_str = (
@@ -1051,7 +1099,7 @@ class GraduatedCog(commands.Cog):
         if not grads:
             return f"🕒 {window_str}: No tokens graduated."
 
-        print(f"\n[DEBUG] === Fetching market cap data for {len(grads)} tokens ===")
+        log.debug(f"=== Fetching market cap data for {len(grads)} tokens ===")
 
         # Fetch market cap data for all tokens (bounded concurrency)
         sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
@@ -1083,12 +1131,12 @@ class GraduatedCog(commands.Cog):
         heaven_grads = [g for g in grads if g.get("launchpad") == "heaven"]
         other_grads = [g for g in grads if g.get("launchpad") not in ["pumpfun", "bonk", "bags", "heaven"]]
 
-        print(f"\n[DEBUG] === Platform breakdown ===")
-        print(f"[DEBUG] PumpFun: {len(pumpfun_grads)} tokens")
-        print(f"[DEBUG] Bonk: {len(bonk_grads)} tokens")
-        print(f"[DEBUG] Bags: {len(bags_grads)} tokens")
-        print(f"[DEBUG] Heaven: {len(heaven_grads)} tokens")
-        print(f"[DEBUG] Other: {len(other_grads)} tokens")
+        log.debug("=== Platform breakdown ===")
+        log.debug(f"PumpFun: {len(pumpfun_grads)} tokens")
+        log.debug(f"Bonk: {len(bonk_grads)} tokens")
+        log.debug(f"Bags: {len(bags_grads)} tokens")
+        log.debug(f"Heaven: {len(heaven_grads)} tokens")
+        log.debug(f"Other: {len(other_grads)} tokens")
 
         # Filter for display (only show >= threshold)
         pumpfun_display = [g for g in pumpfun_grads if g.get("mc_val", 0) >= MIN_MC_DISPLAY]
@@ -1097,12 +1145,12 @@ class GraduatedCog(commands.Cog):
         heaven_display = [g for g in heaven_grads if g.get("mc_val", 0) >= MIN_MC_DISPLAY]
         other_display = [g for g in other_grads if g.get("mc_val", 0) >= MIN_MC_DISPLAY]
 
-        print(f"\n[DEBUG] === After {MIN_MC_DISPLAY:,} MC filter ===")
-        print(f"[DEBUG] PumpFun display: {len(pumpfun_display)} tokens")
-        print(f"[DEBUG] Bonk display: {len(bonk_display)} tokens")
-        print(f"[DEBUG] Bags display: {len(bags_display)} tokens")
-        print(f"[DEBUG] Heaven display: {len(heaven_display)} tokens")
-        print(f"[DEBUG] Other display: {len(other_display)} tokens")
+        log.debug(f"=== After {MIN_MC_DISPLAY:,} MC filter ===")
+        log.debug(f"PumpFun display: {len(pumpfun_display)} tokens")
+        log.debug(f"Bonk display: {len(bonk_display)} tokens")
+        log.debug(f"Bags display: {len(bags_display)} tokens")
+        log.debug(f"Heaven display: {len(heaven_display)} tokens")
+        log.debug(f"Other display: {len(other_display)} tokens")
 
         # Build report sections
         report_sections: List[str] = []
@@ -1178,7 +1226,7 @@ class GraduatedCog(commands.Cog):
         if len(grads) > 0 and (len(pumpfun_display) + len(bonk_display) + len(bags_display) + len(heaven_display) + len(other_display) == 0):
             report_sections.append("\n💡 All graduated tokens are currently under the display threshold")
 
-        print("[DEBUG] Report generation complete")
+        log.debug("Report generation complete")
         return "\n".join(report_sections)
 
 async def setup(bot: commands.Bot):
