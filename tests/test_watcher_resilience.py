@@ -242,7 +242,7 @@ def test_collect_drops_state_for_unwatched_tokens():
     history.record("GONE", 1.0, 1.0)
     history.record("KEEP", 1.0, 1.0)
 
-    A._collect({"KEEP"})
+    asyncio.run(A._collect({"KEEP"}))
 
     assert "GONE" not in token_cache and "KEEP" in token_cache
     assert "GONE" not in A._last_checked and "KEEP" in A._last_checked

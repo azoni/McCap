@@ -114,10 +114,16 @@ class Bot(commands.Bot):
         log.info("Synced %d global slash command(s)", len(synced))
 
     async def close(self):
+        # Cancel and await the loops BEFORE closing the shared aiohttp session.
+        # Closing it first left in-flight requests running against a dead
+        # session, and the scan tracker (owned by its cog, cancelled later by
+        # cog_unload) outlived it entirely.
         for t in self._bg_tasks:
             t.cancel()
+        if self._bg_tasks:
+            await asyncio.gather(*self._bg_tasks, return_exceptions=True)
+        await super().close()   # unloads cogs, so cog_unload cancels its tasks
         await close_session()
-        await super().close()
 
     async def on_ready(self):
         guilds = ", ".join(f"{g.name}({g.id})" for g in self.guilds) or "none"

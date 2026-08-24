@@ -34,11 +34,18 @@ def parse_mc_input(v: str) -> float:
     elif v.endswith("m"): m,v=1_000_000, v[:-1]
     elif v.endswith("b"): m,v=1_000_000_000, v[:-1]
     elif v.endswith("t"): m,v=1_000_000_000_000, v[:-1]
-    return float(v)*m
+    out = float(v) * m
+    # nan/inf pass the >0 guard at the call site but can never satisfy
+    # meets(), producing an alert that silently never fires. json.dump
+    # also refuses to serialise them.
+    if not math.isfinite(out):
+        raise ValueError("target must be a finite number")
+    return out
 
 
 class RelativeTargetError(ValueError):
     """A relative target was given but there is no current MC to anchor to."""
+
 
 
 def parse_target(raw: str, current_mc: Optional[float]) -> Tuple[float, str]:

@@ -39,6 +39,26 @@ from ..tables import (
     fixed_table,
 )
 
+MESSAGE_LIMIT = 2000
+
+
+def _fit(lines: List[str], limit: int = MESSAGE_LIMIT) -> str:
+    """Join lines into one message Discord will accept.
+
+    Removing 40 alerts produced a 2015-character reply, which Discord rejects —
+    and since the interaction was already deferred, the command just hung.
+    """
+    out, used = [], 0
+    for i, line in enumerate(lines):
+        tail = f"…and {len(lines) - i} more line(s)"
+        if used + len(line) + 1 + len(tail) > limit:
+            out.append(tail)
+            break
+        out.append(line)
+        used += len(line) + 1
+    return "\n".join(out)[:limit]
+
+
 _ID_RE = re.compile(r"^[0-9a-f]{6}$")
 
 
@@ -547,7 +567,7 @@ class AlertsCog(commands.Cog):
         if parse_errs:
             lines.append("\n⚠️ **Input issues:**")
             lines += [f"• {e}" for e in parse_errs]
-        await inter.followup.send("\n".join(lines))
+        await inter.followup.send(_fit(lines))
 
     # ---------------- /mc_recent ----------------
 

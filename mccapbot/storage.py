@@ -1,9 +1,10 @@
 import asyncio
 import json
 import os
+import shutil
 import tempfile
 import time
-from dataclasses import asdict, fields
+from dataclasses import MISSING, asdict, fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Type, TypeVar
 
@@ -55,7 +56,7 @@ def _atomic_write(path: str, payload: Any) -> None:
     tmp_fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), prefix=target.name, suffix=".tmp")
     try:
         with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+            json.dump(payload, f, ensure_ascii=False, indent=2, allow_nan=False)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_name, target)
@@ -77,28 +78,74 @@ def _coerce(cls: Type[T], raw: Dict[str, Any]) -> T:
     JSON would survive into the object. Removal is keyed on id, so two records
     sharing a blank one could take out the wrong alert.
     """
-    known = {f.name for f in fields(cls)}  # type: ignore[arg-type]
-    clean = {k: v for k, v in raw.items() if k in known}
-    if "id" in clean and not clean["id"]:
-        del clean["id"]
+    spec = fields(cls)  # type: ignore[arg-type]
+    known = {f.name for f in spec}
+    # Only *absent* keys fall back to a default_factory, so an explicit null or
+    # "" in the JSON would survive into the object — a blank id breaks
+    # remove-by-id, and a null timestamp crashes the sort at startup.
+    generated = {f.name for f in spec if f.default_factory is not MISSING}  # type: ignore[misc]
+    clean = {
+        k: v for k, v in raw.items()
+        if k in known and not (k in generated and not v)
+    }
     return cls(**clean)  # type: ignore[call-arg]
 
 
 async def _load_list(path: str, cls: Type[T], target: List[T], label: str) -> bool:
-    """Load a JSON array of dataclasses. Returns True if the file existed."""
+    """Load a JSON array of dataclasses. Returns True if the file existed.
+
+    Parses into a local list and only publishes on success. The previous version
+    cleared the shared list first and appended one record at a time, so a single
+    unparseable entry left the list holding just the records before it — and the
+    next save (the first alert to fire) wrote that truncation back to disk,
+    destroying the rest permanently. Records that fail individually are skipped
+    and counted rather than aborting the whole load.
+    """
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        target.clear()
+        if not isinstance(data, list):
+            log.error("%s is not a JSON array; refusing to load it.", path)
+            return False
+
+        parsed: List[T] = []
+        skipped = 0
         for it in data:
-            target.append(_coerce(cls, it))
-        log.info("Loaded %d %s", len(target), label)
+            try:
+                parsed.append(_coerce(cls, it))
+            except Exception:
+                skipped += 1
+                log.warning("Skipping unreadable %s record: %r", label, it)
+
+        target[:] = parsed
+        if skipped:
+            # Keep the damaged original: the next save would otherwise overwrite
+            # it with the survivors and make the loss permanent.
+            _backup_corrupt(path)
+            log.error(
+                "Loaded %d %s but SKIPPED %d unreadable record(s). Original kept as %s.corrupt",
+                len(parsed), label, skipped, path,
+            )
+        else:
+            log.info("Loaded %d %s", len(parsed), label)
         return True
     except FileNotFoundError:
         log.info("No %s file at %s; starting fresh.", label, path)
     except Exception:
-        log.exception("Failed to load %s", path)
+        # A wholly unreadable file must not silently become an empty one.
+        log.exception("Failed to load %s; leaving in-memory state untouched", path)
+        _backup_corrupt(path)
     return False
+
+
+def _backup_corrupt(path: str) -> None:
+    """Preserve a file we could not fully read, before anything overwrites it."""
+    try:
+        src = Path(path)
+        if src.exists():
+            shutil.copy2(src, src.with_suffix(src.suffix + ".corrupt"))
+    except Exception:
+        log.debug("Could not back up %s", path, exc_info=True)
 
 
 # ---- Reminders (level alerts) ----
@@ -111,15 +158,25 @@ async def load_reminders() -> None:
     try:
         with open(REM_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        reminders.clear()
-        backfilled = 0
+        parsed, backfilled, skipped = [], 0, 0
         for it in data:
-            r = _coerce(Reminder, it)
+            try:
+                r = _coerce(Reminder, it)
+            except Exception:
+                skipped += 1
+                log.warning("Skipping unreadable reminder record: %r", it)
+                continue
             if not it.get("id"):
                 backfilled += 1
             if not it.get("created_ts"):
                 r.created_ts = time.time()
-            reminders.append(r)
+            parsed.append(r)
+        # Publish only after the whole file parses; a partial list written back
+        # by the next save would destroy every record after the bad one.
+        reminders[:] = parsed
+        if skipped:
+            _backup_corrupt(REM_FILE)
+            log.error("Skipped %d unreadable reminder(s); original kept as %s.corrupt", skipped, REM_FILE)
         log.info("Loaded %d reminder(s) from %s", len(reminders), REM_FILE)
         if backfilled:
             log.info("Backfilled ids for %d legacy reminder(s)", backfilled)

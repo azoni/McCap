@@ -57,16 +57,37 @@ def _note_data_state(ca: str, refresh_result) -> None:
             )
 
 
-def _collect(live: set) -> None:
+async def expire_auto_alerts() -> bool:
+    """Retire auto-armed momentum alerts past their TTL.
+
+    This used to live only in the scan cog's tracker task, which never starts
+    when SCAN_WATCH_ENABLE is off — so alerts armed while it was on became
+    permanent, kept consuming request budget, and kept firing long past their
+    TTL. It belongs on the always-running watcher instead.
+    """
+    now = time.time()
+    expired = [m for m in move_alerts if m.auto_expires_ts and m.auto_expires_ts <= now]
+    if not expired:
+        return False
+    ids = {m.id for m in expired}
+    move_alerts[:] = [m for m in move_alerts if m.id not in ids]
+    await save_moves()
+    log.info("Expired %d auto-armed scan alert(s)", len(expired))
+    return True
+
+
+async def _collect(live: set) -> None:
     """Drop per-token state for addresses nobody watches any more."""
     for ca in [c for c in _last_checked if c not in live]:
         _last_checked.pop(ca, None)
     for ca in [c for c in _no_data if c not in live]:
         _no_data.pop(ca, None)
-    # token_cache was never pruned anywhere, so it grew for the process lifetime.
-    stale = [c for c in token_cache if c not in live]
-    for ca in stale:
-        token_cache.pop(ca, None)
+    # Keep anything the fired-alert history still displays, or /mc_recent's
+    # Current column goes blank the moment an alert fires.
+    keep = live | {e.ca for e in alert_events}
+    async with TOKEN_CACHE_LOCK:
+        for ca in [c for c in token_cache if c not in keep]:
+            token_cache.pop(ca, None)
     history.forget(live)
 
 
@@ -225,6 +246,11 @@ async def _check_levels(client: discord.Client, snap_by_ca) -> bool:
     """
     fired = []
     for rem in list(reminders):
+        # /mc_remove can delete an alert while this loop awaits. Re-check
+        # membership before sending, or a user who just removed one still gets
+        # pinged and it still lands in /mc_recent.
+        if not any(r.id == rem.id for r in reminders):
+            continue
         snap = snap_by_ca.get(rem.ca)
         current = snap.mc if snap else None
         if not meets(rem.direction, current, rem.target_mc):
@@ -250,6 +276,9 @@ async def _check_levels(client: discord.Client, snap_by_ca) -> bool:
         return False
     # Remove by identity; list positions shift as alerts fire.
     fired_ids = {r.id for r in fired}
+    # History first: if the second save fails, the fire is still recorded rather
+    # than the alert being gone with no trace of why.
+    await save_alerts()
     reminders[:] = [r for r in reminders if r.id not in fired_ids]
     await save_reminders()
     return True
@@ -259,6 +288,8 @@ async def _check_moves(client: discord.Client, snap_by_ca) -> bool:
     now = time.time()
     changed = False
     for mv in list(move_alerts):
+        if not any(m.id == mv.id for m in move_alerts):
+            continue  # removed mid-tick
         if not move_ready(mv, now):
             continue
         change = history.pct_change(mv.ca, mv.window_sec, now)
@@ -370,14 +401,12 @@ async def watcher(client: discord.Client) -> None:
                 level_fired = await _check_levels(client, snap_by_ca)
                 await _check_moves(client, snap_by_ca)
 
-                if level_fired:
-                    await save_alerts()
-
                 # Housekeeping runs on its own schedule, not only when a level
                 # alert fires: /mc_remove and expiring auto-armed scan alerts
                 # also stop a token being watched, and those paths never fired.
                 if level_fired or (mono - last_gc) > 300:
-                    _collect(set(watched_addresses()))
+                    await expire_auto_alerts()
+                    await _collect(set(watched_addresses()))
                     last_gc = mono
 
                 if mono - last_rate_log > 900:

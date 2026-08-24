@@ -100,11 +100,13 @@ SCAN_WATCH_ENABLE = _env_flag("SCAN_WATCH_ENABLE", False)
 # ourselves" — convenient, but see SCAN_IGNORE_SELF: reacting to our own posts
 # would be an infinite loop.
 SCANNER_BOT_IDS = {
-    int(x) for x in (os.getenv("SCANNER_BOT_IDS") or "").replace(",", " ").split() if x.isdigit()
+    int(x) for x in (os.getenv("SCANNER_BOT_IDS") or "").replace(",", " ").split()
+    if x.isascii() and x.isdigit()
 }
 # Optional channel allowlist. Empty means every channel the bot can see.
 SCAN_CHANNEL_IDS = {
-    int(x) for x in (os.getenv("SCAN_CHANNEL_IDS") or "").replace(",", " ").split() if x.isdigit()
+    int(x) for x in (os.getenv("SCAN_CHANNEL_IDS") or "").replace(",", " ").split()
+    if x.isascii() and x.isdigit()
 }
 
 # Don't record the same token twice in this window (repeat scans are constant).

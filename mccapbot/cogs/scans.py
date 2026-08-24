@@ -21,6 +21,8 @@ from discord.ext import commands
 
 from .. import scan
 from ..config import (
+    MAX_SCAN_EVENTS,
+    MAX_WATCH_PER_LIST,
     SCAN_AUTO_MOVE_MAX,
     SCAN_AUTO_MOVE_PCT,
     SCAN_AUTO_MOVE_TTL,
@@ -107,8 +109,13 @@ class ScansCog(commands.Cog):
     async def on_message(self, message: discord.Message):
         if not SCAN_WATCH_ENABLE or message.guild is None:
             return
-        if SCAN_CHANNEL_IDS and message.channel.id not in SCAN_CHANNEL_IDS:
-            return
+        if SCAN_CHANNEL_IDS:
+            # A thread has its own id; match its parent so an allowlisted
+            # channel covers threads started inside it.
+            cid = message.channel.id
+            pid = getattr(message.channel, "parent_id", None)
+            if cid not in SCAN_CHANNEL_IDS and pid not in SCAN_CHANNEL_IDS:
+                return
 
         self_id = self.bot.user.id if self.bot.user else None
         if not scan.is_scanner_message(message, SCANNER_BOT_IDS, self_id):
@@ -170,6 +177,9 @@ class ScansCog(commands.Cog):
             last_checked_ts=now,
         )
         scan_events.insert(0, ev)
+        # Trim on write as well as load; enforcing the cap only at boot let the
+        # list and scans.json grow without bound for the life of the process.
+        del scan_events[MAX_SCAN_EVENTS:]
         await save_scans()
         log.info(
             "Scan detected | %s (%s) MC=%s | scanner=%s | id=%s",
@@ -190,14 +200,21 @@ class ScansCog(commands.Cog):
         slash command; neither is guaranteed. The report shows a dash when this
         cannot be resolved rather than pretending to know.
         """
+        def human(candidate) -> int:
+            # A bot in this slot is exactly what the ownership fix removed:
+            # it would be pinged when the alert fires and would own an alert
+            # nobody can delete.
+            if candidate is None or getattr(candidate, "bot", False):
+                return 0
+            return getattr(candidate, "id", 0) or 0
+
         ref = getattr(message, "reference", None)
         resolved = getattr(ref, "resolved", None) if ref else None
-        author = getattr(resolved, "author", None)
-        if author is not None and getattr(author, "id", None):
-            return author.id
+        who = human(getattr(resolved, "author", None))
+        if who:
+            return who
         meta = getattr(message, "interaction_metadata", None)
-        user = getattr(meta, "user", None) if meta else None
-        return getattr(user, "id", 0) or 0
+        return human(getattr(meta, "user", None) if meta else None)
 
     # ---------------- actions ----------------
 
@@ -208,6 +225,22 @@ class ScansCog(commands.Cog):
         )
         if already:
             return
+        # /watch view fetches every entry, so an uncapped list would fan out
+        # through the shared rate limiter and starve the alert watcher.
+        current = sum(
+            1 for w in watchlist
+            if w.guild_id == ev.guild_id and w.list_name == SCAN_AUTO_WATCHLIST_NAME
+        )
+        if current >= MAX_WATCH_PER_LIST:
+            oldest = min(
+                (w for w in watchlist
+                 if w.guild_id == ev.guild_id and w.list_name == SCAN_AUTO_WATCHLIST_NAME),
+                key=lambda w: w.added_ts,
+                default=None,
+            )
+            if oldest is None:
+                return
+            watchlist.remove(oldest)  # ring buffer: newest scans matter most
         watchlist.append(WatchItem(
             ca=ev.ca,
             guild_id=ev.guild_id,
@@ -224,7 +257,7 @@ class ScansCog(commands.Cog):
         """Arm a momentum alert, respecting the cap that protects the budget."""
         if SCAN_AUTO_MOVE_PCT <= 0:
             return None
-        if any(m.ca == ev.ca and m.auto_expires_ts for m in move_alerts):
+        if any(m.ca == ev.ca and m.auto_expires_ts and m.guild_id == ev.guild_id for m in move_alerts):
             return None  # already auto-armed for this token
 
         auto_count = sum(1 for m in move_alerts if m.auto_expires_ts)

@@ -22,7 +22,9 @@ from .helpers import is_solana_address
 
 # Base58 run long enough to be a mint. Deliberately loose — candidates are
 # validated by is_solana_address and then by an actual DexScreener lookup.
-_B58 = re.compile(r"[1-9A-HJ-NP-Za-km-z]{32,44}")
+# Anchored on both sides: unanchored, an 88-character transaction signature
+# is chopped into two 44-character runs that both look like valid mints.
+_B58 = re.compile(r"(?<![1-9A-HJ-NP-Za-km-z])[1-9A-HJ-NP-Za-km-z]{32,44}(?![1-9A-HJ-NP-Za-km-z])")
 
 # Hosts whose URLs carry the mint in the path or query. Used only to prioritise
 # candidates, never to gate them: an unknown host still gets its base58 scanned.

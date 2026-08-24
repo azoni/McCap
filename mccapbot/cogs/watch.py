@@ -211,7 +211,11 @@ class WatchCog(commands.Cog):
             return
         rows = [[n, str(len(entries(inter, n)))] for n in names]
         embed = discord.Embed(title="Watchlists", color=0x2B90D9)
-        add_table_fields(embed, "This server", ["List", "Tokens"], rows, ["l", "r"], max_fields=3)
+        shown, total_lists = add_table_fields(
+            embed, "This server", ["List", "Tokens"], rows, ["l", "r"], max_fields=3
+        )
+        if shown < total_lists:
+            embed.set_footer(text=f"{total_lists - shown} list(s) not shown")
         await inter.followup.send(embed=embed, ephemeral=True)
 
 
