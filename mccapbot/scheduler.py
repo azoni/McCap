@@ -26,6 +26,11 @@ from .config import (
 )
 
 
+# Backoff ceiling for tokens that keep returning no market cap.
+MAX_BACKOFF_DOUBLINGS = 5
+MAX_BACKOFF_SECONDS = 3600
+
+
 def progress_to_target(direction: str, current_mc: Optional[float], target_mc: float) -> Optional[float]:
     """How close a token is to firing, as a 0..1+ ratio (1.0 == at target).
 
@@ -106,16 +111,34 @@ def intervals_by_address(
     return out
 
 
+def backoff_interval(interval: int, no_data_streak: int) -> int:
+    """Stretch a token's interval when it keeps returning no market cap.
+
+    A dead token can never fire, yet its "unknown" tier is *faster* than the
+    cold tier, so without this it consumed more of the request budget than the
+    live tokens did. Doubles per consecutive miss up to an hour.
+    """
+    if no_data_streak <= 0:
+        return interval
+    return min(interval * (2 ** min(no_data_streak, MAX_BACKOFF_DOUBLINGS)), MAX_BACKOFF_SECONDS)
+
+
 def due_addresses(
     reminders: Iterable,
     moves: Iterable,
     mc_by_ca: Dict[str, Optional[float]],
     last_checked: Dict[str, float],
     now: float,
+    no_data: Optional[Dict[str, int]] = None,
 ) -> List[str]:
     """Return the contract addresses whose refresh interval has elapsed."""
+    no_data = no_data or {}
     due: List[str] = []
     for ca, interval in intervals_by_address(reminders, moves, mc_by_ca).items():
+        # A momentum alert needs its steady sample rate regardless — its window
+        # maths depends on it — so only level-only tokens get backed off.
+        if not any(m.ca == ca for m in moves):
+            interval = backoff_interval(interval, no_data.get(ca, 0))
         seen = last_checked.get(ca)
         if seen is None or (now - seen) >= interval:
             due.append(ca)

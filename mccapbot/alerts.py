@@ -11,7 +11,13 @@ from .dex import build_token_url, choose_consensus_pair, fetch_dex_token, get_im
 from .helpers import human_window, humanize, meets, username_from_id
 from .logging_setup import log
 from .models import AlertEvent, TokenSnapshot
-from .scheduler import due_addresses, estimated_requests_per_minute, move_ready, move_triggered
+from .scheduler import (
+    describe_tiers,
+    due_addresses,
+    estimated_requests_per_minute,
+    move_ready,
+    move_triggered,
+)
 from .storage import (
     alert_events,
     move_alerts,
@@ -22,13 +28,61 @@ from .storage import (
     watched_addresses,
 )
 
-# ca -> monotonic timestamp of last successful refresh
+# ca -> monotonic timestamp of last refresh attempt
 _last_checked: Dict[str, float] = {}
 
+# ca -> consecutive refreshes that returned no market cap. Dead memecoins never
+# resolve, and POLL_UNKNOWN_SECONDS (120s) is *shorter* than POLL_COLD_SECONDS
+# (300s), so without a backoff a token that can never fire was polled more often
+# than a live one. The streak backs the interval off geometrically.
+_no_data: Dict[str, int] = {}
+NO_DATA_GIVE_UP = 5
 
-async def _refresh(ca: str) -> None:
-    """Fetch one token, update the cache, and append to its history series."""
+
+def _note_data_state(ca: str, refresh_result) -> None:
+    """Track whether a token is still returning usable data."""
+    if isinstance(refresh_result, Exception) or refresh_result is False:
+        return  # request failed; not evidence about the token itself
+    snap = token_cache.get(ca)
+    if snap is not None and snap.mc is not None:
+        if _no_data.pop(ca, 0):
+            log.info("Token %s is reporting a market cap again", ca)
+    else:
+        _no_data[ca] = _no_data.get(ca, 0) + 1
+        if _no_data[ca] == NO_DATA_GIVE_UP:
+            log.warning(
+                "Token %s has returned no market data %d times running — backing off. "
+                "Alerts on it cannot fire; remove them with /mc_remove.",
+                ca, NO_DATA_GIVE_UP,
+            )
+
+
+def _collect(live: set) -> None:
+    """Drop per-token state for addresses nobody watches any more."""
+    for ca in [c for c in _last_checked if c not in live]:
+        _last_checked.pop(ca, None)
+    for ca in [c for c in _no_data if c not in live]:
+        _no_data.pop(ca, None)
+    # token_cache was never pruned anywhere, so it grew for the process lifetime.
+    stale = [c for c in token_cache if c not in live]
+    for ca in stale:
+        token_cache.pop(ca, None)
+    history.forget(live)
+
+
+async def _refresh(ca: str) -> bool:
+    """Fetch one token and update the cache. Returns False if the request failed.
+
+    A failed request must NOT be written to the cache. ``get_json`` flattens a
+    429, a timeout, and any non-200 into ``None``, which is indistinguishable
+    from "this token has no market data" — and overwriting a good snapshot with
+    ``mc=None`` made /mc_list show "—" for a perfectly live token and demoted it
+    to the slowest polling tier, precisely when it might have been about to fire.
+    On failure the previous snapshot is left alone.
+    """
     data = await fetch_dex_token(ca)
+    if data is None:
+        return False
 
     mc_val: Optional[float] = None
     src, link, dex, chain, quote, consensus, img = "none", None, "", "", "", 0.0, ""
@@ -58,6 +112,7 @@ async def _refresh(ca: str) -> None:
             image_url=img,
         )
     history.record(ca, mc_val, now)
+    return True
 
 
 def _record_event(rem, current_mc, kind: str, direction: str, target: float) -> None:
@@ -108,7 +163,6 @@ async def _fire_level(client: discord.Client, rem, current_mc, snap) -> None:
         embed=embed,
         allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False, replied_user=False),
     )
-    _record_event(rem, current_mc, "level", rem.direction, rem.target_mc)
     log.info(
         "Alert fired | %s (%s) | dir=%s target=%s curr=%s id=%s",
         rem.name, rem.symbol, rem.direction, humanize(rem.target_mc), humanize(current_mc), rem.id,
@@ -144,7 +198,6 @@ async def _fire_move(client: discord.Client, mv, change: float, current_mc, snap
         embed=embed,
         allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False, replied_user=False),
     )
-    _record_event(mv, current_mc, "move", "up" if up else "down", mv.pct)
     log.info(
         "Move fired | %s (%s) | %+.1f%% over %s id=%s",
         mv.name, mv.symbol, change, human_window(mv.window_sec), mv.id,
@@ -152,6 +205,15 @@ async def _fire_move(client: discord.Client, mv, change: float, current_mc, snap
 
 
 async def _check_levels(client: discord.Client, snap_by_ca) -> bool:
+    """Fire level alerts whose target has been reached.
+
+    An alert is only consumed once it has actually been delivered, or once
+    delivery is known to be impossible. Previously ``fired.append`` sat outside
+    the try, so a deleted channel or a missing Send Messages permission threw,
+    got swallowed by the log, and the alert was still deleted and persisted —
+    while ``_record_event`` (which lived after the send) never ran. The alert
+    vanished from both the active list and /mc_recent with no trace anywhere.
+    """
     fired = []
     for rem in list(reminders):
         snap = snap_by_ca.get(rem.ca)
@@ -160,8 +222,19 @@ async def _check_levels(client: discord.Client, snap_by_ca) -> bool:
             continue
         try:
             await _fire_level(client, rem, current, snap)
+        except (discord.NotFound, discord.Forbidden) as e:
+            # The channel is gone or we can't post there — retrying every tick
+            # would spin forever, so retire it, but keep the record.
+            log.warning(
+                "Alert %s (%s) hit its target but is undeliverable to channel %s (%s); "
+                "retiring it and recording the fire.",
+                rem.id, rem.name, rem.channel_id, e.__class__.__name__,
+            )
         except Exception:
-            log.exception("Failed to send alert for %s (%s)", rem.name, rem.id)
+            # Transient (rate limit, gateway blip). Leave it armed and retry.
+            log.exception("Deferring alert %s (%s): send failed", rem.id, rem.name)
+            continue
+        _record_event(rem, current, "level", rem.direction, rem.target_mc)
         fired.append(rem)
 
     if not fired:
@@ -186,8 +259,19 @@ async def _check_moves(client: discord.Client, snap_by_ca) -> bool:
         snap = snap_by_ca.get(mv.ca)
         try:
             await _fire_move(client, mv, change, snap.mc if snap else None, snap)
+        except (discord.NotFound, discord.Forbidden) as e:
+            # Undeliverable for good. Start the cooldown anyway so this doesn't
+            # re-trigger on every tick, but log it loudly.
+            log.warning(
+                "Move alert %s (%s) triggered but is undeliverable to channel %s (%s).",
+                mv.id, mv.name, mv.channel_id, e.__class__.__name__,
+            )
         except Exception:
-            log.exception("Failed to send move alert for %s (%s)", mv.name, mv.id)
+            # Transient: leave last_fired_ts alone so the trigger isn't
+            # swallowed by a cooldown that never earned its notification.
+            log.exception("Deferring move alert %s (%s): send failed", mv.id, mv.name)
+            continue
+        _record_event(mv, snap.mc if snap else None, "move", "up" if change >= 0 else "down", mv.pct)
         mv.last_fired_ts = now
         changed = True
 
@@ -240,7 +324,11 @@ async def backfill_move_history() -> None:
 
 async def watcher(client: discord.Client) -> None:
     await client.wait_until_ready()
-    last_rate_log = 0.0
+    # Seeded from the clock, not 0: time.monotonic() is host uptime on Linux, so
+    # a zero start made the first tick always overdue and logged the empty-cache
+    # request rate — which understated real load roughly twofold.
+    last_rate_log = time.monotonic()
+    last_gc = last_rate_log
 
     try:
         await backfill_move_history()
@@ -255,7 +343,7 @@ async def watcher(client: discord.Client) -> None:
                     mc_by_ca = {ca: (token_cache[ca].mc if ca in token_cache else None) for ca in addresses}
 
                 mono = time.monotonic()
-                due = due_addresses(reminders, move_alerts, mc_by_ca, _last_checked, mono)
+                due = due_addresses(reminders, move_alerts, mc_by_ca, _last_checked, mono, _no_data)
 
                 if due:
                     results = await asyncio.gather(*(_refresh(ca) for ca in due), return_exceptions=True)
@@ -265,6 +353,7 @@ async def watcher(client: discord.Client) -> None:
                         # Stamp regardless so a persistently failing token does
                         # not get retried on every single tick.
                         _last_checked[ca] = mono
+                        _note_data_state(ca, res)
 
                 async with TOKEN_CACHE_LOCK:
                     snap_by_ca = {ca: token_cache.get(ca) for ca in addresses}
@@ -274,16 +363,24 @@ async def watcher(client: discord.Client) -> None:
 
                 if level_fired:
                     await save_alerts()
-                    live = set(watched_addresses())
-                    for ca in [c for c in _last_checked if c not in live]:
-                        _last_checked.pop(ca, None)
-                    history.forget(live)
+
+                # Housekeeping runs on its own schedule, not only when a level
+                # alert fires: /mc_remove and expiring auto-armed scan alerts
+                # also stop a token being watched, and those paths never fired.
+                if level_fired or (mono - last_gc) > 300:
+                    _collect(set(watched_addresses()))
+                    last_gc = mono
 
                 if mono - last_rate_log > 900:
-                    rate = estimated_requests_per_minute(reminders, move_alerts, mc_by_ca)
+                    async with TOKEN_CACHE_LOCK:
+                        warm = {ca: (token_cache[ca].mc if ca in token_cache else None) for ca in addresses}
+                    rate = estimated_requests_per_minute(reminders, move_alerts, warm)
+                    tiers = describe_tiers(reminders, warm)
+                    blind = sum(1 for ca in addresses if _no_data.get(ca, 0) >= NO_DATA_GIVE_UP)
                     log.info(
-                        "Watching %d level + %d move alert(s) across %d token(s) — ~%.0f req/min",
-                        len(reminders), len(move_alerts), len(addresses), rate,
+                        "Watching %d level + %d move alert(s) across %d token(s) — ~%.0f req/min "
+                        "| tiers %s | %d token(s) with no market data",
+                        len(reminders), len(move_alerts), len(addresses), rate, tiers, blind,
                     )
                     last_rate_log = mono
         except asyncio.CancelledError:

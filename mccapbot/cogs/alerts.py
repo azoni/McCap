@@ -40,12 +40,15 @@ from ..tables import (
 _ID_RE = re.compile(r"^[0-9a-f]{6}$")
 
 
-def resolve_targets(raw: str, scoped: List) -> Tuple[List, List[str]]:
+def resolve_targets(raw: str, scoped: List, scope: str = "in this server") -> Tuple[List, List[str]]:
     """Turn a user's `/mc_remove` input into concrete alerts.
 
     Accepts stable ids (``a1b2c3``, what autocomplete supplies) and 1-based
     positions from ``/mc_list``. Ids are matched first because positions shift
     whenever the watcher fires an alert between listing and removing.
+
+    ``scope`` is the caller's wording for where it looked — a DM lists the
+    caller's alerts across every server, so "in this server" would be a lie.
     """
     errs: List[str] = []
     if not raw or not raw.strip():
@@ -61,9 +64,17 @@ def resolve_targets(raw: str, scoped: List) -> Tuple[List, List[str]]:
         if _ID_RE.match(low):
             r = by_id.get(low)
             if r is None:
-                errs.append(f"`{tok}` is not an alert in this server (it may have already fired).")
+                errs.append(f"`{tok}` is not an alert {scope} — check `/mc_list`.")
                 continue
-        elif tok.isdigit():
+        # str.isdigit() is True for '²' and '⁵', which int() then rejects with a
+        # ValueError. Unhandled, that killed the whole command after the defer,
+        # so the interaction just hung on "thinking".
+        elif tok.isascii() and tok.isdigit():
+            if not scoped:
+                errs.append(
+                    "There are no numbered alerts here — momentum alerts are removed by id."
+                )
+                continue
             i = int(tok)
             if i < 1 or i > len(scoped):
                 errs.append(f"Index {i} is out of range (1–{len(scoped)}).")
@@ -76,6 +87,8 @@ def resolve_targets(raw: str, scoped: List) -> Tuple[List, List[str]]:
             seen.add(r.id)
             picked.append(r)
 
+    if not picked and not errs:
+        errs.append("No alerts specified.")
     return picked, errs
 
 
@@ -342,17 +355,32 @@ class AlertsCog(commands.Cog):
             color=0x2B90D9,
         )
 
-        pos = {r.id: i for i, r in enumerate(self._scoped(inter), 1)}
-        headers = ["#", "ID", "Token", "Target", "Current", "By"]
-        aligns = ["r", "l", "l", "r", "r", "l"]
+        # Indices are only offered inside a server. From a user installation the
+        # listing spans every server, while /mc_remove run in a server numbers
+        # just that one — so the same number would mean different alerts in the
+        # two places. Ids are unambiguous everywhere, so DMs get ids only.
+        numbered = bool(inter.guild_id)
+        pos = {r.id: i for i, r in enumerate(self._scoped(inter), 1)} if numbered else {}
+        headers = (["#"] if numbered else []) + ["ID", "Token", "Target", "Current", "By"]
+        aligns = (["r"] if numbered else []) + ["l", "l", "r", "r", "l"]
         rows_ge, rows_le = [], []
         for r in sr:
             s = snap.get(r.ca)
-            curr = f"${humanize(s.mc)}" if s and s.mc is not None else "—"
+            # "—" used to mean four different things at once. Distinguish
+            # "not checked yet" from "checked, and there is no market cap" so a
+            # dead token doesn't look identical to a cold start.
+            if s is None:
+                curr = "…"
+            elif s.mc is None:
+                curr = "n/a"
+            else:
+                curr = f"${humanize(s.mc)}"
             tgt = f"{'≥' if r.direction == 'above' else '≤'} ${humanize(r.target_mc)}"
             if r.spec:
                 tgt = f"{r.spec} ${humanize(r.target_mc)}"
-            row = [str(pos.get(r.id, "?")), r.id, r.symbol or r.name, tgt, curr, names.get(r.creator_id, "?")]
+            row = ([str(pos[r.id])] if numbered else []) + [
+                r.id, r.symbol or r.name, tgt, curr, names.get(r.creator_id, "?")
+            ]
             (rows_ge if r.direction == "above" else rows_le).append(row)
 
         # Tables are split across fields: Discord rejects any single field over
@@ -417,6 +445,11 @@ class AlertsCog(commands.Cog):
     @app_commands.command(name="mc_remove", description="Remove alerts (pick from the list, or pass ids)")
     @app_commands.describe(alerts="Alert id(s) or /mc_list index/indices, e.g. 'a1b2c3' or '1 3 5'")
     @app_commands.autocomplete(alerts=_remove_autocomplete)
+    # /mc_list works from a user installation and points people here, so this has
+    # to be reachable in the same places. Unlike /mc and /mc_move it posts
+    # nothing later, so there is no delivery problem.
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     async def mc_remove(self, inter: discord.Interaction, alerts: str):
         await inter.response.defer(thinking=False)
 
@@ -429,12 +462,28 @@ class AlertsCog(commands.Cog):
         # Move alerts are id-only (they aren't numbered in /mc_list).
         move_by_id = {m.id: m for m in scoped_moves}
         tokens = [t for t in re.split(r"[\s,]+", alerts.strip()) if t]
-        move_hits = [move_by_id[t.lower()] for t in tokens if t.lower() in move_by_id]
+
+        move_hits, seen_moves = [], set()
+        for t in tokens:
+            mid = t.lower()
+            if mid in move_by_id and mid not in seen_moves:
+                seen_moves.add(mid)
+                move_hits.append(move_by_id[mid])
         remaining = " ".join(t for t in tokens if t.lower() not in move_by_id)
 
-        picked, parse_errs = ([], []) if not remaining.strip() else resolve_targets(remaining, scoped)
+        scope = "in this server" if inter.guild_id else "on your account"
+        if remaining.strip():
+            picked, parse_errs = resolve_targets(remaining, scoped, scope)
+        elif move_hits:
+            picked, parse_errs = [], []
+        else:
+            # All-whitespace or all-punctuation input reached here with an empty
+            # error list, producing a bare "Nothing to remove:" and no reason.
+            picked, parse_errs = resolve_targets(alerts, scoped, scope)
+
         if not picked and not move_hits:
-            await inter.followup.send("❌ Nothing to remove:\n" + "\n".join(f"• {e}" for e in parse_errs))
+            reason = "\n".join(f"• {e}" for e in parse_errs) or "• No alerts specified."
+            await inter.followup.send(f"❌ Nothing to remove:\n{reason}")
             return
 
         can_manage = self._can_manage(inter.user)

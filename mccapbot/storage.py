@@ -71,9 +71,17 @@ def _coerce(cls: Type[T], raw: Dict[str, Any]) -> T:
     """Build a dataclass from a dict, ignoring unknown keys.
 
     Lets us add fields (like ``Reminder.id``) without breaking existing files.
+
+    A falsy ``id`` is dropped rather than passed through: only *absent* keys fall
+    back to ``default_factory``, so an explicit ``"id": null`` or ``""`` in the
+    JSON would survive into the object. Removal is keyed on id, so two records
+    sharing a blank one could take out the wrong alert.
     """
     known = {f.name for f in fields(cls)}  # type: ignore[arg-type]
-    return cls(**{k: v for k, v in raw.items() if k in known})  # type: ignore[call-arg]
+    clean = {k: v for k, v in raw.items() if k in known}
+    if "id" in clean and not clean["id"]:
+        del clean["id"]
+    return cls(**clean)  # type: ignore[call-arg]
 
 
 async def _load_list(path: str, cls: Type[T], target: List[T], label: str) -> bool:
