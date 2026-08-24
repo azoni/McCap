@@ -29,7 +29,13 @@ from ..scheduler import (
     interval_for_reminder,
 )
 from ..storage import alert_events, move_alerts, reminders, save_moves, save_reminders
-from ..tables import alerts_table, fixed_table
+from ..tables import (
+    ALERTS_ALIGNS,
+    ALERTS_HEADERS,
+    add_table_fields,
+    alerts_rows,
+    fixed_table,
+)
 
 _ID_RE = re.compile(r"^[0-9a-f]{6}$")
 
@@ -349,10 +355,20 @@ class AlertsCog(commands.Cog):
             row = [str(pos.get(r.id, "?")), r.id, r.symbol or r.name, tgt, curr, names.get(r.creator_id, "?")]
             (rows_ge if r.direction == "above" else rows_le).append(row)
 
+        # Tables are split across fields: Discord rejects any single field over
+        # 1024 chars with a 400, which used to fail /mc_list outright once a
+        # server had roughly 18 alerts in one direction.
+        hidden = 0
         if rows_ge:
-            embed.add_field(name="📈 Breakouts (MC ≥ target)", value=fixed_table(headers, rows_ge, aligns), inline=False)
+            shown, total = add_table_fields(
+                embed, "📈 Breakouts (MC ≥ target)", headers, rows_ge, aligns, max_fields=4
+            )
+            hidden += total - shown
         if rows_le:
-            embed.add_field(name="📉 Pullbacks (MC ≤ target)", value=fixed_table(headers, rows_le, aligns), inline=False)
+            shown, total = add_table_fields(
+                embed, "📉 Pullbacks (MC ≤ target)", headers, rows_le, aligns, max_fields=3
+            )
+            hidden += total - shown
 
         if mv:
             mheaders = ["ID", "Token", "Trigger", "Window", "Now", "By"]
@@ -366,9 +382,13 @@ class AlertsCog(commands.Cog):
                     f"${humanize(s.mc)}" if s and s.mc is not None else "—",
                     names.get(m.creator_id, "?"),
                 ])
-            embed.add_field(name="📊 Momentum", value=fixed_table(mheaders, mrows, maligns), inline=False)
+            shown, total = add_table_fields(embed, "📊 Momentum", mheaders, mrows, maligns, max_fields=3)
+            hidden += total - shown
 
-        embed.set_footer(text=f"{len(sr)} level + {len(mv)} momentum alert(s){filt} • /mc_remove to delete")
+        foot = f"{len(sr)} level + {len(mv)} momentum alert(s){filt} • /mc_remove to delete"
+        if hidden:
+            foot += f" • {hidden} row(s) not shown — filter with user: to narrow"
+        embed.set_footer(text=foot)
         await inter.followup.send(embed=embed, ephemeral=not public)
 
     # ---------------- /mc_remove ----------------
@@ -506,7 +526,18 @@ class AlertsCog(commands.Cog):
         embed = discord.Embed(
             title="Recent Alerts", description=f"Most recent {len(evs)} alert(s){filt}", color=0xF39C12
         )
-        embed.add_field(name="History", value=alerts_table(evs, name_by_id, current_by_ca), inline=False)
+        # count accepts up to 50, which is far past what one embed field holds.
+        shown, total = add_table_fields(
+            embed,
+            "History",
+            ALERTS_HEADERS,
+            alerts_rows(evs, name_by_id, current_by_ca),
+            ALERTS_ALIGNS,
+            max_width=14,
+            max_fields=5,
+        )
+        if shown < total:
+            embed.set_footer(text=f"Showing {shown} of {total} — ask for fewer with count:")
         await inter.followup.send(embed=embed, ephemeral=not public)
 
     # ---------------- /mc_status ----------------

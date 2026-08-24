@@ -17,7 +17,7 @@ from ..dex import token_summary
 from ..helpers import humanize, short_ca
 from ..models import WatchItem
 from ..storage import save_watchlist, watchlist
-from ..tables import fixed_table
+from ..tables import add_table_fields
 
 DEFAULT_LIST = "default"
 
@@ -178,7 +178,6 @@ class WatchCog(commands.Cog):
                 ],
             )
 
-        table = fixed_table(["Token", "MC", "24h", "Liq"], rows, ["l", "r", "r", "r"], max_width=12)
         gainers = sum(1 for _, i in pairs if i["change24"] > 0)
 
         embed = discord.Embed(
@@ -186,8 +185,16 @@ class WatchCog(commands.Cog):
             description=f"{len(items)} token(s) · combined MC **${humanize(total_mc)}**",
             color=0x2B90D9,
         )
-        embed.add_field(name="Sorted by 24h change", value=table, inline=False)
+        # Split across fields: one field caps at 1024 chars, and a long list of
+        # long symbols reaches that well inside MAX_WATCH_PER_LIST.
+        shown, total_rows = add_table_fields(
+            embed, "Sorted by 24h change",
+            ["Token", "MC", "24h", "Liq"], rows, ["l", "r", "r", "r"],
+            max_width=12, max_fields=4,
+        )
         foot = f"{gainers} up / {len(pairs) - gainers} down"
+        if shown < total_rows:
+            foot += f" · {total_rows - shown} row(s) not shown"
         if missing:
             foot += f" · {missing} with no market data"
         embed.set_footer(text=foot)
@@ -204,7 +211,7 @@ class WatchCog(commands.Cog):
             return
         rows = [[n, str(len(entries(inter, n)))] for n in names]
         embed = discord.Embed(title="Watchlists", color=0x2B90D9)
-        embed.add_field(name="This server", value=fixed_table(["List", "Tokens"], rows, ["l", "r"]), inline=False)
+        add_table_fields(embed, "This server", ["List", "Tokens"], rows, ["l", "r"], max_fields=3)
         await inter.followup.send(embed=embed, ephemeral=True)
 
 

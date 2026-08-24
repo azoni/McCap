@@ -50,7 +50,7 @@ from ..storage import (
     scans_to_track,
     watchlist,
 )
-from ..tables import fixed_table
+from ..tables import add_table_fields
 
 
 def _fmt_mult(m: Optional[float]) -> str:
@@ -392,12 +392,14 @@ class ScansCog(commands.Cog):
             ),
             colour=0x2B90D9,
         )
-        embed.add_field(
-            name="Ranked by " + ("peak" if key == "peak" else "current"),
-            value=fixed_table(["Token", "At scan", "Peak", "Now"], rows, ["l", "r", "r", "r"]),
-            inline=False,
+        shown, total_rows = add_table_fields(
+            embed, "Ranked by " + ("peak" if key == "peak" else "current"),
+            ["Token", "At scan", "Peak", "Now"], rows, ["l", "r", "r", "r"], max_fields=4,
         )
-        embed.set_footer(text=f"Each scan is tracked for {SCAN_TRACK_HOURS}h after detection")
+        foot = f"Each scan is tracked for {SCAN_TRACK_HOURS}h after detection"
+        if shown < total_rows:
+            foot += f" · {total_rows - shown} row(s) not shown"
+        embed.set_footer(text=foot)
         await inter.followup.send(embed=embed)
 
     @scans.command(name="recent", description="Most recently detected scans")
@@ -418,10 +420,9 @@ class ScansCog(commands.Cog):
             _fmt_mult(s.current_multiple()),
         ] for s in evs]
         embed = discord.Embed(title="Recent scans", colour=0xF39C12)
-        embed.add_field(
-            name=f"{len(evs)} detection(s)",
-            value=fixed_table(["Token", "CA", "At scan", "Now"], rows, ["l", "l", "r", "r"]),
-            inline=False,
+        add_table_fields(
+            embed, f"{len(evs)} detection(s)",
+            ["Token", "CA", "At scan", "Now"], rows, ["l", "l", "r", "r"], max_fields=3,
         )
         await inter.followup.send(embed=embed, ephemeral=True)
 
