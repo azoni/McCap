@@ -8,7 +8,7 @@ import pytest
 
 import mccapbot.alerts as A
 from mccapbot.cogs.alerts import AlertsCog
-from mccapbot.models import MoveAlert, Reminder, ScanEvent
+from mccapbot.models import MoveAlert, ScanEvent
 
 
 class User:

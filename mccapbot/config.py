@@ -133,3 +133,11 @@ MAX_SCAN_EVENTS = _env_int("MAX_SCAN_EVENTS", 2000)
 # How long a scanned token keeps being re-checked to find its peak.
 SCAN_TRACK_HOURS = _env_int("SCAN_TRACK_HOURS", 48)
 SCAN_TRACK_INTERVAL = _env_int("SCAN_TRACK_INTERVAL", 300)
+
+# ---- Wallet presence ----
+# The bot's SOL balance in its Discord status line. DONATION_WALLET is accepted
+# as an alias because that is the name already provisioned on Railway from the
+# original Solana Pay setup.
+SOLANA_WALLET = (os.getenv("SOLANA_WALLET") or os.getenv("DONATION_WALLET") or "").strip()
+SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com").strip()
+SHOW_BALANCE = _env_flag("SHOW_BALANCE", True)

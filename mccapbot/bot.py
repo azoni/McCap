@@ -1,11 +1,20 @@
 import asyncio
+from typing import Optional
 
 import discord
 from discord.ext import commands
 
 from .alerts import watcher as alerts_watcher
-from .config import DEX_BLACKLIST, LOG_LEVEL, PRESENCE_REFRESH_SECONDS, SCAN_WATCH_ENABLE
+from .config import (
+    DEX_BLACKLIST,
+    LOG_LEVEL,
+    PRESENCE_REFRESH_SECONDS,
+    SCAN_WATCH_ENABLE,
+    SHOW_BALANCE,
+    SOLANA_WALLET,
+)
 from .http import close_session
+from .solana import get_balance
 from .logging_setup import log
 from .storage import (
     load_alerts,
@@ -42,24 +51,42 @@ class Bot(commands.Bot):
     # ---------------- background loops ----------------
 
     async def _presence_loop(self):
-        """Show what the bot is actually tracking.
-
-        This used to display a donation wallet's SOL balance, which told nobody
-        anything useful now that payments are gone.
-        """
+        """Status line: the bot's SOL balance plus what it is tracking."""
         await self.wait_until_ready()
+        last_balance: Optional[float] = None
+
         while not self.is_closed():
-            total = len(reminders) + len(move_alerts)
-            tokens = len(watched_addresses())
-            name = f"{total} alert(s) · {tokens} token(s)" if total else "for /mc alerts"
+            if SHOW_BALANCE and SOLANA_WALLET:
+                balance = await get_balance(SOLANA_WALLET)
+                # None means the RPC call failed, which is not the same as an
+                # empty wallet — keep the last known figure rather than
+                # advertising 0.00 SOL because of a transient blip.
+                if balance is not None:
+                    last_balance = balance
+
             try:
                 await self.change_presence(
                     status=discord.Status.online,
-                    activity=discord.Activity(type=discord.ActivityType.watching, name=name),
+                    activity=discord.Activity(
+                        type=discord.ActivityType.watching,
+                        name=self._presence_text(last_balance),
+                    ),
                 )
             except Exception:
                 log.exception("Failed to update presence")
             await asyncio.sleep(PRESENCE_REFRESH_SECONDS)
+
+    @staticmethod
+    def _presence_text(balance: Optional[float]) -> str:
+        """Build the status line from whatever is actually known."""
+        parts = []
+        if balance is not None:
+            parts.append(f"💰 {balance:,.2f} SOL")
+        total = len(reminders) + len(move_alerts)
+        if total:
+            parts.append(f"{total} alert(s)")
+            parts.append(f"{len(watched_addresses())} token(s)")
+        return " · ".join(parts) if parts else "for /mc alerts"
 
     # ---------------- lifecycle ----------------
 
