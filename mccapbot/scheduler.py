@@ -123,6 +123,30 @@ def backoff_interval(interval: int, no_data_streak: int) -> int:
     return min(interval * (2 ** min(no_data_streak, MAX_BACKOFF_DOUBLINGS)), MAX_BACKOFF_SECONDS)
 
 
+def effective_intervals(
+    reminders: Iterable,
+    moves: Iterable,
+    mc_by_ca: Dict[str, Optional[float]],
+    no_data: Optional[Dict[str, int]] = None,
+) -> Dict[str, int]:
+    """The intervals actually used, backoff included.
+
+    Both scheduling and the reported request rate read this. They used to
+    compute intervals separately, so the backoff applied to polling but not to
+    the figure in the logs — which then overstated real load.
+    """
+    no_data = no_data or {}
+    move_cas = {m.ca for m in moves}
+    out: Dict[str, int] = {}
+    for ca, interval in intervals_by_address(reminders, moves, mc_by_ca).items():
+        # A momentum alert needs its steady sample rate regardless — its window
+        # maths depends on it — so only level-only tokens get backed off.
+        if ca not in move_cas:
+            interval = backoff_interval(interval, no_data.get(ca, 0))
+        out[ca] = interval
+    return out
+
+
 def due_addresses(
     reminders: Iterable,
     moves: Iterable,
@@ -132,13 +156,8 @@ def due_addresses(
     no_data: Optional[Dict[str, int]] = None,
 ) -> List[str]:
     """Return the contract addresses whose refresh interval has elapsed."""
-    no_data = no_data or {}
     due: List[str] = []
-    for ca, interval in intervals_by_address(reminders, moves, mc_by_ca).items():
-        # A momentum alert needs its steady sample rate regardless — its window
-        # maths depends on it — so only level-only tokens get backed off.
-        if not any(m.ca == ca for m in moves):
-            interval = backoff_interval(interval, no_data.get(ca, 0))
+    for ca, interval in effective_intervals(reminders, moves, mc_by_ca, no_data).items():
         seen = last_checked.get(ca)
         if seen is None or (now - seen) >= interval:
             due.append(ca)
@@ -165,6 +184,15 @@ def estimated_requests_per_minute(
     reminders: Iterable,
     moves: Iterable,
     mc_by_ca: Dict[str, Optional[float]],
+    no_data: Optional[Dict[str, int]] = None,
 ) -> float:
-    """Projected outgoing request rate for the current alert set."""
-    return sum(60.0 / i for i in intervals_by_address(reminders, moves, mc_by_ca).values() if i > 0)
+    """Projected outgoing request rate, matching what the scheduler will do.
+
+    Pass ``no_data`` to include the dead-token backoff; without it this reports
+    the un-backed-off ceiling.
+    """
+    return sum(
+        60.0 / i
+        for i in effective_intervals(reminders, moves, mc_by_ca, no_data).values()
+        if i > 0
+    )

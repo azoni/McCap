@@ -12,7 +12,9 @@ from mccapbot.config import (
 )
 from mccapbot.models import MoveAlert, Reminder
 from mccapbot.scheduler import (
+    MAX_BACKOFF_SECONDS,
     describe_tiers,
+    effective_intervals,
     due_addresses,
     estimated_requests_per_minute,
     interval_for_move,
@@ -162,3 +164,60 @@ def test_describe_tiers_counts():
     rs = [mk(ca="A"), mk(ca="B"), mk(ca="C")]
     mc = {"A": 999_000, "B": 600_000, "C": None}
     assert describe_tiers(rs, mc) == {"hot": 1, "warm": 1, "cold": 0, "unknown": 1}
+
+
+# ---------------- scheduling and reporting must agree ----------------
+
+
+def test_reported_rate_reflects_the_backoff():
+    """The estimate and the scheduler used to compute intervals separately, so
+    the backoff applied to polling but not to the number in the logs — which
+    then overstated real load by ~4.7x in production."""
+    dead = [mk(ca=f"D{i}", target=1_000_000) for i in range(20)]
+    mc = {r.ca: None for r in dead}
+
+    ceiling = estimated_requests_per_minute(dead, [], mc)
+    settled = estimated_requests_per_minute(dead, [], mc, {r.ca: 5 for r in dead})
+    assert settled < ceiling, "backoff must lower the reported rate"
+    assert settled == pytest.approx(20 * 60 / MAX_BACKOFF_SECONDS)
+
+
+def test_estimate_matches_what_the_scheduler_actually_polls():
+    """Same intervals, one source of truth."""
+    rs = [mk(ca="LIVE", target=100_000_000), mk(ca="DEAD", target=1_000_000)]
+    mc = {"LIVE": 500_000.0, "DEAD": None}
+    no_data = {"DEAD": 5}
+
+    intervals = effective_intervals(rs, [], mc, no_data)
+    expected = sum(60.0 / i for i in intervals.values())
+    assert estimated_requests_per_minute(rs, [], mc, no_data) == pytest.approx(expected)
+
+    # And a token is due exactly when its effective interval says so.
+    for ca, interval in intervals.items():
+        assert due_addresses(rs, [], mc, {ca: 0.0}, interval - 1, no_data).count(ca) == 0
+        assert ca in due_addresses(rs, [], mc, {ca: 0.0}, interval, no_data)
+
+
+def test_omitting_no_data_reports_the_un_backed_off_ceiling():
+    """Callers that don't track streaks still get a safe upper bound."""
+    dead = [mk(ca="D", target=1_000_000)]
+    mc = {"D": None}
+    assert estimated_requests_per_minute(dead, [], mc) == pytest.approx(60 / POLL_UNKNOWN_SECONDS)
+
+
+def test_production_shape_stays_far_under_the_limit():
+    """40 alerts over 33 tokens, 21 of them dead — the live configuration."""
+    rs, mc = [], {}
+    for i in range(16):
+        ca = f"LIVE{i % 12}"
+        rs.append(mk(ca=ca, target=100_000_000))
+        mc[ca] = 500_000.0
+    for i in range(24):
+        ca = f"DEAD{i % 21}"
+        rs.append(mk(ca=ca, target=1_000_000))
+        mc[ca] = None
+
+    assert describe_tiers(rs, mc) == {"hot": 0, "warm": 0, "cold": 16, "unknown": 24}
+    settled = estimated_requests_per_minute(rs, [], mc, {c: 5 for c in mc if mc[c] is None})
+    assert settled < DEX_HARD_LIMIT
+    assert settled < 5, f"dead tokens should barely register once backed off: {settled}"

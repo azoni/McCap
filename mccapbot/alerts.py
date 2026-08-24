@@ -374,7 +374,7 @@ async def watcher(client: discord.Client) -> None:
                 if mono - last_rate_log > 900:
                     async with TOKEN_CACHE_LOCK:
                         warm = {ca: (token_cache[ca].mc if ca in token_cache else None) for ca in addresses}
-                    rate = estimated_requests_per_minute(reminders, move_alerts, warm)
+                    rate = estimated_requests_per_minute(reminders, move_alerts, warm, _no_data)
                     tiers = describe_tiers(reminders, warm)
                     # Report tokens currently returning nothing, not just those
                     # past the give-up threshold. The backoff slows how fast a

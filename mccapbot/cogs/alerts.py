@@ -604,7 +604,7 @@ class AlertsCog(commands.Cog):
             mc_all = {ca: (token_cache[ca].mc if ca in token_cache else None) for ca in addresses}
 
         tiers = describe_tiers(reminders, mc_all)
-        rate = estimated_requests_per_minute(reminders, move_alerts, mc_all)
+        rate = estimated_requests_per_minute(reminders, move_alerts, mc_all, watcher_no_data)
 
         rows = [
             ["🔥 hot (near target)", str(tiers["hot"])],
