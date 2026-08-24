@@ -21,6 +21,8 @@ from ..helpers import (
     parse_window,
     username_from_id,
 )
+from ..alerts import NO_DATA_GIVE_UP
+from ..alerts import _no_data as watcher_no_data
 from ..models import MoveAlert, Reminder
 from ..scheduler import (
     describe_tiers,
@@ -614,18 +616,32 @@ class AlertsCog(commands.Cog):
         embed.add_field(name="Level alerts by tier", value=fixed_table(["Tier", "Count"], rows, ["l", "r"]), inline=False)
 
         warming = sum(1 for m in move_alerts if history.pct_change(m.ca, m.window_sec, time.time()) is None)
-        embed.add_field(
-            name="Load",
-            value=(
-                f"**{len(reminders)}** level + **{len(move_alerts)}** momentum alert(s)\n"
-                f"over **{len(addresses)}** token(s)\n"
-                f"≈ **{rate:.0f}** DexScreener req/min (limit 300)\n"
-                f"**{warming}** momentum alert(s) still filling their window\n"
-                f"**{len(self._scoped(inter))}** level alert(s) "
-                f"{'in this server' if inter.guild_id else 'on your account'}"
-            ),
-            inline=False,
-        )
+        dead = sum(1 for ca in addresses if watcher_no_data.get(ca, 0) > 0)
+        backed_off = sum(1 for ca in addresses if watcher_no_data.get(ca, 0) >= NO_DATA_GIVE_UP)
+
+        lines = [
+            f"**{len(reminders)}** level + **{len(move_alerts)}** momentum alert(s)",
+            f"over **{len(addresses)}** token(s)",
+            f"≈ **{rate:.0f}** DexScreener req/min (limit 300)",
+            f"**{warming}** momentum alert(s) still filling their window",
+            f"**{len(self._scoped(inter))}** level alert(s) "
+            f"{'in this server' if inter.guild_id else 'on your account'}",
+        ]
+        embed.add_field(name="Load", value="\n".join(lines), inline=False)
+
+        if dead:
+            # These can never fire, so say so plainly rather than leaving the
+            # owner to wonder why a third of the list shows n/a.
+            embed.add_field(
+                name="⚠️ Tokens reporting no market cap",
+                value=(
+                    f"**{dead}** of {len(addresses)} tracked token(s) return no market cap, so "
+                    f"their alerts cannot fire. **{backed_off}** have been backed off to the "
+                    "slowest polling rate.\nUse `/mc_list` (shown as `n/a`) and `/mc_remove` "
+                    "to clear them out."
+                ),
+                inline=False,
+            )
         await inter.followup.send(embed=embed, ephemeral=True)
 
 

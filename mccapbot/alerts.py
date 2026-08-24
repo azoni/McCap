@@ -376,11 +376,17 @@ async def watcher(client: discord.Client) -> None:
                         warm = {ca: (token_cache[ca].mc if ca in token_cache else None) for ca in addresses}
                     rate = estimated_requests_per_minute(reminders, move_alerts, warm)
                     tiers = describe_tiers(reminders, warm)
-                    blind = sum(1 for ca in addresses if _no_data.get(ca, 0) >= NO_DATA_GIVE_UP)
+                    # Report tokens currently returning nothing, not just those
+                    # past the give-up threshold. The backoff slows how fast a
+                    # streak accumulates, so thresholding here read as
+                    # "0 with no market data" while 16 of 33 had none.
+                    no_data_now = sum(1 for ca in addresses if _no_data.get(ca, 0) > 0)
+                    backed_off = sum(1 for ca in addresses if _no_data.get(ca, 0) >= NO_DATA_GIVE_UP)
                     log.info(
                         "Watching %d level + %d move alert(s) across %d token(s) — ~%.0f req/min "
-                        "| tiers %s | %d token(s) with no market data",
-                        len(reminders), len(move_alerts), len(addresses), rate, tiers, blind,
+                        "| tiers %s | %d token(s) reporting no market cap (%d fully backed off)",
+                        len(reminders), len(move_alerts), len(addresses), rate,
+                        tiers, no_data_now, backed_off,
                     )
                     last_rate_log = mono
         except asyncio.CancelledError:
