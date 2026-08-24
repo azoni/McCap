@@ -211,7 +211,9 @@ class ScansCog(commands.Cog):
         watchlist.append(WatchItem(
             ca=ev.ca,
             guild_id=ev.guild_id,
-            added_by=ev.scanner_id,
+            # The human who triggered the scan when we could resolve them; 0
+            # means "nobody in particular", never the scanner bot's own id.
+            added_by=ev.requested_by,
             name=ev.name,
             symbol=ev.symbol,
             list_name=SCAN_AUTO_WATCHLIST_NAME,
@@ -239,7 +241,10 @@ class ScansCog(commands.Cog):
             window_sec=SCAN_AUTO_MOVE_WINDOW,
             direction="both",
             channel_id=ev.channel_id,
-            creator_id=ev.scanner_id,
+            # Owned by whoever asked for the scan, not by the scanner bot.
+            # Using the bot's id pinged the BOT when the alert fired, and made
+            # the alert unremovable by anyone without Manage Server.
+            creator_id=ev.requested_by,
             guild_id=ev.guild_id,
             name=ev.name,
             symbol=ev.symbol,

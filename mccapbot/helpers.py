@@ -120,6 +120,10 @@ def _median(vals: List[float]) -> float:
 
 
 async def username_from_id(client: discord.Client, user_id: int) -> str:
+    # 0 means "no human owner" — an alert armed automatically from a detected
+    # scan. Looking that up would fail and render the literal "user:0".
+    if not user_id:
+        return "auto"
     user = client.get_user(user_id)
     if user is None:
         try: user = await client.fetch_user(user_id)

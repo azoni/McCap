@@ -135,6 +135,15 @@ def _record_event(rem, current_mc, kind: str, direction: str, target: float) -> 
     del alert_events[MAX_ALERT_EVENTS:]
 
 
+def _mention(user_id: int) -> Optional[str]:
+    """Ping the owner, or nobody.
+
+    An auto-armed alert may have no resolvable human behind it (creator_id 0).
+    Formatting that anyway posts a literal, broken "<@0>" mention.
+    """
+    return f"<@{user_id}>" if user_id else None
+
+
 async def _fire_level(client: discord.Client, rem, current_mc, snap) -> None:
     ch = await client.fetch_channel(rem.channel_id)
     color = 0x2ECC71 if rem.direction == "above" else 0xE74C3C
@@ -159,7 +168,7 @@ async def _fire_level(client: discord.Client, rem, current_mc, snap) -> None:
     embed.set_footer(text=f"Set by {user_name} • alert {rem.id}")
 
     await ch.send(
-        content=f"<@{rem.creator_id}>",
+        content=_mention(rem.creator_id),
         embed=embed,
         allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False, replied_user=False),
     )
@@ -194,7 +203,7 @@ async def _fire_move(client: discord.Client, mv, change: float, current_mc, snap
     )
 
     await ch.send(
-        content=f"<@{mv.creator_id}>",
+        content=_mention(mv.creator_id),
         embed=embed,
         allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False, replied_user=False),
     )

@@ -145,6 +145,16 @@ class AlertsCog(commands.Cog):
         return [m for m in move_alerts if m.creator_id == inter.user.id]
 
     @staticmethod
+    def _may_remove(user, owner_id: int, can_manage: bool) -> bool:
+        """Who is allowed to delete an alert.
+
+        creator_id 0 means it was armed automatically from a detected scan and
+        belongs to nobody, so anyone in the server can clear it — otherwise the
+        server accumulates alerts only an admin can remove.
+        """
+        return (not owner_id) or user.id == owner_id or can_manage
+
+    @staticmethod
     def _can_manage(user: discord.abc.User) -> bool:
         return isinstance(user, discord.Member) and (
             user.guild_permissions.manage_guild or user.guild_permissions.administrator
@@ -428,14 +438,14 @@ class AlertsCog(commands.Cog):
         can_manage = self._can_manage(inter.user)
         out = []
         for r in self._scoped(inter):
-            if not (r.creator_id == inter.user.id or can_manage):
+            if not self._may_remove(inter.user, r.creator_id, can_manage):
                 continue
             label = f"{r.symbol or r.name} {'≥' if r.direction == 'above' else '≤'} ${humanize(r.target_mc)} ({r.id})"
             if q and q not in label.lower() and q not in r.ca.lower():
                 continue
             out.append(app_commands.Choice(name=label[:100], value=r.id))
         for m in self._scoped_moves(inter):
-            if not (m.creator_id == inter.user.id or can_manage):
+            if not self._may_remove(inter.user, m.creator_id, can_manage):
                 continue
             arrow = {"up": "▲", "down": "▼", "both": "±"}[m.direction]
             label = f"{m.symbol or m.name} {arrow}{m.pct:g}%/{human_window(m.window_sec)} ({m.id})"
@@ -492,7 +502,7 @@ class AlertsCog(commands.Cog):
         removed, denied = [], []
 
         for rem in picked:
-            if inter.user.id != rem.creator_id and not can_manage:
+            if not self._may_remove(inter.user, rem.creator_id, can_manage):
                 denied.append(rem)
                 continue
             try:
@@ -503,7 +513,7 @@ class AlertsCog(commands.Cog):
             removed.append(("level", rem))
 
         for mv in move_hits:
-            if inter.user.id != mv.creator_id and not can_manage:
+            if not self._may_remove(inter.user, mv.creator_id, can_manage):
                 denied.append(mv)
                 continue
             try:
