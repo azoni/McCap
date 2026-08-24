@@ -54,6 +54,10 @@ class MoveAlert:
     created_ts: float = field(default_factory=time.time)
     cooldown_sec: int = 1800
     last_fired_ts: float = 0.0
+    # Auto-armed alerts (e.g. from a detected scan) expire, so one scanned token
+    # doesn't consume request budget forever. 0 means never expires — the
+    # default, and what every user-created alert keeps.
+    auto_expires_ts: float = 0.0
 
 
 @dataclass
@@ -96,3 +100,41 @@ class AlertEvent:
     guild_id: int
     creator_id: int
     kind: str = "level"      # "level" | "move"
+
+
+@dataclass
+class ScanEvent:
+    """A token seen in a scanner bot's post, tracked for later performance.
+
+    ``mc_at_scan`` is the whole point: it is the entry price the call is judged
+    against. ``peak_mc`` is updated as the token is re-checked, so the report can
+    say what the best exit would have been rather than only where it ended up.
+    """
+
+    ca: str
+    guild_id: int
+    channel_id: int
+    scanner_id: int              # bot that posted the scan
+    name: str
+    symbol: str
+    mc_at_scan: Optional[float]
+    message_id: int = 0
+    requested_by: int = 0        # human who triggered the scan, 0 if unknown
+    id: str = field(default_factory=new_id)
+    ts: float = field(default_factory=time.time)
+    # --- performance tracking, updated by the tracker loop ---
+    peak_mc: Optional[float] = None
+    peak_ts: float = 0.0
+    last_mc: Optional[float] = None
+    last_checked_ts: float = 0.0
+
+    def multiple(self) -> Optional[float]:
+        """Peak gain as a multiple of the scan price (2.0 == a 2x)."""
+        if not self.mc_at_scan or self.mc_at_scan <= 0 or self.peak_mc is None:
+            return None
+        return self.peak_mc / self.mc_at_scan
+
+    def current_multiple(self) -> Optional[float]:
+        if not self.mc_at_scan or self.mc_at_scan <= 0 or self.last_mc is None:
+            return None
+        return self.last_mc / self.mc_at_scan

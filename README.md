@@ -28,6 +28,43 @@ Discord bot for Solana market-cap alerts and token watchlists.
 Watchlists are read-on-demand: tokens are fetched only when someone runs
 `/watch view`, so a long list costs nothing in the background.
 
+### Scan watching (Rick and other scanner bots)
+
+Off by default. When enabled, McCap notices when a scanner bot posts a token
+scan, records the market cap at that moment, and afterwards tracks what the
+token actually did.
+
+| Command | What it does |
+|---|---|
+| `/scans report [hours] [sort]` | Were the calls any good? Ranks scanned tokens by peak or current gain, with a median and a 2x hit count. |
+| `/scans recent [count]` | Most recent detections. |
+| `/scans status` | Whether detection is actually working, and why not if it isn't. |
+
+**Enabling it — order matters.** Turn on *Message Content Intent* under
+**Bot → Privileged Gateway Intents** in the Discord Developer Portal **first**,
+then set `SCAN_WATCH_ENABLE=1`. No Discord approval is needed for this intent,
+but requesting it before the portal grants it makes Discord refuse the
+connection entirely (close code 4014). `main.py` catches that and starts without
+the intent rather than staying offline, so a mis-set flag costs you scan
+detection, not the whole bot.
+
+Setting `SCANNER_BOT_IDS` to Rick's bot user id is strongly recommended. Left
+blank, McCap treats *any* bot posting a resolvable mint as a scanner.
+
+On detection it can add the token to a `scans` watchlist, reply with its own
+consensus numbers, and auto-arm a momentum alert. Auto-armed alerts are capped
+(`SCAN_AUTO_MOVE_MAX`) and expire (`SCAN_AUTO_MOVE_TTL`) because every armed
+alert costs polling — without both, a busy scan channel would quietly eat the
+whole request budget.
+
+Two things worth knowing. Detection reads messages in the channels it watches,
+which is what the privileged intent is for — `SCAN_CHANNEL_IDS` narrows it to
+specific channels. And it depends on another bot's undocumented message format,
+so the parser sweeps every surface of a message (content, all embed text, and
+button URLs) rather than one field, and **logs a warning when a scanner posts
+something it can't extract a mint from** — a format change shows up as a log
+line instead of silence.
+
 ### Where commands work
 
 McCap is **user-installable** — install it to your account and the read-only
@@ -110,7 +147,7 @@ the Dockerfile.
 **Keep one replica.** Two instances means every alert posts twice.
 
 State files on the volume: `reminders.json`, `moves.json`, `watchlists.json`,
-`alerts.json`. To carry data over:
+`alerts.json`, `scans.json`. To carry data over:
 
 ```bash
 railway volume files -v mccap-volume upload ./reminders.json reminders.json

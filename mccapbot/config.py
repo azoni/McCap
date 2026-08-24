@@ -15,6 +15,14 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+def _env_flag(key: str, default: bool = False) -> bool:
+    """Read a boolean env var. Anything falsy-looking turns the feature off."""
+    raw = (os.getenv(key) or "").strip().lower()
+    if not raw:
+        return default
+    return raw not in ("0", "false", "no", "off")
+
+
 # ---- Discord ----
 # Railway/Render templates historically set DISCORD_TOKEN while this bot read
 # MCCAP_TOKEN. Accept either so a deploy can't boot tokenless over a name typo.
@@ -75,3 +83,53 @@ WATCH_FILE = str(DATA_DIR / "watchlists.json")
 
 MAX_ALERT_EVENTS = _env_int("MAX_ALERT_EVENTS", 1000)
 MAX_WATCH_PER_LIST = _env_int("MAX_WATCH_PER_LIST", 25)
+
+# ---- Scan watching (Rick and other scanner bots) ----
+# Reading other bots' scan messages needs the MESSAGE_CONTENT privileged intent,
+# which is a Developer Portal toggle (no Discord approval required). Without it
+# embeds/components arrive empty and detection is inert, so the listener logs a
+# loud warning at startup rather than failing silently.
+# Defaults OFF on purpose. Requesting a privileged intent the Developer Portal
+# has not granted does not degrade gracefully — Discord closes the gateway with
+# 4014 and the bot cannot log in at all. So the portal toggle goes on FIRST,
+# then SCAN_WATCH_ENABLE=1. main.py also retries without the intent if this is
+# set while the toggle is still off, so a mis-set flag can't brick the bot.
+SCAN_WATCH_ENABLE = _env_flag("SCAN_WATCH_ENABLE", False)
+
+# Bot user ids whose messages are treated as scans. Empty means "any bot except
+# ourselves" — convenient, but see SCAN_IGNORE_SELF: reacting to our own posts
+# would be an infinite loop.
+SCANNER_BOT_IDS = {
+    int(x) for x in (os.getenv("SCANNER_BOT_IDS") or "").replace(",", " ").split() if x.isdigit()
+}
+# Optional channel allowlist. Empty means every channel the bot can see.
+SCAN_CHANNEL_IDS = {
+    int(x) for x in (os.getenv("SCAN_CHANNEL_IDS") or "").replace(",", " ").split() if x.isdigit()
+}
+
+# Don't record the same token twice in this window (repeat scans are constant).
+SCAN_DEDUPE_SECONDS = _env_int("SCAN_DEDUPE_SECONDS", 900)
+
+# --- what to do on detection ---
+SCAN_AUTO_WATCHLIST = _env_flag("SCAN_AUTO_WATCHLIST", True)
+SCAN_AUTO_WATCHLIST_NAME = os.getenv("SCAN_AUTO_WATCHLIST_NAME", "scans")
+SCAN_POST_OPINION = _env_flag("SCAN_POST_OPINION", True)
+# Per-channel floor between second-opinion replies, so a scan flood can't make
+# McCap the noisiest bot in the room.
+SCAN_OPINION_MIN_SECONDS = _env_int("SCAN_OPINION_MIN_SECONDS", 60)
+
+# Auto-arm a momentum alert on each newly scanned token. Every armed alert costs
+# polling, so this is capped: past the cap new scans are recorded and watchlisted
+# but not armed.
+SCAN_AUTO_MOVE_PCT = float(os.getenv("SCAN_AUTO_MOVE_PCT", "30"))
+SCAN_AUTO_MOVE_WINDOW = _env_int("SCAN_AUTO_MOVE_WINDOW", 3600)
+SCAN_AUTO_MOVE_MAX = _env_int("SCAN_AUTO_MOVE_MAX", 15)
+# Auto-armed alerts expire; a token scanned once shouldn't be polled forever.
+SCAN_AUTO_MOVE_TTL = _env_int("SCAN_AUTO_MOVE_TTL", 86400)
+
+# --- performance tracking ---
+SCANS_FILE = str(DATA_DIR / "scans.json")
+MAX_SCAN_EVENTS = _env_int("MAX_SCAN_EVENTS", 2000)
+# How long a scanned token keeps being re-checked to find its peak.
+SCAN_TRACK_HOURS = _env_int("SCAN_TRACK_HOURS", 48)
+SCAN_TRACK_INTERVAL = _env_int("SCAN_TRACK_INTERVAL", 300)

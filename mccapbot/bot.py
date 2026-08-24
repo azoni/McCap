@@ -4,13 +4,14 @@ import discord
 from discord.ext import commands
 
 from .alerts import watcher as alerts_watcher
-from .config import DEX_BLACKLIST, LOG_LEVEL, PRESENCE_REFRESH_SECONDS
+from .config import DEX_BLACKLIST, LOG_LEVEL, PRESENCE_REFRESH_SECONDS, SCAN_WATCH_ENABLE
 from .http import close_session
 from .logging_setup import log
 from .storage import (
     load_alerts,
     load_moves,
     load_reminders,
+    load_scans,
     load_watchlist,
     move_alerts,
     reminders,
@@ -22,15 +23,19 @@ EXTENSIONS = (
     "mccapbot.cogs.alerts",
     "mccapbot.cogs.watch",
     "mccapbot.cogs.lp",
+    "mccapbot.cogs.scans",
 )
 
 
 class Bot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
-        # Slash commands don't need message content; leaving it off avoids
-        # requiring a privileged intent in the developer portal.
-        intents.message_content = False
+        # Slash commands need no message content. It is required only to read
+        # OTHER bots' scan embeds (see cogs/scans.py) and is a privileged
+        # intent, so it stays opt-in: the code requesting it is not enough,
+        # the Developer Portal toggle has to be on too or the gateway refuses
+        # the connection.
+        intents.message_content = SCAN_WATCH_ENABLE
         super().__init__(command_prefix="!", intents=intents)
         self._bg_tasks: list[asyncio.Task] = []
 
@@ -63,6 +68,7 @@ class Bot(commands.Bot):
         await load_moves()
         await load_watchlist()
         await load_alerts()
+        await load_scans()
 
         for ext in EXTENSIONS:
             try:

@@ -7,15 +7,25 @@ from dataclasses import asdict, fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Type, TypeVar
 
-from .config import ALERTS_FILE, DATA_DIR, MAX_ALERT_EVENTS, MOVES_FILE, REM_FILE, WATCH_FILE
+from .config import (
+    ALERTS_FILE,
+    DATA_DIR,
+    MAX_ALERT_EVENTS,
+    MAX_SCAN_EVENTS,
+    MOVES_FILE,
+    REM_FILE,
+    SCANS_FILE,
+    WATCH_FILE,
+)
 from .logging_setup import log
-from .models import AlertEvent, MoveAlert, Reminder, WatchItem
+from .models import AlertEvent, MoveAlert, Reminder, ScanEvent, WatchItem
 
 # In-memory
 reminders: List[Reminder] = []
 move_alerts: List[MoveAlert] = []
 watchlist: List[WatchItem] = []
 alert_events: List[AlertEvent] = []
+scan_events: List[ScanEvent] = []
 
 # Locks
 REM_LOCK = asyncio.Lock()
@@ -149,6 +159,37 @@ async def save_alerts() -> None:
 async def load_alerts() -> None:
     if await _load_list(ALERTS_FILE, AlertEvent, alert_events, "alert event(s)"):
         alert_events[:] = sorted(alert_events, key=lambda x: x.ts, reverse=True)[:MAX_ALERT_EVENTS]
+
+
+# ---- Scan events (scanner-bot detections) ----
+SCANS_LOCK = asyncio.Lock()
+
+
+async def save_scans() -> None:
+    async with SCANS_LOCK:
+        _atomic_write(SCANS_FILE, [asdict(s) for s in scan_events])
+
+
+async def load_scans() -> None:
+    if await _load_list(SCANS_FILE, ScanEvent, scan_events, "scan event(s)"):
+        scan_events[:] = sorted(scan_events, key=lambda x: x.ts, reverse=True)[:MAX_SCAN_EVENTS]
+
+
+def recent_scan(ca: str, guild_id: int, within_sec: float, now: float) -> Optional[ScanEvent]:
+    """A prior scan of this token in this guild inside the dedupe window.
+
+    Scanner channels re-scan the same token constantly; without this the history
+    fills with duplicates and the performance report double-counts a single call.
+    """
+    for s in scan_events:
+        if s.ca == ca and s.guild_id == guild_id and (now - s.ts) <= within_sec:
+            return s
+    return None
+
+
+def scans_to_track(track_seconds: float, now: float) -> List[ScanEvent]:
+    """Scans still inside their tracking window, newest first."""
+    return [s for s in scan_events if (now - s.ts) <= track_seconds]
 
 
 def watched_addresses() -> List[str]:
