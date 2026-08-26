@@ -143,3 +143,21 @@ SCAN_TRACK_INTERVAL = _env_int("SCAN_TRACK_INTERVAL", 300)
 SOLANA_WALLET = (os.getenv("SOLANA_WALLET") or os.getenv("DONATION_WALLET") or "").strip()
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com").strip()
 SHOW_BALANCE = _env_flag("SHOW_BALANCE", True)
+
+# ---- Jupiter (holder / risk enrichment + market-cap fallback) ----
+# Free and keyless, and it batches: up to 100 mints in one request, so the whole
+# watchlist is a single call rather than one per token. That also makes it a
+# viable fallback for tokens DexScreener has stopped returning pairs for —
+# measured 10 of 12 such tokens still have a market cap here.
+JUPITER_ENABLE = _env_flag("JUPITER_ENABLE", True)
+JUPITER_URL = os.getenv("JUPITER_URL", "https://lite-api.jup.ag/tokens/v2/search")
+JUPITER_BATCH = _env_int("JUPITER_BATCH", 100)
+# One sweep per interval covers every watched token, so this can be generous.
+JUPITER_REFRESH_SECONDS = _env_int("JUPITER_REFRESH_SECONDS", 90)
+JUPITER_TIMEOUT = _env_int("JUPITER_TIMEOUT", 10)
+# Jupiter publishes no rate-limit headers and no documented keyless quota, so
+# stay well clear of anything that could look abusive.
+JUPITER_MAX_REQUESTS_PER_MIN = _env_int("JUPITER_MAX_REQUESTS_PER_MIN", 30)
+
+# Flag a token in alert embeds when the top 10 wallets hold more than this.
+TOP_HOLDER_WARN_PCT = float(os.getenv("TOP_HOLDER_WARN_PCT", "50"))

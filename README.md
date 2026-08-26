@@ -15,6 +15,7 @@ Discord bot for Solana market-cap alerts and token watchlists.
 | `/mc_recent [count] [user]` | Recently fired alerts. |
 | `/mc_status` | Polling tiers, request rate, and which momentum alerts are still filling their window. |
 | `/mc_lp <ca>` | Best LP venue across Meteora / Raydium / Pumpswap. |
+| `/mc_check <ca>` | Holder count, top-10 concentration, mint/freeze authority, dev mints. |
 
 ### Watchlists
 
@@ -83,6 +84,29 @@ Outside a server there is no guild, so scoping switches from "this server's
 alerts" to "your alerts, across every server", and watchlists become personal
 rather than shared. Both are keyed on the caller — guildless records are *not*
 pooled under a shared id.
+
+### Holder and risk context
+
+Alerts carry a second line beyond the market cap:
+
+```
+🔎 756 holders · ⚠️ top 10 hold 65% · dev minted 25 · organic: low
+```
+
+That comes from **Jupiter's token API** — free, keyless, and batched: up to 100
+mints resolve in one request, so the entire watchlist costs a single call every
+`JUPITER_REFRESH_SECONDS`. `/mc_check <ca>` shows the same data on demand.
+
+It doubles as a **market-cap fallback**. DexScreener stops returning pairs for
+tokens whose pools thin out, which had left a third of this bot's alerts unable
+to fire at all. Jupiter still reports a market cap for most of them — measured on
+the live alert set, 9 tokens went from "no data" to fireable. DexScreener's
+consensus market cap stays primary; Jupiter is only consulted when it comes back
+empty, and `/mc_list` labels the source.
+
+Everything here is best-effort: a Jupiter outage costs you the context line, never
+the alert. Concentration and dev-mint counts are third-party measurements, not
+verdicts — the embed says so.
 
 ## Alert types
 

@@ -4,9 +4,15 @@ from typing import Dict, Optional
 
 import discord
 
-from . import gecko, history
+from . import gecko, history, jupiter
 from .cache import TOKEN_CACHE_LOCK, token_cache
-from .config import MAX_ALERT_EVENTS, POLL_TICK_SECONDS
+from .config import (
+    JUPITER_ENABLE,
+    JUPITER_REFRESH_SECONDS,
+    MAX_ALERT_EVENTS,
+    POLL_TICK_SECONDS,
+    TOP_HOLDER_WARN_PCT,
+)
 from .dex import build_token_url, choose_consensus_pair, fetch_dex_token, get_image_url, resolve_mc_value
 from .helpers import human_window, humanize, meets, username_from_id
 from .logging_setup import log
@@ -37,6 +43,38 @@ _last_checked: Dict[str, float] = {}
 # than a live one. The streak backs the interval off geometrically.
 _no_data: Dict[str, int] = {}
 NO_DATA_GIVE_UP = 5
+
+
+# ca -> JupToken. Populated by a single batched sweep, not per-token, so the whole
+# watchlist costs one request. Used for embed context and as a market-cap fallback
+# for tokens DexScreener has stopped returning pairs for.
+jup_cache: Dict[str, "jupiter.JupToken"] = {}
+
+
+async def jupiter_sweep() -> int:
+    """Refresh Jupiter data for every watched token in one batched request."""
+    if not JUPITER_ENABLE:
+        return 0
+    addresses = watched_addresses()
+    if not addresses:
+        return 0
+    try:
+        fetched = await jupiter.fetch_many(addresses)
+    except Exception:
+        # Decoration must never break the watcher.
+        log.debug("Jupiter sweep failed", exc_info=True)
+        return 0
+    jup_cache.update(fetched)
+    live = set(addresses)
+    for ca in [c for c in jup_cache if c not in live]:
+        jup_cache.pop(ca, None)
+    return len(fetched)
+
+
+def jupiter_mc(ca: str) -> Optional[float]:
+    """Jupiter's market cap for a token, if it has one."""
+    tok = jup_cache.get(ca)
+    return tok.mcap if tok and tok.mcap else None
 
 
 def _note_data_state(ca: str, refresh_result) -> None:
@@ -118,6 +156,15 @@ async def _refresh(ca: str) -> bool:
             quote = ((best.get("quoteToken") or {}).get("symbol") or "").upper()
             img = get_image_url(best, ca) or ""
 
+    # DexScreener drops tokens whose pools thin out, which made a third of this
+    # bot's alerts permanently unfireable. Jupiter still has a market cap for
+    # most of them, so fall back rather than reporting "no data".
+    if mc_val is None:
+        fallback = jupiter_mc(ca)
+        if fallback:
+            mc_val, src = fallback, "jupiter"
+            link = link or build_token_url(ca, None)
+
     now = time.time()
     async with TOKEN_CACHE_LOCK:
         token_cache[ca] = TokenSnapshot(
@@ -177,6 +224,10 @@ async def _fire_level(client: discord.Client, rem, current_mc, snap) -> None:
     if rem.note:
         desc += f"\n\n📝 {rem.note}"
 
+    risk = jupiter.risk_line(jup_cache.get(rem.ca), TOP_HOLDER_WARN_PCT)
+    if risk:
+        desc += f"\n\n🔎 {risk}"
+
     user_name = await username_from_id(client, rem.creator_id)
     embed = discord.Embed(
         title=f"{rem.name} ({rem.symbol})",
@@ -209,6 +260,10 @@ async def _fire_move(client: discord.Client, mv, change: float, current_mc, snap
     )
     if mv.note:
         desc += f"\n\n📝 {mv.note}"
+
+    risk = jupiter.risk_line(jup_cache.get(mv.ca), TOP_HOLDER_WARN_PCT)
+    if risk:
+        desc += f"\n\n🔎 {risk}"
 
     user_name = await username_from_id(client, mv.creator_id)
     embed = discord.Embed(
@@ -369,6 +424,7 @@ async def watcher(client: discord.Client) -> None:
     # request rate — which understated real load roughly twofold.
     last_rate_log = time.monotonic()
     last_gc = last_rate_log
+    last_jup = 0.0
 
     try:
         await backfill_move_history()
@@ -383,6 +439,14 @@ async def watcher(client: discord.Client) -> None:
                     mc_by_ca = {ca: (token_cache[ca].mc if ca in token_cache else None) for ca in addresses}
 
                 mono = time.monotonic()
+
+                # One batched call covers every token, so this is cheap enough to
+                # run on its own cadence independent of the per-token polling.
+                if JUPITER_ENABLE and (mono - last_jup) > JUPITER_REFRESH_SECONDS:
+                    got = await jupiter_sweep()
+                    last_jup = mono
+                    log.debug("Jupiter sweep resolved %d token(s)", got)
+
                 due = due_addresses(reminders, move_alerts, mc_by_ca, _last_checked, mono, _no_data)
 
                 if due:
