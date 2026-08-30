@@ -33,6 +33,7 @@ EXTENSIONS = (
     "mccapbot.cogs.watch",
     "mccapbot.cogs.lp",
     "mccapbot.cogs.check",
+    "mccapbot.cogs.trade",
     "mccapbot.cogs.scans",
 )
 

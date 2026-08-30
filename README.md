@@ -66,6 +66,54 @@ button URLs) rather than one field, and **logs a warning when a scanner posts
 something it can't extract a mint from** — a format change shows up as a log
 line instead of silence.
 
+### Trading (Robinhood Crypto)
+
+**Off by default.** These place real orders against a real brokerage account.
+
+| Command | What it does |
+|---|---|
+| `/rh_balance` | Buying power, holdings, and today's spend against the cap. |
+| `/rh_quote <symbol>` | Best bid/ask for a pair like `BTC-USD`. |
+| `/rh_buy <symbol> <usd>` | Buy a dollar amount. Asks to confirm before executing. |
+| `/rh_sell <symbol> <qty>` | Sell a quantity. Asks to confirm before executing. |
+| `/rh_orders` | Recent orders and their state. |
+
+Everything is ephemeral — balances and orders are never posted to a channel.
+
+**Setup.** Generate a keypair, register the public half, then set four variables:
+
+```bash
+python scripts/generate_rh_keypair.py     # run locally, not on Railway
+
+printf %s "$RH_KEY" | railway variable set RH_API_KEY --stdin -s mccap --skip-deploys
+printf %s "$RH_PRIV" | railway variable set RH_PRIVATE_KEY_B64 --stdin -s mccap --skip-deploys
+railway variable set RH_OWNER_ID=<your discord user id> RH_TRADING_ENABLE=1 -s mccap
+```
+
+Pipe the secrets through stdin so neither the API key nor the signing key lands
+in your shell history.
+
+US-only, and it needs an active Robinhood Crypto account.
+
+**The guards, and why each exists:**
+
+- **`RH_OWNER_ID` gates every command.** McCap runs in shared servers. Without an
+  owner check any member could spend the account holder's money — so an unset
+  owner blocks *everyone*, and is never read as "anyone".
+- **Confirmation button** on every buy and sell, bound to the owner's user id so
+  nobody else can press it. It expires after `RH_CONFIRM_TIMEOUT`.
+- **Per-trade and daily dollar caps**, checked before the order is built *and
+  re-checked after confirmation* — a button can sit unclicked while other orders
+  land.
+- **The daily ledger is on the volume**, not in memory. McCap redeploys several
+  times a day, and a cap that resets on restart is not a cap.
+- **Order sizing rounds down.** Rounding up would breach the very cap the amount
+  was just checked against.
+- Spend is recorded **only after** Robinhood accepts the order.
+
+Note Robinhood lists roughly 15–30 mainstream coins. None of the Solana
+memecoins McCap alerts on are tradeable there — those exist only on DEXes.
+
 ### Where commands work
 
 McCap is **user-installable** — install it to your account and the read-only
