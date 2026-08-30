@@ -22,7 +22,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from .. import robinhood, spend
+from .. import coingecko, robinhood, spend
 from ..config import (
     RH_CONFIRM_TIMEOUT,
     RH_MAX_DAILY_USD,
@@ -31,6 +31,7 @@ from ..config import (
     RH_TRADING_ENABLE,
 )
 from ..logging_setup import log
+from ..tables import add_table_fields
 
 
 def _gate() -> Optional[str]:
@@ -278,6 +279,79 @@ class TradeCog(commands.Cog):
             f"Order `{order.get('id', '?')}` · state `{order.get('state', '?')}`",
             ephemeral=True,
         )
+
+    # ---------------- trending ----------------
+
+    @app_commands.command(
+        name="rh_trending",
+        description="Biggest movers among the coins Robinhood actually lists",
+    )
+    @app_commands.describe(
+        window="Rank by 1h, 24h or 7d change (default 24h)",
+        count="How many to show (default 10, max 25)",
+    )
+    @app_commands.choices(window=[
+        app_commands.Choice(name="1 hour", value="1h"),
+        app_commands.Choice(name="24 hours", value="24h"),
+        app_commands.Choice(name="7 days", value="7d"),
+    ])
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def rh_trending(
+        self,
+        inter: discord.Interaction,
+        window: Optional[app_commands.Choice[str]] = None,
+        count: Optional[int] = 10,
+    ):
+        # Public market data only — no account details, so this needs no owner
+        # gate and is the one trading-adjacent command anyone can run.
+        await inter.response.defer(thinking=True)
+        key = window.value if window else "24h"
+        n = max(1, min(int(count or 10), 25))
+
+        symbols, authoritative = await robinhood.get_trading_pairs()
+        coins = await coingecko.for_symbols(symbols)
+        if not coins:
+            await inter.followup.send(
+                "Couldn't reach CoinGecko for market data — try again shortly."
+            )
+            return
+
+        field = {"1h": "change_1h", "24h": "change_24h", "7d": "change_7d"}[key]
+        ranked = [c for c in coins if getattr(c, field) is not None]
+        ranked.sort(key=lambda c: getattr(c, field), reverse=True)
+        top = ranked[:n]
+
+        rows = [[
+            c.symbol,
+            f"${c.price:,.4f}".rstrip("0").rstrip(".") if c.price else "—",
+            f"{getattr(c, field):+.2f}%",
+            f"{c.change_24h:+.1f}%" if c.change_24h is not None else "—",
+        ] for c in top]
+
+        gainers = sum(1 for c in ranked if getattr(c, field) > 0)
+        embed = discord.Embed(
+            title=f"Robinhood movers · {key}",
+            colour=0x2ECC71 if (top and getattr(top[0], field) > 0) else 0xE74C3C,
+            description=(
+                f"{len(ranked)} tradeable coin(s) · **{gainers} up / "
+                f"{len(ranked) - gainers} down** over {key}"
+            ),
+        )
+        shown, total = add_table_fields(
+            embed, f"Sorted by {key} change",
+            ["Coin", "Price", key, "24h"], rows, ["l", "r", "r", "r"], max_fields=3,
+        )
+        foot = "Prices from CoinGecko"
+        foot += (
+            " · pair list from your Robinhood account"
+            if authoritative
+            else " · pair list is a built-in approximation (no credentials configured)"
+        )
+        if shown < total:
+            foot += f" · {total - shown} row(s) not shown"
+        embed.set_footer(text=foot)
+        await inter.followup.send(embed=embed)
 
     # ---------------- orders ----------------
 

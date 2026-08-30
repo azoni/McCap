@@ -77,8 +77,16 @@ line instead of silence.
 | `/rh_buy <symbol> <usd>` | Buy a dollar amount. Asks to confirm before executing. |
 | `/rh_sell <symbol> <qty>` | Sell a quantity. Asks to confirm before executing. |
 | `/rh_orders` | Recent orders and their state. |
+| `/rh_trending [window] [count]` | Biggest movers among the coins Robinhood lists, by 1h / 24h / 7d. |
 
-Everything is ephemeral — balances and orders are never posted to a channel.
+All except `/rh_trending` are ephemeral — balances and orders are never posted
+to a channel. `/rh_trending` is public market data and needs no credentials or
+owner check, so anyone can run it.
+
+Robinhood's API has no trending or movers endpoint — it is execution-only. So
+`/rh_trending` takes the tradeable pair list from Robinhood (authoritative when
+credentials are set, a built-in approximation otherwise, and the footer says
+which) and the price movement from CoinGecko, which is free and keyless.
 
 **Setup.** Generate a keypair, register the public half, then set four variables:
 

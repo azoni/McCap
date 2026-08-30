@@ -184,3 +184,11 @@ RH_CONFIRM_TIMEOUT = _env_int("RH_CONFIRM_TIMEOUT", 60)
 RH_TIMEOUT = _env_int("RH_TIMEOUT", 15)
 # Spend ledger lives on the volume so a redeploy cannot reset the daily cap.
 RH_SPEND_FILE = str(DATA_DIR / "rh_spend.json")
+
+# ---- CoinGecko (movement data for Robinhood-listed coins) ----
+# Robinhood's API has no trending/movers endpoint and its quotes carry no
+# historical reference, so "what's moving" has to come from somewhere else.
+# Free and keyless; one request covers the whole top N.
+COINGECKO_URL = os.getenv("COINGECKO_URL", "https://api.coingecko.com/api/v3/coins/markets")
+COINGECKO_TOP_N = _env_int("COINGECKO_TOP_N", 250)
+COINGECKO_TIMEOUT = _env_int("COINGECKO_TIMEOUT", 15)

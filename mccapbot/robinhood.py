@@ -148,6 +148,40 @@ async def get_orders() -> Dict:
     return await _request("GET", ORDERS_PATH)
 
 
+# Fallback list for when credentials aren't configured yet. Robinhood's own
+# trading_pairs endpoint is authoritative and is preferred whenever it can be
+# reached; this only exists so /rh_trending is useful before setup, and it is
+# labelled as approximate wherever it gets used.
+KNOWN_PAIRS = (
+    "BTC", "ETH", "SOL", "DOGE", "XRP", "ADA", "AVAX", "LINK", "LTC", "BCH",
+    "ETC", "UNI", "XLM", "AAVE", "COMP", "SHIB", "PEPE", "DOT", "USDC", "XTZ",
+)
+
+
+async def get_trading_pairs() -> Tuple[list, bool]:
+    """Base symbols Robinhood will actually trade.
+
+    Returns ``(symbols, authoritative)``. ``authoritative`` is False when the
+    list came from KNOWN_PAIRS because credentials are missing or the call
+    failed — the caller says so rather than implying the list is verified.
+    """
+    if not configured():
+        return list(KNOWN_PAIRS), False
+    try:
+        data = await _request("GET", PAIRS_PATH)
+    except RobinhoodError:
+        return list(KNOWN_PAIRS), False
+
+    symbols = []
+    for row in (data or {}).get("results") or []:
+        sym = row.get("symbol") or ""          # e.g. "BTC-USD"
+        base = sym.split("-")[0].strip().upper()
+        # Only surface pairs that are actually tradeable right now.
+        if base and row.get("status", "tradable") == "tradable":
+            symbols.append(base)
+    return (symbols, True) if symbols else (list(KNOWN_PAIRS), False)
+
+
 def _f(v) -> Optional[float]:
     try:
         return float(v) if v is not None else None
