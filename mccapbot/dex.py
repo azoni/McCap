@@ -74,7 +74,62 @@ def _own_pairs(pairs: List[Dict], ca: str) -> List[Dict]:
     return [p for p in out if _not_blacklisted(p)]
 
 
+# Pools holding less than this fraction of the deepest pool's liquidity carry
+# no price information — see _consensus_mc.
+DUST_POOL_FRACTION = 0.01
+
+
+def _consensus_mc(cands: List[Tuple[float, float]]) -> float:
+    """Consensus market cap from (market_cap, liquidity_usd) pairs.
+
+    A plain median across pools is wrong as soon as most pools are dust. RSTR
+    on the Robinhood chain had 23 pools: two real ones ($152K and $92K of
+    liquidity) both at ~$2.6M, and twenty-one holding under $1K with stale
+    prices scattered from $0.26M to $3.6M. The median of all 23 was $1.04M,
+    and the alert embed reported that while the token sat at $2.6M.
+
+    So: drop pools under DUST_POOL_FRACTION of the deepest pool's liquidity,
+    reject log-space outliers among what is left, then take the
+    liquidity-weighted median (the value at which half the surviving
+    liquidity sits at or below). Pools with no liquidity figure are
+    weightless; if none has one, fall back to the plain median.
+    """
+    vals = [(mc, max(liq or 0.0, 0.0)) for mc, liq in cands if mc and mc > 0]
+    if not vals:
+        return 0.0
+
+    max_liq = max(liq for _mc, liq in vals)
+    if max_liq > 0:
+        floor = max_liq * DUST_POOL_FRACTION
+        vals = [(mc, liq) for mc, liq in vals if liq >= floor]
+
+    if len(vals) >= 3:
+        logs = sorted(math.log10(mc) for mc, _liq in vals)
+        q1 = _percentile(logs, 0.25); q3 = _percentile(logs, 0.75); iqr = q3 - q1
+        lo = q1 - 1.5 * iqr; hi = q3 + 1.5 * iqr
+        kept = [(mc, liq) for mc, liq in vals if lo <= math.log10(mc) <= hi]
+        if len(kept) >= 2:
+            vals = kept
+
+    total = sum(liq for _mc, liq in vals)
+    if total <= 0:
+        return _median([mc for mc, _liq in vals])
+    running = 0.0
+    for mc, liq in sorted(vals):
+        running += liq
+        if running >= total / 2:
+            return mc
+    return vals[-1][0]
+
+
 def choose_consensus_pair(pairs: List[Dict], ca: str):
+    """Pick the pool whose market cap best represents the token.
+
+    Returns (pair, consensus_mc, candidates). The consensus is computed by
+    _consensus_mc; the returned pair is the one closest to it, deepest first
+    on a tie, so callers reading the pair's own fields get a number that
+    agrees with the consensus.
+    """
     if not pairs: return None, 0.0, []
     filtered = _own_pairs(pairs, ca)
     if not filtered: return None, 0.0, []
@@ -84,22 +139,14 @@ def choose_consensus_pair(pairs: List[Dict], ca: str):
         mc,src=resolve_mc_value(p, ca)
         liq,vol,_tx=_liq_vol_tx(p)
         if mc and mc>0:
-            valid.append(mc)
+            valid.append((mc, liq))
             cands.append((p,mc,liq,vol,src))
         else:
             cands.append((p,float("nan"),liq,vol,"none"))
 
     if not valid: return None, 0.0, cands
 
-    logs=sorted([math.log10(v) for v in valid if v>0])
-    if len(logs)>=3:
-        q1=_percentile(logs,0.25); q3=_percentile(logs,0.75); iqr=q3-q1
-        lo=q1-1.5*iqr; hi=q3+1.5*iqr
-        kept=[10**x for x in logs if lo<=x<=hi]
-        base_vals=kept if len(kept)>=2 else valid
-    else:
-        base_vals=valid
-    consensus=_median(base_vals)
+    consensus=_consensus_mc(valid)
 
     best=None; best_key=None
     for p,mc,liq,vol,_src in cands:
@@ -173,6 +220,7 @@ async def token_summary(ca: str) -> Optional[Dict]:
         "name": base.get("name") or base.get("symbol") or "Token",
         "symbol": base.get("symbol") or "",
         "mc": mc,
+        "price": (float(best.get("priceUsd")) if best.get("priceUsd") else None),
         "liq": liq,
         "vol24": vol,
         "change24": change24,

@@ -62,6 +62,64 @@ def test_consensus_ignores_wild_outlier():
     assert best["fdv"] != 900_000_000_000
 
 
+RSTR_CA = "0x78b96280c3347e0f58a7147b73eb0ec5ffff025d"
+
+
+def evm_pair(mc, liq, quote="ETH"):
+    p = pair(mc=mc, fdv=mc, liq=liq, dex="uniswap", chain="robinhood",
+             ca="0x78b96280C3347E0f58a7147B73eb0EC5fFFf025d", quote=quote)
+    return p
+
+
+def test_dust_pools_cannot_drag_the_market_cap_down():
+    """The real RSTR case (2026-09-07): two funded pools agree on ~$2.6M while
+    twenty-one dust pools with stale prices pull the plain median to $1.04M."""
+    real = [evm_pair(2_599_891, 151_898.98), evm_pair(2_586_099, 92_381.56, "USDG"),
+            evm_pair(2_624_107, 9_547.70, "USDG"), evm_pair(2_494_676, 1_052.53, "USDG")]
+    dust_mcs = [3_592_869, 1_038_694, 2_472_250, 2_714_243, 1_609_802, 802_219, 432_914,
+                2_895_884, 849_506, 2_606_010, 328_237, 305_324, 2_334_781, 657_236,
+                677_398, 262_511, 893_311, 555_454, 940_544]
+    dust = [evm_pair(mc, liq) for mc, liq in zip(dust_mcs, [94, 53, 523, 390, 0, 10, 0.16,
+                                                            12, 5, 6, 20, 18, 4, 6, 7, 30, 1, 1.6, 3])]
+    best, consensus, _ = choose_consensus_pair(real + dust, RSTR_CA)
+    assert 2_500_000 <= consensus <= 2_700_000, f"dust pools leaked into the consensus: {consensus}"
+    assert best["liquidity"]["usd"] >= 90_000, "the reported pair should be a funded one"
+    assert resolve_mc_value(best, RSTR_CA)[0] == consensus
+
+
+def test_deep_pool_beats_a_tight_cluster_of_dust():
+    """Outlier rejection alone would throw away the one real pool here."""
+    pairs = [pair(fdv=5_000_000, liq=100_000)]
+    pairs += [pair(fdv=1_000_000 + i * 10_000, liq=5 + i) for i in range(8)]
+    _best, consensus, _ = choose_consensus_pair(pairs, SOL_CA)
+    assert consensus == 5_000_000
+
+
+def test_liquidity_weighted_median_prefers_the_funded_pool():
+    pairs = [pair(fdv=1_000_000, liq=100_000), pair(fdv=2_000_000, liq=3_000)]
+    _best, consensus, _ = choose_consensus_pair(pairs, SOL_CA)
+    assert consensus == 1_000_000
+
+
+def test_consensus_without_liquidity_data_is_the_plain_median():
+    pairs = [pair(fdv=900_000, liq=0), pair(fdv=1_000_000, liq=0), pair(fdv=1_300_000, liq=0)]
+    _best, consensus, _ = choose_consensus_pair(pairs, SOL_CA)
+    assert consensus == 1_000_000
+
+
+def test_bogus_funded_pool_is_still_an_outlier():
+    """A pool with real liquidity but an absurd market cap must not win just
+    because it clears the dust floor."""
+    pairs = [
+        pair(fdv=1_000_000, liq=50_000),
+        pair(fdv=1_020_000, liq=40_000),
+        pair(fdv=980_000, liq=30_000),
+        pair(fdv=900_000_000_000, liq=10_000),
+    ]
+    _best, consensus, _ = choose_consensus_pair(pairs, SOL_CA)
+    assert 900_000 <= consensus <= 1_100_000
+
+
 def test_consensus_ignores_pairs_for_other_tokens():
     other = pair(fdv=5_000_000, ca="OtherMintAddress1111111111111111111111111")
     mine = pair(fdv=1_000_000)
