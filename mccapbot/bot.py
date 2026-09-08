@@ -26,9 +26,6 @@ from .storage import (
     load_reminders,
     load_scans,
     load_watchlist,
-    move_alerts,
-    reminders,
-    watched_addresses,
 )
 
 # Cogs loaded at startup. Each module exposes `async def setup(bot)`.
@@ -121,17 +118,15 @@ class Bot(commands.Bot):
 
     @staticmethod
     def _presence_text(balance: Optional[float], rh=None) -> str:
-        """Build the status line from whatever is actually known."""
+        """Build the status line from whatever is actually known: the SOL
+        balance and the Robinhood Chain wallets' total. Alert and token counts
+        live in /mc_status, not here."""
         parts = []
         if balance is not None:
             parts.append(f"💰 {balance:,.2f} SOL")
         fragment = portfolio.presence_fragment(rh)
         if fragment:
             parts.append(fragment)
-        total = len(reminders) + len(move_alerts)
-        if total:
-            parts.append(f"{total} alert(s)")
-            parts.append(f"{len(watched_addresses())} token(s)")
         return " · ".join(parts) if parts else "for /mc alerts"
 
     # ---------------- lifecycle ----------------
