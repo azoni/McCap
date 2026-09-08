@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from mccapbot.cogs import rhc as cog
-from mccapbot.rhc import chain, kyber, ledger, swap, wallets
+from mccapbot.rhc import chain, kyber, ledger, pnl, portfolio, swap, wallets
 
 USER = 7
 PONS = "0x39dbed3a2bd333467115de45665cc57f813c4571"
@@ -104,6 +104,7 @@ class World:
         self.token_balance = 36 * 10**18
         self.eth_balance = 10**18
         self.liquidity = 500_000.0
+        self.mc_now = 500_000_000.0
         self.results = []                   # optional sequence of results for successive executes
         self.route_calls = 0
 
@@ -127,15 +128,21 @@ class World:
                                    amount_out_usd=rt.amount_out_usd, gas=1, gas_usd=0.49, slippage_bps=bps,
                                    min_out=kyber.min_out(rt.amount_out, bps), route=rt)
 
-        async def execute(user_id, built, token, symbol):
+        async def execute(user_id, built, token, symbol, extra=None):
             w.executed.append(built)
+            w.last_extra = extra
             if w.results:
                 return w.results.pop(0)
             return w.result
 
         async def summary(addr):
-            return {"liq": w.liquidity, "price": 0.7}
+            if addr.lower() == chain.WETH.lower():
+                return {"price": w.eth_usd}
+            return {"liq": w.liquidity, "price": 0.7, "mc": w.mc_now}
         monkeypatch.setattr(cog, "token_summary", summary)
+        monkeypatch.setattr(pnl, "token_summary", summary)
+        monkeypatch.setattr(portfolio, "token_summary", summary)
+        portfolio._cache = None
 
         async def eth_usd(self_):
             return w.eth_usd
@@ -193,8 +200,8 @@ def world(monkeypatch):
             pass
 
 
-async def run_buy(inter, eth="0.01", slippage=None):
-    await cog.RhcCog.buy.callback(cog.RhcCog(bot=None), inter, PONS, eth, slippage)
+async def run_buy(inter, eth="0.01", slippage=None, usd=None):
+    await cog.RhcCog.buy.callback(cog.RhcCog(bot=None), inter, PONS, eth=eth, usd=usd, slippage_bps=slippage)
 
 
 # ---------------- buy ----------------
@@ -439,11 +446,92 @@ async def test_slippage_revert_twice_is_reported_plainly_and_refunded(world):
 
 
 @pytest.mark.asyncio
+async def test_buy_in_dollars_and_results_carry_dollar_amounts(world):
+    inter = FakeInteraction()
+    await run_buy(inter, eth=None, usd=5.0)               # $5 at $2500/ETH = 0.002 ETH
+    assert world.executed[0].route.amount_in == world.buy_route.amount_in   # the fake route ignores size
+    assert inter.last.startswith("✅") and "($24.80)" in inter.last and "at $500.00M MC" in inter.last
+
+    both = FakeInteraction()
+    await run_buy(both, eth="0.01", usd=5.0)
+    assert "either" in both.last and both.response.deferred_ephemeral is None
+    neither = FakeInteraction()
+    await run_buy(neither, eth=None, usd=None)
+    assert "either" in neither.last
+
+
+@pytest.mark.asyncio
+async def test_sell_result_shows_the_multiple_from_entry(world):
+    # A confirmed buy at $50K MC is on record; the token is at $200K now.
+    ledger.journal({"ts": 1.0, "user_id": USER, "kind": "buy", "token": PONS, "symbol": "PONS", "decimals": 18,
+                    "amount_in": "10000000000000000", "quoted_out": str(36 * 10**18), "actual_out_estimate": str(36 * 10**18),
+                    "usd_in": 20.0, "mc_usd": 50_000.0, "tx": "0xb1", "status": "confirmed", "gas_cost_wei": "0"})
+    world.mc_now = 200_000.0
+    world.result = swap.SwapResult(ok=True, tx="0xsell", amount_out=5 * 10**15, gas_cost_wei=10**14)
+    inter = FakeInteraction()
+    await cog.RhcCog.sell.callback(cog.RhcCog(bot=None), inter, PONS, 50, None)
+    assert inter.last.startswith("✅") and "4.00x" in inter.last and "$50.00K → $200.00K MC" in inter.last
+    assert "($24.70)" in inter.last, "the ETH received is shown in dollars too"
+    journaled = [e for e in ledger.entries_for(USER) if e.get("kind") == "sell"]
+    assert journaled == [], "the fake executor journals nothing; the real one is covered in test_rhc_swap"
+
+
+@pytest.mark.asyncio
+async def test_holdings_history_pnl_and_stats_render(world, monkeypatch):
+    ledger.journal({"ts": 1.0, "user_id": USER, "kind": "buy", "token": PONS, "symbol": "PONS", "decimals": 18,
+                    "amount_in": "10000000000000000", "quoted_out": str(36 * 10**18), "actual_out_estimate": str(36 * 10**18),
+                    "usd_in": 20.0, "mc_usd": 250_000_000.0, "tx": "0xb1", "status": "confirmed", "gas_cost_wei": str(10**14)})
+    world.mc_now = 500_000_000.0            # doubled since entry; price 0.7 × 36 = $25.20 worth
+    inter = FakeInteraction()
+    await cog.RhcCog.holdings.callback(cog.RhcCog(bot=None), inter)
+    embed = inter.followup.sent[-1][1]["embed"]
+    text = embed.description + "\n" + "\n".join(f.value for f in embed.fields)
+    assert "1 ETH" in text and "$2,500.00" in text and "total $2,525.20" in text
+    assert "PONS" in text and "2.00x" in text and "$250.00M MC, now $500.00M" in text
+    assert "gas $0.25" in text and "net +$4.95" in text   # 25.20 - 20 - 0.25
+
+    hist = FakeInteraction()
+    await cog.RhcCog.history.callback(cog.RhcCog(bot=None), hist, 10)
+    h = hist.followup.sent[-1][1]["embed"].description
+    assert "BUY 0.01 ETH → 36 PONS ($20.00 at $250.00M MC)" in h and "✅" in h
+
+    p = FakeInteraction()
+    await cog.RhcCog.pnl_cmd.callback(cog.RhcCog(bot=None), p)
+    kw = p.followup.sent[-1][1]
+    assert "Net +$4.95" in kw["embed"].description and kw["files"] and kw["files"][0].filename == "pnl.png"
+
+    s = FakeInteraction()
+    await cog.RhcCog.stats.callback(cog.RhcCog(bot=None), s)
+    d = s.followup.sent[-1][1]["embed"].description
+    assert "1** buys" in d and "Gas spent **0.00010 ETH**" in d
+
+
+@pytest.mark.asyncio
+async def test_private_flag_keeps_one_call_to_yourself_even_in_public_mode(world, monkeypatch):
+    monkeypatch.setattr(cog, "PRIVATE", False)
+    public = FakeInteraction()
+    await cog.RhcCog.holdings.callback(cog.RhcCog(bot=None), public)
+    assert public.response.deferred_ephemeral is False and public.last_kw.get("ephemeral") is False
+
+    mine = FakeInteraction()
+    await cog.RhcCog.holdings.callback(cog.RhcCog(bot=None), mine, private=True)
+    assert mine.response.deferred_ephemeral is True and mine.last_kw.get("ephemeral") is True
+
+    quiet_buy = FakeInteraction()
+    await run_buy(quiet_buy)
+    assert quiet_buy.last_kw.get("ephemeral") is False
+    quiet_buy2 = FakeInteraction()
+    await cog.RhcCog.buy.callback(cog.RhcCog(bot=None), quiet_buy2, PONS, eth="0.01", private=True)
+    assert quiet_buy2.response.deferred_ephemeral is True and quiet_buy2.last_kw.get("ephemeral") is True
+    assert not quiet_buy2.last.startswith("**tester**"), "no name prefix when nobody else can see it"
+
+
+@pytest.mark.asyncio
 async def test_result_falls_back_to_a_dm_when_the_followup_fails(world):
     inter = FakeInteraction()
 
     async def broken(content=None, **kw):
         raise RuntimeError("interaction token expired")
     inter.followup.send = broken
-    await cog.RhcCog._reply(inter, "✅ Bought")
+    await cog.RhcCog._reply(inter, "✅ Bought", True)
     assert inter.dms == ["✅ Bought"]

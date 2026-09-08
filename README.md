@@ -12,6 +12,7 @@ Discord bot for Solana market-cap alerts and token watchlists.
 | `/mc_move <ca> <percent> [window] [direction] [cooldown]` | Momentum alert — fires when a token **moves** X% within a window (`15m`, `1h`, `4h`, `1d`). Recurring. |
 | `/mc_list [user] [public]` | All active alerts, level and momentum. |
 | `/mc_remove <alerts>` | Remove alerts. Autocompletes; accepts ids (`a1b2c3`) or `/mc_list` positions. |
+| `/mc_clear` | Remove every alert in the server (server managers only, confirm button). |
 | `/mc_recent [count] [user]` | Recently fired alerts. |
 | `/mc_status` | Polling tiers, request rate, and which momentum alerts are still filling their window. |
 | `/mc_lp <ca>` | Best LP venue across Meteora / Raydium / Pumpswap. |
@@ -82,7 +83,10 @@ what you are actively trading here.
 | `/rhc wallet withdraw <to> <eth>` | Send ETH out. Confirm first. |
 | `/rhc buy <token> <eth> [slippage_bps]` | Quote, honeypot check, confirm, swap, receipt. Counts against your daily cap. |
 | `/rhc sell <token> <percent> [slippage_bps]` | Sell part of a holding for ETH. Exits are never capped. |
-| `/rhc holdings` | ETH and every token you have traded here, with rough USD values. |
+| `/rhc holdings` | Your ETH and open positions: amount, cost, worth now, profit, multiple from entry, total balance. |
+| `/rhc history [count]` | Your recent buys, sells and withdrawals with status, market cap at the time, and transaction links. |
+| `/rhc pnl` | Profit per token (realized, unrealized, net), gas spent, and a bar chart. |
+| `/rhc stats` | Group metrics: wallets, trades, volume, gas spent, realized profit, best multiple. |
 | `/rhc trending [window] [sort] [count] [include_majors]` | Busiest and fastest-moving tokens on the chain: volume, market cap at the start of the window → now, liquidity. Windows 5m to 24h; sort by volume, gainers, losers or newest. |
 | `/rhc new [count] [min_liquidity]` | Brand-new pairs from GeckoTerminal's new-pools feed, newest first, with age, liquidity, 1h volume and change. |
 | `/help` | Every command with what it does. |
@@ -94,8 +98,10 @@ refreshed every `PRESENCE_REFRESH_SECONDS`. Per-person figures stay behind
 
 `<token>` is a contract address or a symbol from `/rhc trending`. Quotes, trade
 results, wallet addresses, balances and holdings post to the channel so the
-group can see them (`RHC_PUBLIC_REPLIES=0` makes everything private). Confirm
-prompts, refusals and the private-key export are only ever visible to the user.
+group can see them (`RHC_PUBLIC_REPLIES=0` makes everything private), and every
+one of those commands takes `private:True` to keep that single reply to yourself.
+Refusals, the withdraw prompt and the private-key export are only ever visible
+to the user.
 
 **Routing.** Swaps go through the KyberSwap aggregator, which sees every DEX on
 the chain (Uniswap V2/V3/V4, Ramses, Pons, ...) and builds the calldata itself.

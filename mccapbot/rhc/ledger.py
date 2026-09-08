@@ -165,6 +165,35 @@ def entries_for(user_id: int) -> List[Dict[str, Any]]:
     return [e for e in _all() if e.get("user_id") == user_id]
 
 
+def history(user_id: int) -> List[Dict[str, Any]]:
+    """A user's buys, sells and withdrawals, oldest first, each with its FINAL
+    status under ``final_status`` (a later resolution entry wins)."""
+    entries = entries_for(user_id)
+    latest: Dict[str, str] = {}
+    for e in entries:
+        tx = (e.get("tx") or "").lower()
+        if tx:
+            latest[tx] = str(e.get("status") or "")
+    out = []
+    for e in entries:
+        if e.get("kind") not in ("buy", "sell", "withdraw"):
+            continue
+        tx = (e.get("tx") or "").lower()
+        # The same trade is journaled twice on the fast path (submitted, then
+        # confirmed/reverted); keep the last original record per tx.
+        if tx and any((o.get("tx") or "").lower() == tx for o in out):
+            out = [o for o in out if (o.get("tx") or "").lower() != tx]
+        e = dict(e)
+        e["final_status"] = latest.get(tx, e.get("status") or "")
+        out.append(e)
+    return out
+
+
+def trades(user_id: int) -> List[Dict[str, Any]]:
+    """Confirmed buys and sells only: what the profit figures are built from."""
+    return [e for e in history(user_id) if e.get("kind") in ("buy", "sell") and e["final_status"] == "confirmed"]
+
+
 def entry_for_tx(user_id: int, tx_hash: str) -> Optional[Dict[str, Any]]:
     """The original (non-resolution) record of a transaction, if journaled."""
     for e in entries_for(user_id):

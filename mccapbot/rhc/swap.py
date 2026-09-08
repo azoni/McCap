@@ -204,8 +204,14 @@ async def _ensure_allowance(user_id: int, token: str, owner: str, amount: int) -
     return await _approve(user_id, token, owner, amount)
 
 
-async def execute(user_id: int, built: BuiltSwap, token: str, symbol: str) -> SwapResult:
-    """Run the full path for a built swap. ``token`` is the non-ETH side."""
+async def execute(user_id: int, built: BuiltSwap, token: str, symbol: str,
+                  extra: Optional[Dict[str, Any]] = None) -> SwapResult:
+    """Run the full path for a built swap. ``token`` is the non-ETH side.
+
+    ``extra`` is journaled with the trade: market cap and price at the time,
+    token decimals, entry figures for a sell. It is what /rhc holdings and
+    /rhc pnl are computed from later.
+    """
     lk = _lock(user_id)
     if lk.locked():
         return SwapResult(ok=False, error="You already have a transaction in flight. Wait for it to finish.")
@@ -213,10 +219,11 @@ async def execute(user_id: int, built: BuiltSwap, token: str, symbol: str) -> Sw
         blocked = await _pending_block(user_id)
         if blocked:
             return SwapResult(ok=False, error=blocked)
-        return await _execute_locked(user_id, built, token, symbol)
+        return await _execute_locked(user_id, built, token, symbol, extra or {})
 
 
-async def _execute_locked(user_id: int, built: BuiltSwap, token: str, symbol: str) -> SwapResult:
+async def _execute_locked(user_id: int, built: BuiltSwap, token: str, symbol: str,
+                          extra: Dict[str, Any]) -> SwapResult:
     w = wallets.get(user_id)
     if w is None:
         return SwapResult(ok=False, error="You have no wallet yet. Use /rhc wallet create.")
@@ -306,7 +313,7 @@ async def _execute_locked(user_id: int, built: BuiltSwap, token: str, symbol: st
     # its receipt. Journal it NOW, before waiting, so a restart cannot forget
     # it; never report a broadcast transaction as a plain failure.
     log.info("Swap broadcast for user %s: %s", user_id, tx_hash)
-    _journal(user_id, built, token, symbol, tx_hash, "submitted", None, 0)
+    _journal(user_id, built, token, symbol, tx_hash, "submitted", None, 0, extra)
     rec = await _wait(tx_hash)
     if rec is None:
         _mark_pending(user_id, tx_hash)
@@ -316,7 +323,7 @@ async def _execute_locked(user_id: int, built: BuiltSwap, token: str, symbol: st
     eff = int(rec.get("effectiveGasPrice", 0) or 0)
     gas_cost = gas_used * eff
     if int(rec.get("status", 0)) != 1:
-        _journal(user_id, built, token, symbol, tx_hash, "reverted", None, gas_cost)
+        _journal(user_id, built, token, symbol, tx_hash, "reverted", None, gas_cost, extra)
         return SwapResult(ok=False, tx=tx_hash, error="Swap reverted on-chain. Nothing was swapped (gas was spent).",
                           gas_cost_wei=gas_cost)
 
@@ -331,13 +338,15 @@ async def _execute_locked(user_id: int, built: BuiltSwap, token: str, symbol: st
                 amount_out = None
     except chain.ChainError:
         pass
-    _journal(user_id, built, token, symbol, tx_hash, "confirmed", amount_out, gas_cost)
+    _journal(user_id, built, token, symbol, tx_hash, "confirmed", amount_out, gas_cost, extra)
     return SwapResult(ok=True, tx=tx_hash, amount_out=amount_out, gas_cost_wei=gas_cost)
 
 
 def _journal(user_id: int, built: BuiltSwap, token: str, symbol: str, tx_hash: str,
-             status: str, amount_out: Optional[int], gas_cost: int) -> None:
+             status: str, amount_out: Optional[int], gas_cost: int,
+             extra: Optional[Dict[str, Any]] = None) -> None:
     ledger.journal({
+        **(extra or {}),
         "ts": time.time(),
         "user_id": user_id,
         "kind": "buy" if built.is_buy else "sell",

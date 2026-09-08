@@ -31,6 +31,7 @@ from ..scheduler import (
     interval_for_reminder,
 )
 from ..storage import alert_events, move_alerts, reminders, save_moves, save_reminders
+from ..views import ConfirmOrder
 from ..tables import (
     ALERTS_ALIGNS,
     ALERTS_HEADERS,
@@ -673,6 +674,38 @@ class AlertsCog(commands.Cog):
                 inline=False,
             )
         await inter.followup.send(embed=embed, ephemeral=True)
+
+
+    # ---------------- clear ----------------
+
+    @app_commands.command(name="mc_clear", description="Remove every alert in this server (server managers only)")
+    @app_commands.guild_only()
+    async def mc_clear(self, inter: discord.Interaction):
+        """Start fresh. Confirm-gated and limited to people who can manage the
+        server, since it removes everyone's alerts here, not just the caller's."""
+        if not self._can_manage(inter.user):
+            await inter.response.send_message("🔒 Only server managers can clear every alert.", ephemeral=True)
+            return
+        levels = [r for r in reminders if r.guild_id == inter.guild_id]
+        moves = [m for m in move_alerts if m.guild_id == inter.guild_id]
+        if not levels and not moves:
+            await inter.response.send_message("No active alerts here.", ephemeral=True)
+            return
+        view = ConfirmOrder(inter.user.id, 60)
+        await inter.response.send_message(
+            f"Remove **{len(levels)}** level alert(s) and **{len(moves)}** momentum alert(s) from this server? "
+            f"This cannot be undone.", view=view, ephemeral=True,
+        )
+        await view.wait()
+        if not view.value:
+            await inter.followup.send("Cancelled. Nothing was removed.", ephemeral=True)
+            return
+        reminders[:] = [r for r in reminders if r.guild_id != inter.guild_id]
+        move_alerts[:] = [m for m in move_alerts if m.guild_id != inter.guild_id]
+        await save_reminders()
+        await save_moves()
+        log.info("User %s cleared %d level + %d move alert(s) in guild %s", inter.user.id, len(levels), len(moves), inter.guild_id)
+        await inter.followup.send(f"🧹 Cleared {len(levels)} level and {len(moves)} momentum alert(s). /mc_list is empty here.")
 
 
 async def setup(bot: commands.Bot):

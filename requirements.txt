@@ -8,3 +8,4 @@ pynacl
 anthropic>=1.4,<2
 web3>=7,<9
 eth-account>=0.13,<1
+matplotlib>=3.8,<4

@@ -137,5 +137,14 @@ def about_me(s: Optional[Summary]) -> str:
         lines.append(f"• {amount:,.2f} {sym}" + (f" ({_usd(usd)})" if usd else ""))
     if total is not None:
         lines.append(f"Total ≈ {_usd(total)}")
-    lines.append(f"Updated {time.strftime('%H:%M', time.gmtime(s.fetched_ts))} UTC · /rhc holdings for yours")
+    try:
+        from . import pnl
+        g = pnl.group_stats()
+        if g.buys or g.sells:
+            gas = f", gas {g.gas_wei / 1e18:.4f} ETH" if g.gas_wei else ""
+            best = f", best {pnl.fmt_x(g.best_multiple)} {g.best_symbol}" if g.best_multiple else ""
+            lines.append(f"Group: {g.buys + g.sells} trades, {_usd(g.volume_usd)} volume{gas}{best}")
+    except Exception:
+        log.debug("Group stats unavailable for About Me", exc_info=True)
+    lines.append(f"Updated {time.strftime('%H:%M', time.gmtime(s.fetched_ts))} UTC · /rhc holdings, /rhc pnl, /rhc stats")
     return "\n".join(lines)[:400]
