@@ -1,4 +1,4 @@
-"""/rhc gates and helpers. Money must not move for the wrong person, server, or flag."""
+"""/rh gates and helpers. Money must not move for the wrong person, server, or flag."""
 
 import pytest
 

@@ -67,7 +67,7 @@ button URLs) rather than one field, and **logs a warning when a scanner posts
 something it can't extract a mint from** — a format change shows up as a log
 line instead of silence.
 
-### Robinhood Chain wallets and trading (`/rhc`)
+### Robinhood Chain wallets and trading (`/rh`)
 
 **Off by default. Custodial. Real money.** McCap generates one Robinhood Chain
 (chain id 4663) wallet per Discord user, keeps the key encrypted on the volume,
@@ -77,26 +77,26 @@ what you are actively trading here.
 
 | Command | What it does |
 |---|---|
-| `/rhc wallet create` | Generate your wallet. Fund it by withdrawing ETH on Robinhood Chain from the Robinhood app. |
-| `/rhc wallet show` | Address, ETH balance, today's remaining buy budget. |
-| `/rhc wallet export` | Reveal your private key (ephemeral, confirm first, logged). |
-| `/rhc wallet withdraw <to> <eth>` | Send ETH out. Confirm first. |
-| `/rhc buy <token> <eth> [slippage_bps]` | Quote, honeypot check, confirm, swap, receipt. Counts against your daily cap. |
-| `/rhc sell <token> <percent> [slippage_bps]` | Sell part of a holding for ETH. Exits are never capped. |
-| `/rhc holdings` | Your ETH and open positions: amount, cost, worth now, profit, multiple from entry, total balance. |
-| `/rhc history [count]` | Your recent buys, sells and withdrawals with status, market cap at the time, and transaction links. |
-| `/rhc pnl` | Profit per token (realized, unrealized, net), gas spent, and a bar chart. |
-| `/rhc stats` | Group metrics: wallets, trades, volume, gas spent, realized profit, best multiple. |
-| `/rhc trending [window] [sort] [count] [include_majors]` | Busiest and fastest-moving tokens on the chain: volume, market cap at the start of the window → now, liquidity. Windows 5m to 24h; sort by volume, gainers, losers or newest. |
-| `/rhc new [count] [min_liquidity]` | Brand-new pairs from GeckoTerminal's new-pools feed, newest first, with age, liquidity, 1h volume and change. |
+| `/rh wallet create` | Generate your wallet. Fund it by withdrawing ETH on Robinhood Chain from the Robinhood app. |
+| `/rh wallet show` | Address, ETH balance, today's remaining buy budget. |
+| `/rh wallet export` | Reveal your private key (ephemeral, confirm first, logged). |
+| `/rh wallet withdraw <to> <eth>` | Send ETH out. Confirm first. |
+| `/rh buy <token> <eth> [slippage_bps]` | Quote, honeypot check, confirm, swap, receipt. Counts against your daily cap. |
+| `/rh sell <token> <percent> [slippage_bps]` | Sell part of a holding for ETH. Exits are never capped. |
+| `/rh holdings` | Your ETH and open positions: amount, cost, worth now, profit, multiple from entry, total balance. |
+| `/rh history [count]` | Your recent buys, sells and withdrawals with status, market cap at the time, and transaction links. |
+| `/rh pnl` | Profit per token (realized, unrealized, net), gas spent, and a bar chart. |
+| `/rh stats` | Group metrics: wallets, trades, volume, gas spent, realized profit, best multiple. |
+| `/rh trending [window] [sort] [count] [include_majors]` | Busiest and fastest-moving tokens on the chain: volume, market cap at the start of the window → now, liquidity. Windows 5m to 24h; sort by volume, gainers, losers or newest. |
+| `/rh new [count] [min_liquidity]` | Brand-new pairs from GeckoTerminal's new-pools feed, newest first, with age, liquidity, 1h volume and change. |
 | `/help` | Every command with what it does. |
 
 The bot's status line and its About Me (click McCap) show the combined total
 across all wallets: ETH, tokens traded through McCap, and a rough dollar value,
 refreshed every `PRESENCE_REFRESH_SECONDS`. Per-person figures stay behind
-`/rhc holdings`. `RHC_ABOUT_ME_ENABLE=0` leaves the profile text alone.
+`/rh holdings`. `RHC_ABOUT_ME_ENABLE=0` leaves the profile text alone.
 
-`<token>` is a contract address or a symbol from `/rhc trending`. Quotes, trade
+`<token>` is a contract address or a symbol from `/rh trending`. Quotes, trade
 results, wallet addresses, balances and holdings post to the channel so the
 group can see them (`RHC_PUBLIC_REPLIES=0` makes everything private), and every
 one of those commands takes `private:True` to keep that single reply to yourself.
@@ -200,7 +200,7 @@ commands work anywhere, including DMs and servers the bot isn't in.
 
 | Works anywhere | Server-only |
 |---|---|
-| `/help`, `/mc_list`, `/mc_recent`, `/mc_status`, `/mc_check`, `/mc_lp`, all of `/watch`, `/memory` | `/mc`, `/mc_move`, `/mc_remove`, `/scans`, all of `/rhc` (server-installed; also usable in a DM with the bot) |
+| `/help`, `/mc_list`, `/mc_recent`, `/mc_status`, `/mc_check`, `/mc_lp`, all of `/watch`, `/memory` | `/mc`, `/mc_move`, `/mc_remove`, `/scans`, all of `/rh` (server-installed; also usable in a DM with the bot) |
 
 Alert *creation* stays server-only for a structural reason: an alert fires
 minutes or days later, and a bot can only post unprompted into a channel it is
@@ -347,7 +347,7 @@ cap at all.
 | Source | Used for | Key | Limit |
 |---|---|---|---|
 | DexScreener | live MC, liquidity, 24h change, pairs | none | ~300 req/min |
-| GeckoTerminal | historical OHLCV to seed momentum alerts; Robinhood-chain pools for `/rhc trending` and `/rhc new` | none | ~30 req/min |
+| GeckoTerminal | historical OHLCV to seed momentum alerts; Robinhood-chain pools for `/rh trending` and `/rh new` | none | ~30 req/min |
 | Claude API | chat replies (`ANTHROPIC_API_KEY`) | yes | per account |
 | KyberSwap Aggregator API | routes and swap calldata on Robinhood Chain | none (`X-Client-Id`) | unpublished; kept under 30/min |
 | Robinhood Chain RPC | balances, simulation, broadcasting | none (public) or a paid provider | public endpoint is rate limited |

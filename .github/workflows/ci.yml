@@ -42,7 +42,7 @@ jobs:
               # Chat and scan watching are off in CI, so /memory and /scans are not registered.
               expected = sorted([
                   "mc", "mc_check", "mc_clear", "mc_list", "mc_lp", "mc_move", "mc_recent", "mc_remove", "mc_status",
-                  "help", "rhc", "watch",
+                  "help", "rh", "watch",
               ])
               assert names == expected, f"slash commands differ from the expected set: {sorted(set(names) ^ set(expected))}"
               await bot.close()

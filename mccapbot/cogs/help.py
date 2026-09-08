@@ -10,7 +10,7 @@ from discord.ext import commands
 # Where each top-level command belongs on the help card. Anything unlisted
 # lands in "Other", so a new cog still shows up.
 AREAS = [
-    ("Robinhood Chain wallets & trading", ("rhc",)),
+    ("Robinhood Chain wallets & trading", ("rh",)),
     ("Market-cap alerts", ("mc", "mc_move", "mc_list", "mc_remove", "mc_recent", "mc_status", "mc_check", "mc_lp")),
     ("Watchlists", ("watch",)),
     ("Chat memory", ("memory",)),

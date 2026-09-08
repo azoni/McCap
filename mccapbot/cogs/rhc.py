@@ -1,4 +1,4 @@
-"""/rhc: Robinhood Chain wallets, DEX trading, and the chain's trending board.
+"""/rh: Robinhood Chain wallets, DEX trading, and the chain's trending board.
 
 Trading (buy/sell) needs the trading flag and the allowlist; getting your own
 funds OUT (export, withdraw) needs only your wallet, so a kill switch never
@@ -132,7 +132,7 @@ class RhcCog(commands.Cog):
         Allowlist first, so a stranger learns nothing about the vault's state.
         """
         if not allowed(inter.user.id):
-            log.warning("Rejected /rhc trade command from non-allowlisted user %s", inter.user.id)
+            log.warning("Rejected /rh trade command from non-allowlisted user %s", inter.user.id)
             await self._send_private(inter, "🔒 You are not on the trader allowlist.")
             return True
         if not guild_ok(inter.guild_id):
@@ -170,7 +170,7 @@ class RhcCog(commands.Cog):
             return chain.to_checksum(addr), sym or matches[0].symbol, dec
         if len(matches) > 1:
             raise ValueError(f"Several tokens use the symbol {q}; pass the contract address instead.")
-        raise ValueError(f"Unknown token {q!r}. Pass a contract address (see /rhc trending for the busy ones).")
+        raise ValueError(f"Unknown token {q!r}. Pass a contract address (see /rh trending for the busy ones).")
 
     async def _eth_usd(self) -> Optional[float]:
         try:
@@ -184,7 +184,7 @@ class RhcCog(commands.Cog):
     # Guild-installed only (the bot posts results into channels), usable from a
     # server or a DM with the bot. Declared here so tree defaults cannot change it.
     rhc = app_commands.Group(
-        name="rhc", description="Robinhood Chain: your wallet, DEX trades, and what's trending",
+        name="rh", description="Robinhood Chain: your wallet, DEX trades, and what's trending",
         allowed_installs=app_commands.AppInstallationType(guild=True, user=False),
         allowed_contexts=app_commands.AppCommandContext(guild=True, dm_channel=True, private_channel=False),
     )
@@ -223,7 +223,7 @@ class RhcCog(commands.Cog):
         w = wallets.get(inter.user.id)
         if w is None:
             problem = _vault_problem() if not wallets.loaded() else None
-            await self._send_private(inter, problem or "You have no wallet yet. `/rhc wallet create` makes one.")
+            await self._send_private(inter, problem or "You have no wallet yet. `/rh wallet create` makes one.")
             return
         await inter.response.defer(thinking=True, ephemeral=priv)
         try:
@@ -329,7 +329,7 @@ class RhcCog(commands.Cog):
 
     @rhc.command(name="buy", description="Buy a token with ETH or dollars from your wallet (shows the quote, asks to confirm)")
     @app_commands.describe(
-        token="Contract address or a symbol from /rhc trending",
+        token="Contract address or a symbol from /rh trending",
         eth="ETH to spend, e.g. 0.01 (or use usd)",
         usd="Dollars to spend instead of ETH, e.g. 5",
         slippage_bps="Max slippage in basis points (default 200 = 2%)", private="Reply only to you",
@@ -341,10 +341,10 @@ class RhcCog(commands.Cog):
             return
         w = wallets.get(inter.user.id)
         if w is None:
-            await self._send_private(inter, "You have no wallet yet. `/rhc wallet create` makes one.")
+            await self._send_private(inter, "You have no wallet yet. `/rh wallet create` makes one.")
             return
         if (eth is None) == (usd is None):
-            await self._send_private(inter, "Give either `eth` or `usd`, e.g. `/rhc buy PONS eth:0.01` or `/rhc buy PONS usd:5`.")
+            await self._send_private(inter, "Give either `eth` or `usd`, e.g. `/rh buy PONS eth:0.01` or `/rh buy PONS usd:5`.")
             return
         await inter.response.defer(thinking=True, ephemeral=priv)
         bps = clamp_slippage(slippage_bps)
@@ -494,7 +494,7 @@ class RhcCog(commands.Cog):
 
     @rhc.command(name="sell", description="Sell a percentage of a token you hold for ETH (asks to confirm)")
     @app_commands.describe(
-        token="Contract address or a symbol from /rhc trending", percent="1 to 100",
+        token="Contract address or a symbol from /rh trending", percent="1 to 100",
         slippage_bps="Max slippage in basis points (default 200 = 2%)", private="Reply only to you",
     )
     async def sell(self, inter: discord.Interaction, token: str, percent: int, slippage_bps: Optional[int] = None,
@@ -613,14 +613,14 @@ class RhcCog(commands.Cog):
             if entries:
                 embed.add_field(name="Entry → now (market cap)", value="\n".join(entries), inline=False)
         else:
-            embed.add_field(name="Open positions", value="None. `/rhc buy` to open one.", inline=False)
+            embed.add_field(name="Open positions", value="None. `/rh buy` to open one.", inline=False)
         embed.add_field(
             name="Profit",
             value=(f"Unrealized {pnl.fmt_usd(u.unrealized_usd, signed=True)} · realized {pnl.fmt_usd(u.realized_usd, signed=True)} · "
                    f"gas {pnl.fmt_usd(u.gas_usd)} ({u.gas_eth:.5f} ETH) · **net {pnl.fmt_usd(u.pnl_usd, signed=True)}**"),
             inline=False,
         )
-        embed.set_footer(text="Cost and profit from your McCap trades; prices from KyberSwap at trade time and DexScreener now. /rhc pnl for the chart.")
+        embed.set_footer(text="Cost and profit from your McCap trades; prices from KyberSwap at trade time and DexScreener now. /rh pnl for the chart.")
         await inter.followup.send(embed=embed, ephemeral=priv)
 
     @rhc.command(name="history", description="Your recent trades and withdrawals")
@@ -736,10 +736,10 @@ class RhcCog(commands.Cog):
 
     @staticmethod
     def _addresses_field(embed: discord.Embed, tokens) -> None:
-        """Addresses are what /rhc buy needs, and a table cell is not copyable."""
+        """Addresses are what /rh buy needs, and a table cell is not copyable."""
         lines = [f"{t.symbol[:10]:<10} {t.address}" for t in tokens[:15]]
         if lines:
-            embed.add_field(name="Addresses (for /rhc buy and /mc)", value="```\n" + "\n".join(lines) + "\n```", inline=False)
+            embed.add_field(name="Addresses (for /rh buy and /mc)", value="```\n" + "\n".join(lines) + "\n```", inline=False)
         links = " · ".join(f"[{t.symbol[:10]}]({t.deepest.url()})" for t in tokens[:10])
         if links:
             embed.add_field(name="Charts", value=links[:1024], inline=False)
@@ -825,7 +825,7 @@ class RhcCog(commands.Cog):
             ["l", "r", "r", "r", "r", "r"], max_fields=3,
         )
         self._addresses_field(embed, top)
-        foot = "GeckoTerminal · Robinhood chain DEX pools · /rhc new for brand-new pairs"
+        foot = "GeckoTerminal · Robinhood chain DEX pools · /rh new for brand-new pairs"
         foot += "" if include_majors else " · WETH/USDG/stables hidden (include_majors to show)"
         if shown < total:
             foot += f" · {total - shown} row(s) not shown"
@@ -874,7 +874,7 @@ class RhcCog(commands.Cog):
             colour=0x3498DB,
             description=(f"{len(kept)} of the {len(tokens)} newest pools have ≥ ${floor:,} liquidity · "
                          f"oldest shown {rhchain.age_str(top[-1].created_ts)} · most are dust: check the sell-back "
-                         f"line in /rhc buy before touching one"),
+                         f"line in /rh buy before touching one"),
         )
         shown, total = add_table_fields(
             embed, "Age, liquidity, 1h volume, 1h change, market cap",

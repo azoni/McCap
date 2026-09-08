@@ -24,8 +24,8 @@ async def tree():
 async def test_help_lists_every_leaf_command_with_its_description(tree):
     embed = build_help(tree)
     text = "\n".join(f"{f.name}\n{f.value}" for f in embed.fields)
-    for leaf in ("/rhc wallet create`", "/rhc buy`", "/rhc sell`", "/rhc trending`", "/rhc new`", "/rhc holdings`",
-                 "/rhc history`", "/rhc pnl`", "/rhc stats`", "`/mc`", "/mc_move`", "/mc_clear`", "/watch add`"):
+    for leaf in ("/rh wallet create`", "/rh buy`", "/rh sell`", "/rh trending`", "/rh new`", "/rh holdings`",
+                 "/rh history`", "/rh pnl`", "/rh stats`", "`/mc`", "/mc_move`", "/mc_clear`", "/watch add`"):
         assert leaf in text, f"{leaf} missing from /help"
     assert "/help" not in text, "help does not list itself"
     assert "Robinhood Chain wallets & trading" in [f.name for f in embed.fields]
@@ -35,5 +35,5 @@ async def test_help_lists_every_leaf_command_with_its_description(tree):
 @pytest.mark.asyncio
 async def test_help_has_no_stale_commands(tree):
     text = "\n".join(f.value for f in build_help(tree).fields)
-    for gone in ("/rh_buy", "/rh_trending", "/rhc quote", "/pay", "/graduated_report"):
+    for gone in ("/rh_buy", "/rh_trending", "/rh quote", "/pay", "/graduated_report"):
         assert gone not in text

@@ -1,4 +1,4 @@
-"""/rhc buy, sell and withdraw flows with a fake interaction.
+"""/rh buy, sell and withdraw flows with a fake interaction.
 
 Money is reserved before a swap, refunded only on a definite failure, kept on a
 pending broadcast, and a stale re-quote below the confirmed floor stops the

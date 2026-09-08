@@ -163,7 +163,7 @@ JUPITER_MAX_REQUESTS_PER_MIN = _env_int("JUPITER_MAX_REQUESTS_PER_MIN", 30)
 # Flag a token in alert embeds when the top 10 wallets hold more than this.
 TOP_HOLDER_WARN_PCT = float(os.getenv("TOP_HOLDER_WARN_PCT", "50"))
 
-# ---- Robinhood chain (DEX activity for /rhc trending and /rhc new) ----
+# ---- Robinhood chain (DEX activity for /rh trending and /rh new) ----
 # Robinhood's own API is execution-only and has no chain data at all, and
 # DexScreener has no per-chain listing. GeckoTerminal lists a network's pools
 # sorted by 24h volume, 20 per page, keyless.

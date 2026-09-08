@@ -3,7 +3,7 @@
 The status line and About Me are global (one text for every server), so this
 is an aggregate across all wallets: ETH, the tokens people have traded through
 McCap, and their rough dollar value. Per-person figures stay behind
-``/rhc holdings``. Everything here is best effort and cached: a wallet whose
+``/rh holdings``. Everything here is best effort and cached: a wallet whose
 balance cannot be read right now is skipped, never reported as zero.
 """
 
@@ -124,9 +124,9 @@ def presence_fragment(s: Optional[Summary]) -> str:
 
 def about_me(s: Optional[Summary]) -> str:
     """The bot's profile text: what it does, and what the group's wallets hold."""
-    lines = ["Market-cap alerts (/mc) and Robinhood Chain trading (/rhc)."]
+    lines = ["Market-cap alerts (/mc) and Robinhood Chain trading (/rh)."]
     if s is None or s.wallets == 0:
-        lines.append("No Robinhood Chain wallets yet. /rhc wallet create makes one.")
+        lines.append("No Robinhood Chain wallets yet. /rh wallet create makes one.")
         return "\n".join(lines)
     total = s.total_usd
     lines.append(
@@ -146,5 +146,5 @@ def about_me(s: Optional[Summary]) -> str:
             lines.append(f"Group: {g.buys + g.sells} trades, {_usd(g.volume_usd)} volume{gas}{best}")
     except Exception:
         log.debug("Group stats unavailable for About Me", exc_info=True)
-    lines.append(f"Updated {time.strftime('%H:%M', time.gmtime(s.fetched_ts))} UTC · /rhc holdings, /rhc pnl, /rhc stats")
+    lines.append(f"Updated {time.strftime('%H:%M', time.gmtime(s.fetched_ts))} UTC · /rh holdings, /rh pnl, /rh stats")
     return "\n".join(lines)[:400]

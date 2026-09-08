@@ -1,7 +1,7 @@
 # Trading Robinhood Chain tokens from Discord
 
 Status: **built 2026-09-07, as a Python port inside McCap** (`mccapbot/rhc/`,
-`/rhc` commands). Decisions taken: operator-decryptable custody (scrypt +
+`/rh` commands). Decisions taken: operator-decryptable custody (scrypt +
 SecretBox under `RHC_WALLET_SECRET`), KyberSwap-only routing with the router
 pinned and every swap simulated before signing, per-user caps that reserve then
 refund, no paper mode (the flag is the gate). The research below is what those
@@ -98,7 +98,7 @@ opt-out later, not as the base.
   confirm button bound to that user, and logged.
 - **Be plain about what this is:** custodial hot wallets. Whoever controls the
   Railway environment and the volume controls every wallet. Users are trusting
-  Charlton. Keep balances small, make withdrawing easy, say so in `/rhc wallet
+  Charlton. Keep balances small, make withdrawing easy, say so in `/rh wallet
   create`.
 - Losing `WALLET_MASTER_SECRET` or the wallet file loses everyone's funds. Both
   need an offline backup before the first deposit.
@@ -131,14 +131,14 @@ opt-out later, not as the base.
 
 | Command | Behaviour |
 |---|---|
-| `/rhc wallet create` | Generates a wallet bound to the caller. Replies ephemerally with the address and the custody warning. |
-| `/rhc wallet show` | Address, ETH balance, token holdings with USD values. Ephemeral. |
-| `/rhc wallet export` | Private key, DM only, confirm button, logged. |
-| `/rhc wallet withdraw <to> <eth>` | Send ETH out. Confirm button. |
-| `/rhc quote <token> <eth>` | Best route and expected output, gas, price impact. |
-| `/rhc buy <token> <eth> [slippage]` | Quote, honeypot sim, confirm, swap, receipt. |
-| `/rhc sell <token> <percent>` | Same path in reverse. Exits are never capped. |
-| `/rhc holdings` | What the caller holds across their wallet, with P&L from the engine's journal. |
+| `/rh wallet create` | Generates a wallet bound to the caller. Replies ephemerally with the address and the custody warning. |
+| `/rh wallet show` | Address, ETH balance, token holdings with USD values. Ephemeral. |
+| `/rh wallet export` | Private key, DM only, confirm button, logged. |
+| `/rh wallet withdraw <to> <eth>` | Send ETH out. Confirm button. |
+| `/rh quote <token> <eth>` | Best route and expected output, gas, price impact. |
+| `/rh buy <token> <eth> [slippage]` | Quote, honeypot sim, confirm, swap, receipt. |
+| `/rh sell <token> <percent>` | Same path in reverse. Exits are never capped. |
+| `/rh holdings` | What the caller holds across their wallet, with P&L from the engine's journal. |
 
 Guards, all carried over from mccap-web and the existing `rh_*` commands:
 feature flag off by default; guild allowlist; per-user per-trade and daily caps
@@ -159,8 +159,8 @@ the chain accepts the transaction; honest receipt status; paper mode first.
 
 ## Phases
 
-- **Phase 0, no money.** Engine deployed with paper mode forced. `/rhc wallet
-  create/show`, `/rhc quote` through the aggregator, journal visible. Proves the
+- **Phase 0, no money.** Engine deployed with paper mode forced. `/rh wallet
+  create/show`, `/rh quote` through the aggregator, journal visible. Proves the
   plumbing and the quotes.
 - **Phase 1, owner only.** Live buys and sells for `RH_OWNER_ID` with small caps.
   Compare realised fills against quotes for a week.

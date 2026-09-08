@@ -209,8 +209,8 @@ async def execute(user_id: int, built: BuiltSwap, token: str, symbol: str,
     """Run the full path for a built swap. ``token`` is the non-ETH side.
 
     ``extra`` is journaled with the trade: market cap and price at the time,
-    token decimals, entry figures for a sell. It is what /rhc holdings and
-    /rhc pnl are computed from later.
+    token decimals, entry figures for a sell. It is what /rh holdings and
+    /rh pnl are computed from later.
     """
     lk = _lock(user_id)
     if lk.locked():
@@ -226,7 +226,7 @@ async def _execute_locked(user_id: int, built: BuiltSwap, token: str, symbol: st
                           extra: Dict[str, Any]) -> SwapResult:
     w = wallets.get(user_id)
     if w is None:
-        return SwapResult(ok=False, error="You have no wallet yet. Use /rhc wallet create.")
+        return SwapResult(ok=False, error="You have no wallet yet. Use /rh wallet create.")
     owner = w.address
     is_buy = built.is_buy
 
@@ -252,7 +252,7 @@ async def _execute_locked(user_id: int, built: BuiltSwap, token: str, symbol: st
     except chain.ChainError:
         return SwapResult(ok=False, error="Could not read your ETH balance on Robinhood Chain.")
     if bal == 0:
-        return SwapResult(ok=False, error="Your wallet has no ETH for gas. Fund it first (/rhc wallet show).")
+        return SwapResult(ok=False, error="Your wallet has no ETH for gas. Fund it first (/rh wallet show).")
     # The aggregator's gas estimate, buffered, at the fee we will actually sign.
     try:
         price = await chain.gas_price()
