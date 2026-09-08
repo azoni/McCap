@@ -62,13 +62,25 @@ async def test_summary_adds_eth_and_tokens_across_wallets(monkeypatch):
     assert s.total_usd == pytest.approx(150.2)
 
     frag = portfolio.presence_fragment(s)
-    assert frag == "RH 0.050 ETH + 1 token ($150)"
+    assert frag == "RH $150.20"
     line = Bot._presence_text(1.0, s)
-    assert line.startswith("💰 1.00 SOL · RH 0.050 ETH + 1 token ($150)")
+    assert line == "💰 1.00 SOL · RH $150.20"
 
     about = portfolio.about_me(s)
-    assert "2 wallets, 0.0500 ETH ($125)" in about and "36.00 PONS" in about and "Total ≈ $150" in about
+    assert "2 wallets hold $150.20: 0.05 ETH ($125.00) + 36 PONS ($25.20)" in about, about
+    assert about.endswith("/rh holdings · /rh pnl · /rh stats") and "Updated" not in about
     assert len(about) <= 400
+
+
+def test_about_me_drops_positions_before_cutting_a_sentence():
+    positions = [(f"TOKEN{i:02d}", 1234.5, 12.0) for i in range(40)]
+    s = portfolio.Summary(wallets=3, readable=3, eth_wei=10**18, eth_usd=2500.0,
+                          tokens_usd=480.0, positions=positions)
+    about = portfolio.about_me(s)
+    assert len(about) <= 400
+    assert about.endswith("/rh holdings · /rh pnl · /rh stats"), "the tail survives; positions are what get dropped"
+    assert "3 wallets hold $2.98K: 1 ETH ($2.5K)" in about
+    assert "TOKEN39" not in about and "TOKEN00" in about
 
 
 @pytest.mark.asyncio
@@ -87,7 +99,7 @@ async def test_unreadable_wallet_is_skipped_not_zeroed(monkeypatch):
     monkeypatch.setattr(ledger, "tokens_touched", lambda uid: [])
     s = await portfolio.summary()
     assert s.readable == 1 and s.eth == 1.0 and s.eth_usd is None and s.total_usd is None
-    assert portfolio.presence_fragment(s) == "RH 1.000 ETH"
+    assert portfolio.presence_fragment(s) == "RH 1 ETH"
 
 
 @pytest.mark.asyncio

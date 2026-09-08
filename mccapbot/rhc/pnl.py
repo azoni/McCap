@@ -7,8 +7,9 @@ at the time, and the gas the receipt charged. From that:
 * cost basis of a position (average cost per token, entry market cap),
 * realized profit on what was sold, unrealized profit on what is still held
   (valued at DexScreener's current price), gas as its own line,
-* the multiple: current (or sold-at) market cap over the entry market cap,
-  which is the "bought at 50K, sold at 200K, 4x" people actually say.
+* the multiple: price now (or at the sale) over the price paid, shown as the
+  "bought at 50K, sold at 200K, 4x" people actually say by putting the entry
+  price in market-cap terms with today's supply.
 
 Prices at trade time come from the aggregator's USD figures and DexScreener,
 so this is an honest estimate, not an exchange statement.
@@ -20,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from ..dex import token_summary
+from ..helpers import SEP, usd
 from ..logging_setup import log
 from . import chain, ledger, wallets
 
@@ -65,8 +67,28 @@ class TokenPnl:
         return self.cost_usd / self.bought if self.bought > 0 and self.cost_usd > 0 else None
 
     @property
-    def entry_mc(self) -> Optional[float]:
+    def journal_entry_mc(self) -> Optional[float]:
+        """Cost-weighted market cap DexScreener reported at buy time. Fallback only:
+        for a minutes-old token that reading can disagree with its own price (the
+        price comes from the best pool, the market cap from a consensus that dust
+        pools drag around), which once showed a -4% position as 0.58x."""
         return self.entry_mc_weight / self.cost_usd if self.cost_usd > 0 and self.entry_mc_weight > 0 else None
+
+    @property
+    def supply_now(self) -> Optional[float]:
+        """Circulating supply implied by today's price and market cap."""
+        if self.mc_now and self.price_now:
+            return self.mc_now / self.price_now
+        return None
+
+    @property
+    def entry_mc(self) -> Optional[float]:
+        """Market cap at the price actually paid: average cost × today's implied
+        supply, so it agrees with the dollar figures by construction. Falls back
+        to the journal's reading when there is no live price."""
+        if self.avg_cost and self.supply_now:
+            return self.avg_cost * self.supply_now
+        return self.journal_entry_mc
 
     @property
     def worth_usd(self) -> Optional[float]:
@@ -104,11 +126,11 @@ class TokenPnl:
 
     @property
     def multiple_now(self) -> Optional[float]:
-        """Current market cap over entry market cap (falls back to price over avg cost)."""
-        if self.entry_mc and self.mc_now:
-            return self.mc_now / self.entry_mc
+        """Price now over the price paid; market caps only when there is no live price."""
         if self.avg_cost and self.price_now:
             return self.price_now / self.avg_cost
+        if self.journal_entry_mc and self.mc_now:
+            return self.mc_now / self.journal_entry_mc
         return None
 
 
@@ -285,30 +307,6 @@ def group_stats() -> GroupStats:
     return g
 
 
-# ---------------- formatting ----------------
-
-def fmt_usd(v: Optional[float], signed: bool = False) -> str:
-    if v is None:
-        return "—"
-    if signed:
-        return f"{'+' if v >= 0 else '-'}${abs(v):,.2f}"
-    return f"${v:,.2f}"
-
-
-def fmt_x(m: Optional[float]) -> str:
-    if m is None:
-        return "—"
-    return f"{m:.2f}x" if m < 10 else f"{m:.1f}x"
-
-
-def fmt_amount(v: float) -> str:
-    if v >= 1000:
-        return f"{v:,.0f}"
-    if v >= 1:
-        return f"{v:,.2f}"
-    return f"{v:.4f}".rstrip("0").rstrip(".") or "0"
-
-
 # ---------------- chart ----------------
 
 def render_chart(u: UserPnl, title: str) -> Optional[bytes]:
@@ -334,10 +332,10 @@ def render_chart(u: UserPnl, title: str) -> Optional[bytes]:
     bars = ax.bar(labels, values, color=colours)
     ax.axhline(0, color="#9aa0a6", linewidth=0.8)
     for bar, v in zip(bars, values):
-        ax.annotate(fmt_usd(v, signed=True), (bar.get_x() + bar.get_width() / 2, v),
+        ax.annotate(usd(v, signed=True), (bar.get_x() + bar.get_width() / 2, v),
                     ha="center", va="bottom" if v >= 0 else "top", fontsize=8, color="#e3e5e8",
                     xytext=(0, 3 if v >= 0 else -3), textcoords="offset points")
-    ax.set_title(f"{title} · total {fmt_usd(u.pnl_usd, signed=True)}", color="#e3e5e8", fontsize=11)
+    ax.set_title(f"{title}{SEP}net {usd(u.pnl_usd, signed=True)}", color="#e3e5e8", fontsize=11)
     ax.tick_params(colors="#e3e5e8", labelsize=8)
     for spine in ax.spines.values():
         spine.set_color("#4e5058")

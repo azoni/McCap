@@ -10,7 +10,7 @@ Discord bot for Solana market-cap alerts and token watchlists.
 |---|---|
 | `/mc <ca> <target> [note]` | Alert when market cap hits a target. Accepts **`2x`**, **`+50%`**, **`-30%`** or an absolute (`250k`, `2.5m`). Direction (≥ / ≤) is inferred. |
 | `/mc_move <ca> <percent> [window] [direction] [cooldown]` | Momentum alert — fires when a token **moves** X% within a window (`15m`, `1h`, `4h`, `1d`). Recurring. |
-| `/mc_list [user] [public]` | All active alerts, level and momentum. |
+| `/mc_list [user] [public]` | All active alerts, level and momentum, with the current market cap. |
 | `/mc_remove <alerts>` | Remove alerts. Autocompletes; accepts ids (`a1b2c3`) or `/mc_list` positions. |
 | `/mc_clear` | Remove every alert in the server (server managers only, confirm button). |
 | `/mc_recent [count] [user]` | Recently fired alerts. |
@@ -81,14 +81,14 @@ what you are actively trading here.
 | `/rh wallet show` | Address, ETH balance, today's remaining buy budget. |
 | `/rh wallet export` | Reveal your private key (ephemeral, confirm first, logged). |
 | `/rh wallet withdraw <to> <eth>` | Send ETH out. Confirm first. |
-| `/rh buy <token> <eth> [slippage_bps]` | Quote, honeypot check, confirm, swap, receipt. Counts against your daily cap. |
-| `/rh sell <token> <percent> [slippage_bps]` | Sell part of a holding for ETH. Exits are never capped. |
-| `/rh holdings` | Your ETH and open positions: amount, cost, worth now, profit, multiple from entry, total balance. |
-| `/rh history [count]` | Your recent buys, sells and withdrawals with status, market cap at the time, and transaction links. |
-| `/rh pnl` | Profit per token (realized, unrealized, net), gas spent, and a bar chart. |
+| `/rh buy <token> <eth\|usd> [slippage_bps] [private]` | Quote (ETH and dollars), sell-back check, private confirm prompt, swap, receipt with the entry market cap. Counts against your daily cap. |
+| `/rh sell <token> <percent> [slippage_bps] [private]` | Sell part of a holding for ETH; the receipt shows the multiple from your entry. Exits are never capped. |
+| `/rh holdings [public]` | Your ETH and open positions: amount, worth now, cost, multiple, and the net profit line. Yours by default. |
+| `/rh history [count] [public]` | Your recent buys, sells and withdrawals with status, relative time and transaction links. |
+| `/rh pnl [public]` | Net profit, per-token lines, gas spent, and a bar chart. |
 | `/rh stats` | Group metrics: wallets, trades, volume, gas spent, realized profit, best multiple. |
-| `/rh trending [window] [sort] [count] [include_majors]` | Busiest and fastest-moving tokens on the chain: volume, market cap at the start of the window → now, liquidity. Windows 5m to 24h; sort by volume, gainers, losers or newest. |
-| `/rh new [count] [min_liquidity]` | Brand-new pairs from GeckoTerminal's new-pools feed, newest first, with age, liquidity, 1h volume and change. |
+| `/rh trending [window] [sort] [count] [include_majors]` | Busiest and fastest-moving tokens on the chain: volume, change, market cap, liquidity. Windows 5m to 24h; sort by volume, gainers (with then → now market caps), losers or newest. |
+| `/rh new [count] [min_liquidity]` | Brand-new pairs from GeckoTerminal's new-pools feed, newest first, with age, liquidity, 1h volume and market cap. |
 | `/help` | Every command with what it does. |
 
 The bot's status line and its About Me (click McCap) show the combined total
@@ -96,12 +96,18 @@ across all wallets: ETH, tokens traded through McCap, and a rough dollar value,
 refreshed every `PRESENCE_REFRESH_SECONDS`. Per-person figures stay behind
 `/rh holdings`. `RHC_ABOUT_ME_ENABLE=0` leaves the profile text alone.
 
-`<token>` is a contract address or a symbol from `/rh trending`. Quotes, trade
-results, wallet addresses, balances and holdings post to the channel so the
-group can see them (`RHC_PUBLIC_REPLIES=0` makes everything private), and every
-one of those commands takes `private:True` to keep that single reply to yourself.
-Refusals, the withdraw prompt and the private-key export are only ever visible
-to the user.
+`<token>` is a contract address or a symbol from `/rh trending`. Visibility:
+the confirm prompts, refusals, the withdraw flow and the private-key export are
+only ever visible to the caller. Trade results, wallet balances, the trending
+board and the group stats post to the channel (`RHC_PUBLIC_REPLIES=0` makes them
+private too; `private:True` keeps one reply to yourself). Holdings, history and
+profit are yours by default; `public:True` shows one of them to the channel.
+
+The multiple on a position or a sale is the price now over the price you paid;
+the "entry" market cap next to it is that entry price restated at today's
+supply, so it always agrees with the dollar figures. (The market cap DexScreener
+reported at buy time is journaled but not shown: for a minutes-old token it can
+come from a different pool than the price.)
 
 **Routing.** Swaps go through the KyberSwap aggregator, which sees every DEX on
 the chain (Uniswap V2/V3/V4, Ramses, Pons, ...) and builds the calldata itself.

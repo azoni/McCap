@@ -7,6 +7,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from .. import chat
+from ..helpers import footer, plural
 from ..config import CHAT_ENABLE, CHAT_MODEL
 from ..logging_setup import log
 
@@ -92,7 +93,7 @@ class ChatCog(commands.Cog):
         if not notes:
             await inter.response.send_message("Nothing saved yet. @mention me and tell me what to remember.")
             return
-        pieces = chat.chunk_message(f"**{len(notes)} note(s)**\n{chat.describe_notes(scope)}")
+        pieces = chat.chunk_message(f"**{plural(len(notes), 'note')}**\n{chat.describe_notes(scope)}")
         await inter.response.send_message(pieces[0])
         for piece in pieces[1:]:
             await inter.followup.send(piece)
@@ -111,8 +112,8 @@ class ChatCog(commands.Cog):
     async def memory_status(self, inter: discord.Interaction):
         state = f"on ({CHAT_MODEL})" if CHAT_ENABLE else "off (no ANTHROPIC_API_KEY)"
         await inter.response.send_message(
-            f"Chat: {state} / {self.guard.calls_today} call(s) today / "
-            f"{len(chat.memory_notes)} note(s) total / {len(chat.chat_turns)} history turn(s)",
+            footer(f"Chat {state}", f"{plural(self.guard.calls_today, 'call')} today",
+                   f"{plural(len(chat.memory_notes), 'note')} saved", f"{plural(len(chat.chat_turns), 'history turn')}"),
             ephemeral=True,
         )
 

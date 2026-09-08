@@ -76,15 +76,17 @@ def test_quote_text_shows_the_address_and_flags_honeypots_and_bad_round_trips():
     assert "No sell route" in no_way_back and "Honeypot" in no_way_back and PONS in no_way_back
     unknown = cog.RhcCog._quote_text(rt, PONS, "PONS", 18, None, True)
     assert "did not answer" in unknown and "Honeypot" not in unknown
-    fine = cog.RhcCog._quote_text(rt, PONS, "PONS", 18, back_route(10**16 * 99 // 100), False)
-    assert "round trip" in fine and "⚠️" not in fine
+    fine = cog.RhcCog._quote_text(rt, PONS, "PONS", 18, back_route(10**16 * 99 // 100), False, liq=500_000.0)
+    assert fine.startswith("Buy **36 PONS** for **0.01 ETH ($24.80)**?"), fine
+    assert "round trip" in fine and "liquidity $500K" in fine and "gas ≈ $0.49" in fine and "⚠️" not in fine
     bad = cog.RhcCog._quote_text(rt, PONS, "PONS", 18, back_route(10**16 // 2), False)
-    assert "⚠️" in bad and "-50.0%" in bad
+    assert "⚠️" in bad and "-50%" in bad
 
 
 def test_describe_distinguishes_ok_pending_and_failed():
     ok = swap.SwapResult(ok=True, tx="0xabc", gas_cost_wei=10**14)
     assert cog.RhcCog._describe(ok, "Bought X").startswith("✅") and "0xabc" in cog.RhcCog._describe(ok, "x")
+    assert "gas" not in cog.RhcCog._describe(ok, "x"), "gas lives in /rh holdings and /rh stats, not on every receipt"
     pending = swap.SwapResult(ok=False, tx="0xdef", pending=True, error="Submitted but unconfirmed.")
     assert cog.RhcCog._describe(pending, "x").startswith("⏳")
     failed = swap.SwapResult(ok=False, error="REFUSING TO SIGN")

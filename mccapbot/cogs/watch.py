@@ -14,7 +14,7 @@ from discord.ext import commands
 
 from ..config import MAX_WATCH_PER_LIST
 from ..dex import token_summary
-from ..helpers import humanize, short_ca
+from ..helpers import NEUTRAL, SEP, UNKNOWN, fit_lines, footer, pct, plural, short_ca, usd
 from ..models import WatchItem
 from ..storage import save_watchlist, watchlist
 from ..tables import add_table_fields
@@ -102,8 +102,8 @@ class WatchCog(commands.Cog):
         )
         await save_watchlist()
         await inter.followup.send(
-            f"👁️ Added **{info['name']} ({info['symbol']})** to **{name}** "
-            f"— MC ${humanize(info['mc'])}, {len(entries(inter, name))} token(s) on this list."
+            f"👁️ Added **{info['symbol'] or info['name']}** ({usd(info['mc'])} MC) to **{name}**"
+            f"{SEP}{plural(len(entries(inter, name)), 'token')} on the list"
         )
 
     # ---------------- /watch remove ----------------
@@ -154,50 +154,41 @@ class WatchCog(commands.Cog):
 
         infos = await asyncio.gather(*(token_summary(w.ca) for w in items), return_exceptions=True)
 
-        rows, total_mc, missing = [], 0.0, 0
-        pairs = []
+        pairs, unknown, total_mc = [], [], 0.0
         for w, info in zip(items, infos):
             if isinstance(info, Exception) or not info:
-                missing += 1
-                rows.append([w.symbol or w.name, "—", "—", "—"])
+                unknown.append([w.symbol or w.name, UNKNOWN, UNKNOWN, UNKNOWN])
                 continue
             total_mc += info["mc"] or 0
             pairs.append((w, info))
 
-        # Biggest movers first — that's what you want to see during a run.
+        # Biggest movers first — that's what you want to see during a run —
+        # and the tokens with no data at the bottom.
         pairs.sort(key=lambda p: p[1]["change24"], reverse=True)
-        for w, info in pairs:
-            ch = info["change24"]
-            rows.insert(
-                len(rows) - missing if missing else len(rows),
-                [
-                    info["symbol"] or info["name"],
-                    f"${humanize(info['mc'])}",
-                    f"{ch:+.1f}%",
-                    f"${humanize(info['liq'])}",
-                ],
-            )
+        rows = [
+            [info["symbol"] or info["name"], usd(info["mc"]), pct(info["change24"]), usd(info["liq"])]
+            for _w, info in pairs
+        ] + unknown
 
         gainers = sum(1 for _, i in pairs if i["change24"] > 0)
 
         embed = discord.Embed(
-            title=f"Watchlist · {name}",
-            description=f"{len(items)} token(s) · combined MC **${humanize(total_mc)}**",
-            color=0x2B90D9,
+            title=f"Watchlist{SEP}{name}",
+            description=f"{plural(len(items), 'token')}{SEP}combined MC **{usd(total_mc)}**",
+            color=NEUTRAL,
         )
         # Split across fields: one field caps at 1024 chars, and a long list of
         # long symbols reaches that well inside MAX_WATCH_PER_LIST.
         shown, total_rows = add_table_fields(
-            embed, "Sorted by 24h change",
+            embed, "Tokens",
             ["Token", "MC", "24h", "Liq"], rows, ["l", "r", "r", "r"],
             max_width=12, max_fields=4,
         )
-        foot = f"{gainers} up / {len(pairs) - gainers} down"
-        if shown < total_rows:
-            foot += f" · {total_rows - shown} row(s) not shown"
-        if missing:
-            foot += f" · {missing} with no market data"
-        embed.set_footer(text=foot)
+        embed.set_footer(text=footer(
+            f"{gainers} up", f"{len(pairs) - gainers} down",
+            f"{len(unknown)} with no market data" if unknown else "",
+            f"{plural(total_rows - shown, 'row')} not shown" if shown < total_rows else "",
+        ))
         await inter.followup.send(embed=embed, ephemeral=not public)
 
     # ---------------- /watch lists ----------------
@@ -209,13 +200,8 @@ class WatchCog(commands.Cog):
         if not names:
             await inter.followup.send("No watchlists yet — create one with `/watch add`.", ephemeral=True)
             return
-        rows = [[n, str(len(entries(inter, n)))] for n in names]
-        embed = discord.Embed(title="Watchlists", color=0x2B90D9)
-        shown, total_lists = add_table_fields(
-            embed, "This server", ["List", "Tokens"], rows, ["l", "r"], max_fields=3
-        )
-        if shown < total_lists:
-            embed.set_footer(text=f"{total_lists - shown} list(s) not shown")
+        lines = [f"**{n}**{SEP}{plural(len(entries(inter, n)), 'token')}" for n in names]
+        embed = discord.Embed(title="Watchlists", color=NEUTRAL, description=fit_lines(lines, 4000))
         await inter.followup.send(embed=embed, ephemeral=True)
 
 

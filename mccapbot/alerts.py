@@ -14,7 +14,7 @@ from .config import (
     TOP_HOLDER_WARN_PCT,
 )
 from .dex import build_token_url, choose_consensus_pair, fetch_dex_token, get_image_url, resolve_mc_value
-from .helpers import human_window, humanize, meets, username_from_id
+from .helpers import BAD, GOOD, SEP, footer, human_window, humanize, meets, pct, usd, username_from_id
 from .logging_setup import log
 from .models import AlertEvent, TokenSnapshot
 from .scheduler import (
@@ -120,8 +120,8 @@ async def _collect(live: set) -> None:
         _last_checked.pop(ca, None)
     for ca in [c for c in _no_data if c not in live]:
         _no_data.pop(ca, None)
-    # Keep anything the fired-alert history still displays, or /mc_recent's
-    # Current column goes blank the moment an alert fires.
+    # Keep anything the fired-alert history still references, so a token that
+    # just fired and gets re-armed does not start from a cold cache.
     keep = live | {e.ca for e in alert_events}
     async with TOKEN_CACHE_LOCK:
         for ca in [c for c in token_cache if c not in keep]:
@@ -214,30 +214,27 @@ def _mention(user_id: int) -> Optional[str]:
 
 async def _fire_level(client: discord.Client, rem, current_mc, snap) -> None:
     ch = await client.fetch_channel(rem.channel_id)
-    color = 0x2ECC71 if rem.direction == "above" else 0xE74C3C
-    desc = (
-        f"{'rose above' if rem.direction == 'above' else 'fell below'} "
-        f"**${humanize(rem.target_mc)} MC**\nCurrent: **${humanize(current_mc)}**"
-    )
+    up = rem.direction == "above"
+    desc = f"{'📈 Rose above' if up else '📉 Fell below'} **{usd(rem.target_mc)} MC**{SEP}now **{usd(current_mc)}**"
     if rem.spec:
-        desc += f"\nTarget was `{rem.spec}` from ${humanize(rem.anchor_mc)}"
+        desc += f"\n{rem.spec} from {usd(rem.anchor_mc)} when set"
     if rem.note:
-        desc += f"\n\n📝 {rem.note}"
+        desc += f"\n📝 {rem.note}"
 
     risk = jupiter.risk_line(jup_cache.get(rem.ca), TOP_HOLDER_WARN_PCT)
     if risk:
-        desc += f"\n\n🔎 {risk}"
+        desc += f"\n🔎 {risk}"
 
     user_name = await username_from_id(client, rem.creator_id)
     embed = discord.Embed(
         title=f"{rem.name} ({rem.symbol})",
         description=desc,
         url=(snap.url if snap else build_token_url(rem.ca, None)),
-        color=color,
+        color=GOOD if up else BAD,
     )
     if snap and snap.image_url:
         embed.set_thumbnail(url=snap.image_url)
-    embed.set_footer(text=f"Set by {user_name} • alert {rem.id}")
+    embed.set_footer(text=footer(user_name, rem.id))
 
     await ch.send(
         content=_mention(rem.creator_id),
@@ -254,29 +251,24 @@ async def _fire_move(client: discord.Client, mv, change: float, current_mc, snap
     ch = await client.fetch_channel(mv.channel_id)
     up = change >= 0
     arrow = "📈" if up else "📉"
-    desc = (
-        f"{arrow} **{change:+.1f}%** in the last {human_window(mv.window_sec)}\n"
-        f"Current: **${humanize(current_mc)}**"
-    )
+    desc = f"{arrow} **{pct(change)}** in {human_window(mv.window_sec)}{SEP}now **{usd(current_mc)}**"
     if mv.note:
-        desc += f"\n\n📝 {mv.note}"
+        desc += f"\n📝 {mv.note}"
 
     risk = jupiter.risk_line(jup_cache.get(mv.ca), TOP_HOLDER_WARN_PCT)
     if risk:
-        desc += f"\n\n🔎 {risk}"
+        desc += f"\n🔎 {risk}"
 
     user_name = await username_from_id(client, mv.creator_id)
     embed = discord.Embed(
         title=f"{mv.name} ({mv.symbol})",
         description=desc,
         url=(snap.url if snap else build_token_url(mv.ca, None)),
-        color=0x2ECC71 if up else 0xE74C3C,
+        color=GOOD if up else BAD,
     )
     if snap and snap.image_url:
         embed.set_thumbnail(url=snap.image_url)
-    embed.set_footer(
-        text=f"Set by {user_name} • move {mv.id} • rearms in {human_window(mv.cooldown_sec)}"
-    )
+    embed.set_footer(text=footer(user_name, mv.id, f"re-arms in {human_window(mv.cooldown_sec)}"))
 
     await ch.send(
         content=_mention(mv.creator_id),

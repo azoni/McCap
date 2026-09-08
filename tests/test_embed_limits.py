@@ -6,15 +6,13 @@ server. These tests exist so no table command can regress into that again.
 
 import pytest
 
+from mccapbot.helpers import fit_lines
 from mccapbot.tables import (
-    ALERTS_ALIGNS,
-    ALERTS_HEADERS,
     EMBED_FIELD_LIMIT,
     _normalise_aligns,
     _render,
     _widths,
     add_table_fields,
-    alerts_rows,
     table_chunks,
 )
 
@@ -154,23 +152,13 @@ def test_continuation_fields_are_labelled():
 # ---------------- /mc_recent, which allows count up to 50 ----------------
 
 
-class Ev:
-    ts = 1_700_000_000.0
-    ca = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
-    name = "TokenName"
-    symbol = "LONGSYM"
-    direction = "above"
-    target_mc = 12_345_678.0
-    current_mc = 9_999_999.0
-    creator_id = 2
+RECENT_LINE = "📈 **LONGSYMBOL** ≥ $12.3M · fired at $10M · <t:1700000000:R> · charltonuw"
 
 
 @pytest.mark.parametrize("n", [5, 20, 50])
-def test_mc_recent_fits_at_its_maximum_count(n):
-    rows = alerts_rows([Ev()] * n, {2: "charltonuw"}, {Ev.ca: 9_999_999.0})
-    embed = FakeEmbed()
-    shown, total = add_table_fields(
-        embed, "History", ALERTS_HEADERS, rows, ALERTS_ALIGNS, max_width=14, max_fields=5
-    )
-    assert shown == total == n, "the documented max count must render fully"
-    assert all(len(v) <= EMBED_FIELD_LIMIT for _, v in embed.fields)
+def test_mc_recent_lines_fit_an_embed_description(n):
+    """The history is plain lines now; at the documented maximum every line
+    must still fit, and any cut must be disclosed."""
+    out = fit_lines([RECENT_LINE] * n, 4000)
+    assert len(out) <= 4000
+    assert out.count("\n") + 1 == n or "more lines" in out

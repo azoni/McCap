@@ -63,10 +63,14 @@ def test_aggregate_cost_entry_mc_and_multiple():
     pos = pnl.aggregate(ledger.trades(USER))[PONS]
     assert pos.bought == 60 and pos.cost_usd == 40.0 and pos.buys == 2
     assert pos.avg_cost == pytest.approx(40 / 60)
-    assert pos.entry_mc == pytest.approx(75_000.0), "cost-weighted entry market cap"
+    assert pos.journal_entry_mc == pytest.approx(75_000.0), "cost-weighted market cap DexScreener reported"
+    assert pos.entry_mc == pytest.approx(75_000.0), "without a live price the journal's reading is all there is"
     assert pos.gas_wei == 2 * 10**14
     pos.balance_raw, pos.mc_now, pos.price_now = 60 * 10**18, 300_000.0, 4.0
-    assert pos.multiple_now == pytest.approx(4.0)                    # 75K -> 300K
+    # Live: $4 a token against $0.667 paid is 6x, whatever DexScreener said at
+    # buy time. Entry MC is restated at today's supply (300K / 4 = 75K tokens).
+    assert pos.multiple_now == pytest.approx(6.0)
+    assert pos.entry_mc == pytest.approx(50_000.0)
     assert pos.worth_usd == pytest.approx(240.0)
     assert pos.unrealized_usd == pytest.approx(200.0)
     assert pos.realized_usd == 0.0
@@ -89,6 +93,21 @@ def test_entry_for_is_journal_only():
     buy("0x1", PONS, "PONS", 10**16, 40 * 10**18, 20.0, 50_000.0)
     assert pnl.entry_for(USER, PONS.upper()).entry_mc == 50_000.0
     assert pnl.entry_for(USER, LAPTOP) is None
+
+
+def test_the_multiple_agrees_with_the_dollar_figures():
+    """The screenshot case: $5.00 of ELIZABAO worth $4.79 showed 0.58x and
+    'bought at $380K MC, now $222K'. The buy-time market cap came from a
+    different pool than the price, so it was wrong; the dollars were right."""
+    buy("0x1", PONS, "ELIZABAO", 2 * 10**15, 21_593 * 10**18, 5.00, 380_120.0)
+    pos = pnl.aggregate(ledger.trades(USER))[PONS]
+    pos.balance_raw = 21_593 * 10**18
+    pos.price_now = 4.79 / 21_593
+    pos.mc_now = 221_930.0
+    assert pos.worth_usd == pytest.approx(4.79)
+    assert pos.multiple_now == pytest.approx(0.958, abs=0.001)
+    assert pos.entry_mc == pytest.approx(231_660.0, rel=0.001), "entry restated at today's supply, not $380K"
+    assert pos.journal_entry_mc == 380_120.0, "the raw reading is still there for the record"
 
 
 # ---------------- live enrichment ----------------
@@ -147,14 +166,7 @@ def test_group_stats_span_every_wallet():
     assert g.best_multiple == 10.0 and g.best_symbol == "PONS"
 
 
-# ---------------- formatting and chart ----------------
-
-
-def test_formatting_helpers():
-    assert pnl.fmt_usd(1234.5) == "$1,234.50" and pnl.fmt_usd(None) == "—"
-    assert pnl.fmt_usd(-3.2, signed=True) == "-$3.20" and pnl.fmt_usd(3.2, signed=True) == "+$3.20"
-    assert pnl.fmt_x(4.0) == "4.00x" and pnl.fmt_x(12.34) == "12.3x" and pnl.fmt_x(None) == "—"
-    assert pnl.fmt_amount(2062.09) == "2,062" and pnl.fmt_amount(3.33) == "3.33" and pnl.fmt_amount(0.00042) == "0.0004"
+# ---------------- chart ----------------
 
 
 def test_chart_renders_a_png():

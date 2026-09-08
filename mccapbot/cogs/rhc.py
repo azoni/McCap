@@ -3,9 +3,12 @@
 Trading (buy/sell) needs the trading flag and the allowlist; getting your own
 funds OUT (export, withdraw) needs only your wallet, so a kill switch never
 strands anyone. Money moves only after a confirm button bound to the caller.
-With ``RHC_PUBLIC_REPLIES`` on (the default) quotes, prompts, results, balances
-and the trending board post to the channel; refusals, the withdraw prompt and
-the private-key export are always visible only to the user. See
+
+Visibility: the confirm prompts, refusals, the withdraw flow and the key export
+are always visible only to the caller. Trade results, the trending board and
+the group stats post to the channel (``RHC_PUBLIC_REPLIES=0`` makes them
+private too; ``private:True`` does it for one call). Holdings, history and
+profit are yours by default; ``public:True`` shows them to the channel. See
 ``mccapbot/rhc`` for the execution path and its guards.
 """
 
@@ -26,13 +29,27 @@ from ..config import (
     RHC_GUILD_IDS,
     RHC_MAX_DAILY_USD,
     RHC_MAX_SLIPPAGE_BPS,
-    RHC_MAX_TRADE_USD,
     RHC_PUBLIC_REPLIES,
     RHC_TRADER_IDS,
     RHC_TRADING_ENABLE,
 )
 from ..dex import token_summary
-from ..helpers import humanize
+from ..helpers import (
+    NEUTRAL,
+    SEP,
+    UNKNOWN,
+    colour_for,
+    eth_str,
+    fit_lines,
+    footer,
+    mult,
+    pct,
+    plural,
+    qty,
+    short_ca,
+    usd as usd_str,   # ``usd`` is also the buy command's dollar option
+    when,
+)
 from ..logging_setup import log
 from ..rhc import chain, guard, kyber, ledger, pnl, portfolio, swap, wallets
 from ..tables import add_table_fields
@@ -46,8 +63,9 @@ CUSTODY_WARNING = (
     "treat it like cash in a friend's drawer, not a bank."
 )
 
-# Visibility of quotes, prompts, results and balances. Refusals, the withdraw
-# prompt and the key export never use this: they are always private.
+# Visibility of trade results, balances, the trending board and group stats.
+# Prompts, refusals, the withdraw flow and the key export never use this: they
+# are always private.
 PRIVATE = not RHC_PUBLIC_REPLIES
 
 
@@ -89,12 +107,19 @@ def clamp_slippage(bps: Optional[int]) -> int:
     return max(10, min(v, RHC_MAX_SLIPPAGE_BPS))
 
 
-def _fmt_usd(v: Optional[float]) -> str:
-    return f"${v:,.2f}" if v is not None else "—"
+def _eth(wei: Optional[int]) -> str:
+    """An ETH amount from integer wei, exact, trailing zeros dropped."""
+    return chain.fmt_units(wei, 18) if wei is not None else UNKNOWN
 
 
-def _short_addr(a: str) -> str:
-    return f"{a[:6]}…{a[-4:]}"
+def _entry_mc(usd_in: Optional[float], tokens: float, info: Optional[dict]) -> Optional[float]:
+    """The market cap at the price just paid, in today's supply terms: what the
+    buyer will later compare against. None when the price is unknown."""
+    price = (info or {}).get("price")
+    mc = (info or {}).get("mc")
+    if not usd_in or tokens <= 0 or not price or not mc:
+        return None
+    return (usd_in / tokens) * (mc / price)
 
 
 class RhcCog(commands.Cog):
@@ -209,7 +234,7 @@ class RhcCog(commands.Cog):
             await inter.followup.send("❌ Wallet creation failed on the server; it's in the logs.", ephemeral=priv)
             return
         await inter.followup.send(
-            f"✅ {inter.user.display_name}'s Robinhood Chain wallet:\n`{w.address}`\n"
+            f"✅ **{inter.user.display_name}**'s Robinhood Chain wallet\n`{w.address}`\n"
             f"Fund it by withdrawing **ETH on Robinhood Chain** from the Robinhood app to that address. "
             f"Gas is paid in ETH.\n\n{CUSTODY_WARNING}\n\n"
             f"[Explorer]({chain.explorer_address(w.address)})",
@@ -231,12 +256,16 @@ class RhcCog(commands.Cog):
         except chain.ChainError:
             bal = None
         eth_usd = await self._eth_usd()
-        eth = chain.fmt_units(bal, 18) if bal is not None else "unavailable (RPC)"
-        usd = f" (≈ ${bal / 1e18 * eth_usd:,.2f})" if (bal is not None and eth_usd) else ""
+        if bal is None:
+            balance = "balance unavailable (RPC)"
+        else:
+            balance = f"**{_eth(bal)} ETH**"
+            if eth_usd:
+                balance += f" ({usd_str(bal / 1e18 * eth_usd)})"
+        budget = f"{usd_str(ledger.remaining(inter.user.id))} of today's {usd_str(RHC_MAX_DAILY_USD)} buy budget left"
         await inter.followup.send(
-            f"**{inter.user.display_name}** · `{w.address}`\n**{eth} ETH**{usd}\n"
-            f"Daily cap: ${ledger.remaining(inter.user.id):,.2f} of ${RHC_MAX_DAILY_USD:,.2f} left today "
-            f"(${RHC_MAX_TRADE_USD:,.2f} per buy)\n[Explorer]({chain.explorer_address(w.address)})",
+            f"**{inter.user.display_name}**{SEP}`{w.address}`\n{balance}{SEP}{budget}\n"
+            f"[Explorer]({chain.explorer_address(w.address)})",
             ephemeral=priv, suppress_embeds=True,
         )
 
@@ -301,16 +330,17 @@ class RhcCog(commands.Cog):
         if bal < amount + fee:
             max_send = max(0, bal - fee)
             await inter.followup.send(
-                f"🚫 Not enough ETH: you have {chain.fmt_units(bal, 18)} ETH; gas needs about {chain.fmt_units(fee, 18)} ETH, "
-                f"so the most you can send is **{chain.fmt_units(max_send, 18)} ETH**.", ephemeral=True,
+                f"🚫 Not enough ETH: you have {_eth(bal)} ETH and gas needs about {_eth(fee)} ETH, "
+                f"so the most you can send is **{_eth(max_send)} ETH**.", ephemeral=True,
             )
             return
         eth_usd = await self._eth_usd()
-        usd = f" (≈ ${amount / 1e18 * eth_usd:,.2f})" if eth_usd else ""
+        dollars = f" ({usd_str(amount / 1e18 * eth_usd)})" if eth_usd else ""
         view = ConfirmOrder(inter.user.id, RHC_CONFIRM_TIMEOUT)
         await inter.followup.send(
-            f"Send **{chain.fmt_units(amount, 18)} ETH**{usd} on Robinhood Chain to `{chain.to_checksum(to)}`?{warning}\n"
-            f"Gas ≈ {chain.fmt_units(fee, 18)} ETH. Transfers cannot be reversed.", view=view, ephemeral=True,
+            f"Send **{_eth(amount)} ETH**{dollars} to `{chain.to_checksum(to)}`?{warning}\n"
+            f"Gas ≈ {_eth(fee)} ETH{SEP}cannot be reversed{SEP}expires {when(time.time() + RHC_CONFIRM_TIMEOUT)}",
+            view=view, ephemeral=True,
         )
         await view.wait()
         if not view.value:
@@ -323,7 +353,7 @@ class RhcCog(commands.Cog):
             await self._reply(inter, "❌ The withdrawal hit an internal error. Check your balance and the explorer "
                                      "before retrying.", True)
             return
-        await self._reply(inter, self._describe(res, f"Sent {chain.fmt_units(amount, 18)} ETH"), True)
+        await self._reply(inter, self._describe(res, f"Sent {_eth(amount)} ETH"), True)
 
     # ---------------- trades ----------------
 
@@ -332,11 +362,11 @@ class RhcCog(commands.Cog):
         token="Contract address or a symbol from /rh trending",
         eth="ETH to spend, e.g. 0.01 (or use usd)",
         usd="Dollars to spend instead of ETH, e.g. 5",
-        slippage_bps="Max slippage in basis points (default 200 = 2%)", private="Reply only to you",
+        slippage_bps="Max slippage in basis points (default 200 = 2%)", private="Keep the result to yourself too",
     )
     async def buy(self, inter: discord.Interaction, token: str, eth: Optional[str] = None,
                   usd: Optional[float] = None, slippage_bps: Optional[int] = None, private: bool = False):
-        priv = PRIVATE or private
+        priv = PRIVATE or private          # the result; the prompt is always private
         if await self._deny_trade(inter):
             return
         w = wallets.get(inter.user.id)
@@ -346,7 +376,7 @@ class RhcCog(commands.Cog):
         if (eth is None) == (usd is None):
             await self._send_private(inter, "Give either `eth` or `usd`, e.g. `/rh buy PONS eth:0.01` or `/rh buy PONS usd:5`.")
             return
-        await inter.response.defer(thinking=True, ephemeral=priv)
+        await inter.response.defer(thinking=True, ephemeral=True)
         bps = clamp_slippage(slippage_bps)
         eth_usd = await self._eth_usd()
         try:
@@ -361,16 +391,16 @@ class RhcCog(commands.Cog):
                 amount = chain.to_units(eth, 18)
             rt = await kyber.route(chain.NATIVE, addr, amount)
         except (ValueError, kyber.KyberError, chain.ChainError) as e:
-            await inter.followup.send(f"❌ {e}", ephemeral=priv)
+            await inter.followup.send(f"❌ {e}", ephemeral=True)
             return
 
         usd, why = await self._usd_basis(rt, amount, eth_usd)
         if usd is None:
-            await inter.followup.send(f"🚫 {why}", ephemeral=priv)
+            await inter.followup.send(f"🚫 {why}", ephemeral=True)
             return
         ok, why = ledger.check(inter.user.id, usd)
         if not ok:
-            await inter.followup.send(f"🚫 {why}", ephemeral=priv)
+            await inter.followup.send(f"🚫 {why}", ephemeral=True)
             return
         # Enough ETH for the trade AND its gas, said with numbers, before the
         # confirm prompt rather than after a reservation.
@@ -378,49 +408,44 @@ class RhcCog(commands.Cog):
             bal = await chain.native_balance(w.address)
             gas_price = await chain.gas_price()
         except chain.ChainError:
-            await inter.followup.send("❌ Could not read your balance on Robinhood Chain. Try again.", ephemeral=priv)
+            await inter.followup.send("❌ Could not read your balance on Robinhood Chain. Try again.", ephemeral=True)
             return
         need = amount + (rt.gas * (100 + swap.GAS_BUFFER_PCT) // 100) * gas_price * swap.FEE_MULTIPLIER
         if bal < need:
             await inter.followup.send(
-                f"🚫 Not enough ETH: you have {chain.fmt_units(bal, 18)} ETH and this needs about "
-                f"{chain.fmt_units(need, 18)} ETH including gas. Fund the wallet or size down.", ephemeral=priv,
+                f"🚫 Not enough ETH: you have {_eth(bal)} ETH and this needs about "
+                f"{_eth(need)} ETH including gas. Fund the wallet or size down.", ephemeral=True,
             )
             return
         back, unavailable = await self._round_trip(addr, rt.amount_out)
         if unavailable:
             await inter.followup.send("❌ KyberSwap is not answering right now, so the sell-back check cannot run. "
-                                      "Try again in a minute.", ephemeral=priv)
+                                      "Try again in a minute.", ephemeral=True)
             return
         if back is None:
             await inter.followup.send(
                 f"🚫 **{sym}** cannot be sold back for ETH right now (no route). That is what a honeypot looks "
-                f"like; refusing to buy.", ephemeral=priv,
+                f"like; refusing to buy.", ephemeral=True,
             )
             return
 
         # Liquidity tells the user whether the default slippage will survive
         # the few seconds between quote and send.
-        liq_line = ""
         info = None
+        liq = None
         try:
             info = await token_summary(addr)
             liq = (info or {}).get("liq")
-            if liq is not None:
-                liq_line = f"\nLiquidity ${humanize(liq)}"
-                if liq < THIN_POOL_USD and bps < 500:
-                    liq_line += (f" · **thin pool**: {bps / 100:.0f}% slippage often fails on these; "
-                                 f"re-run with `slippage_bps:500` if it does")
         except Exception:
             pass
+        text = self._quote_text(rt, addr, sym, dec, back, False, liq)
+        if liq is not None and liq < THIN_POOL_USD and bps < 500:
+            text += (f"\n⚠️ **Thin pool**{SEP}{pct(bps / 100, signed=False)} slippage often fails here; "
+                     f"re-run with `slippage_bps:500` if it does")
+        text += f"\nSlippage {pct(bps / 100, signed=False)}{SEP}expires {when(time.time() + RHC_CONFIRM_TIMEOUT)}"
 
         view = ConfirmOrder(inter.user.id, RHC_CONFIRM_TIMEOUT)
-        text = f"**{inter.user.display_name}** is buying\n" + self._quote_text(rt, addr, sym, dec, back, False) + liq_line
-        text += (f"\nSlippage **{bps / 100:.2f}%** · daily cap: ${max(0.0, ledger.remaining(inter.user.id) - usd):,.2f} "
-                 f"of ${RHC_MAX_DAILY_USD:,.2f} left after this\n"
-                 f"Real swap from `{_short_addr(w.address)}`. Only {inter.user.display_name} can confirm; "
-                 f"expires in {RHC_CONFIRM_TIMEOUT}s.")
-        await inter.followup.send(text, view=view, ephemeral=priv)
+        await inter.followup.send(text, view=view, ephemeral=True)
         await view.wait()
         if not view.value:
             await inter.followup.send("⏲️ Expired, nothing was bought. Run it again and press Confirm."
@@ -486,49 +511,49 @@ class RhcCog(commands.Cog):
             return
         if not res.ok and not res.pending:
             self._refund(inter.user.id, usd)
-        got = (f"{chain.fmt_units(res.amount_out, dec)} {sym}" if res.amount_out is not None
-               else f"~{chain.fmt_units(built.amount_out, dec)} {sym} (quoted)")
-        spent = f"{chain.fmt_units(amount, 18)} ETH ({pnl.fmt_usd(built.amount_in_usd)})"
-        mc_note = f" at ${humanize((info or {}).get('mc'))} MC" if (info or {}).get("mc") else ""
-        await self._reply(inter, self._describe(res, f"Bought {got} for {spent}{mc_note}"), priv)
+        out_raw = res.amount_out if res.amount_out is not None else built.amount_out
+        got = f"{chain.fmt_units(out_raw, dec)} {sym}" + ("" if res.amount_out is not None else " (quoted)")
+        spent = f"{_eth(amount)} ETH ({usd_str(built.amount_in_usd)})"
+        entry = _entry_mc(built.amount_in_usd, out_raw / 10 ** dec, info)
+        tail = f"{SEP}in at {usd_str(entry)} MC" if entry else ""
+        await self._reply(inter, self._describe(res, f"Bought {got} for {spent}{tail}"), priv)
 
     @rhc.command(name="sell", description="Sell a percentage of a token you hold for ETH (asks to confirm)")
     @app_commands.describe(
         token="Contract address or a symbol from /rh trending", percent="1 to 100",
-        slippage_bps="Max slippage in basis points (default 200 = 2%)", private="Reply only to you",
+        slippage_bps="Max slippage in basis points (default 200 = 2%)", private="Keep the result to yourself too",
     )
     async def sell(self, inter: discord.Interaction, token: str, percent: int, slippage_bps: Optional[int] = None,
                    private: bool = False):
-        priv = PRIVATE or private
+        priv = PRIVATE or private          # the result; the prompt is always private
         if await self._deny_trade(inter):
             return
         w = wallets.get(inter.user.id)
         if w is None:
             await self._send_private(inter, "You have no wallet yet.")
             return
-        await inter.response.defer(thinking=True, ephemeral=priv)
-        pct = max(1, min(int(percent), 100))
+        await inter.response.defer(thinking=True, ephemeral=True)
+        pct_sold = max(1, min(int(percent), 100))
         bps = clamp_slippage(slippage_bps)
         try:
             addr, sym, dec = await self._resolve_token(token)
             have = await chain.erc20_balance(addr, w.address)
             if have <= 0:
-                await inter.followup.send(f"You hold no {sym}.", ephemeral=priv)
+                await inter.followup.send(f"You hold no {sym}.", ephemeral=True)
                 return
-            amount = have * pct // 100
+            amount = have * pct_sold // 100
             rt = await kyber.route(addr, chain.NATIVE, amount)
         except (ValueError, kyber.KyberError, chain.ChainError) as e:
-            await inter.followup.send(f"❌ {e}", ephemeral=priv)
+            await inter.followup.send(f"❌ {e}", ephemeral=True)
             return
 
         view = ConfirmOrder(inter.user.id, RHC_CONFIRM_TIMEOUT)
         await inter.followup.send(
-            f"**{inter.user.display_name}** is selling **{chain.fmt_units(amount, dec)} {sym}** "
-            f"({pct}% of {chain.fmt_units(have, dec)}) for **≈ {chain.fmt_units(rt.amount_out, 18)} ETH** "
-            f"({_fmt_usd(rt.amount_out_usd)})\nToken `{addr}`\n"
-            f"Route: {', '.join(rt.hops) or '?'} · gas ≈ {_fmt_usd(rt.gas_usd)} · slippage {bps / 100:.2f}%\n"
-            f"Real swap. Only {inter.user.display_name} can confirm; expires in {RHC_CONFIRM_TIMEOUT}s.",
-            view=view, ephemeral=priv,
+            f"Sell **{chain.fmt_units(amount, dec)} {sym}** ({pct_sold}% of {chain.fmt_units(have, dec)}) for "
+            f"**≈ {_eth(rt.amount_out)} ETH ({usd_str(rt.amount_out_usd)})**?\n`{addr}`\n"
+            f"Slippage {pct(bps / 100, signed=False)}{SEP}gas ≈ {usd_str(rt.gas_usd)}{SEP}"
+            f"expires {when(time.time() + RHC_CONFIRM_TIMEOUT)}",
+            view=view, ephemeral=True,
         )
         await view.wait()
         if not view.value:
@@ -537,8 +562,8 @@ class RhcCog(commands.Cog):
             return
         confirmed_floor = kyber.min_out(rt.amount_out, bps)
         # Where this token stands against the entry: the multiple people quote
-        # ("bought at 50K, sold at 200K, 4x") comes from the journal's entry MC
-        # and the market cap right now.
+        # ("bought at 50K, sold at 200K, 4x") is the price now over the price
+        # paid, with the entry restated as a market cap at today's supply.
         info = None
         try:
             info = await token_summary(addr)
@@ -546,15 +571,19 @@ class RhcCog(commands.Cog):
             pass
         entry = pnl.entry_for(inter.user.id, addr)
         mc_now = (info or {}).get("mc")
-        multiple = (mc_now / entry.entry_mc) if (entry and entry.entry_mc and mc_now) else None
+        multiple = entry_mc = None
+        if entry is not None:
+            entry.price_now = (info or {}).get("price")
+            entry.mc_now = mc_now
+            multiple, entry_mc = entry.multiple_now, entry.entry_mc
         extra = {"decimals": dec, "mc_usd": mc_now, "price_usd": (info or {}).get("price"),
-                 "entry_mc": (entry.entry_mc if entry else None), "multiple": multiple}
+                 "entry_mc": entry_mc, "multiple": multiple}
         try:
             rt = await kyber.route(addr, chain.NATIVE, amount)   # always fresh after the click
             if rt.amount_out < confirmed_floor:
                 await inter.followup.send(
-                    f"🚫 The price moved while you were confirming: {chain.fmt_units(rt.amount_out, 18)} ETH now vs "
-                    f"the {chain.fmt_units(confirmed_floor, 18)} floor you confirmed. Nothing was sold; run it again.",
+                    f"🚫 The price moved while you were confirming: {_eth(rt.amount_out)} ETH now vs "
+                    f"the {_eth(confirmed_floor)} floor you confirmed. Nothing was sold; run it again.",
                     ephemeral=True,
                 )
                 return
@@ -569,64 +598,60 @@ class RhcCog(commands.Cog):
             await inter.followup.send("❌ Internal error during the sell. Check your balances and the explorer "
                                       "before retrying.", ephemeral=True)
             return
-        got = (f"{chain.fmt_units(res.amount_out, 18)} ETH" if res.amount_out is not None
-               else f"~{chain.fmt_units(built.amount_out, 18)} ETH (quoted)")
-        got += f" ({pnl.fmt_usd(built.amount_out_usd)})"
+        out_raw = res.amount_out if res.amount_out is not None else built.amount_out
+        got = f"{_eth(out_raw)} ETH ({usd_str(built.amount_out_usd)})" + ("" if res.amount_out is not None else " (quoted)")
         tail = ""
-        if res.ok and multiple is not None and entry is not None:
-            tail = (f" · **{pnl.fmt_x(multiple)}** from your entry (${humanize(entry.entry_mc)} → "
-                    f"${humanize(mc_now)} MC)")
+        if res.ok and multiple is not None:
+            tail = f"{SEP}**{mult(multiple)}** from your entry"
+            if entry_mc and mc_now:
+                tail += f" ({usd_str(entry_mc)} → {usd_str(mc_now)} MC)"
         await self._reply(inter, self._describe(res, f"Sold {chain.fmt_units(amount, dec)} {sym} for {got}{tail}"), priv)
 
+    # ---------------- your book ----------------
+
     @rhc.command(name="holdings", description="What your wallet holds: cost, worth now, multiple, total")
-    @app_commands.describe(private="Reply only to you")
-    async def holdings(self, inter: discord.Interaction, private: bool = False):
-        priv = PRIVATE or private
+    @app_commands.describe(public="Show it to the channel instead of just you")
+    async def holdings(self, inter: discord.Interaction, public: bool = False):
+        priv = PRIVATE or not public
         w = wallets.get(inter.user.id)
         if w is None:
             await self._send_private(inter, "You have no wallet yet.")
             return
         await inter.response.defer(thinking=True, ephemeral=priv)
         u = await pnl.user_pnl(inter.user.id, w.address)
+        eth_part = f"{eth_str(u.eth)} ETH" + (f" ({usd_str(u.eth_value_usd)})" if u.eth_value_usd is not None else "")
         embed = discord.Embed(
-            title=f"{inter.user.display_name}'s Robinhood Chain wallet",
-            colour=0x57F287 if u.pnl_usd >= 0 else 0xED4245,
+            title=f"{inter.user.display_name}'s wallet",
+            colour=colour_for(u.pnl_usd if u.positions else None),
             description=(
-                f"`{w.address}`\n"
-                f"**{chain.fmt_units(u.eth_wei, 18)} ETH** ({pnl.fmt_usd(u.eth_value_usd)}) · "
-                f"tokens {pnl.fmt_usd(u.tokens_worth_usd)} · **total {pnl.fmt_usd(u.total_usd)}**"
+                f"**{usd_str(u.total_usd)}** total{SEP}{eth_part}{SEP}tokens {usd_str(u.tokens_worth_usd)}\n"
+                f"`{w.address}`"
             ),
         )
-        rows = [[
-            p.symbol[:10],
-            pnl.fmt_amount(p.balance),
-            pnl.fmt_usd(p.open_cost_usd),
-            pnl.fmt_usd(p.worth_usd),
-            pnl.fmt_usd(p.unrealized_usd, signed=True),
-            pnl.fmt_x(p.multiple_now),
-        ] for p in u.open_positions]
-        if rows:
-            add_table_fields(embed, "Open positions", ["Token", "Amount", "Cost", "Worth", "PnL", "x"], rows,
-                             ["l", "r", "r", "r", "r", "r"], max_fields=3)
-            entries = [f"{p.symbol}: bought at ${humanize(p.entry_mc)} MC, now ${humanize(p.mc_now)}"
-                       for p in u.open_positions if p.entry_mc and p.mc_now][:6]
-            if entries:
-                embed.add_field(name="Entry → now (market cap)", value="\n".join(entries), inline=False)
-        else:
-            embed.add_field(name="Open positions", value="None. `/rh buy` to open one.", inline=False)
+        lines = [
+            f"**{p.symbol}**{SEP}{qty(p.balance)}{SEP}**{usd_str(p.worth_usd)}** now{SEP}"
+            f"cost {usd_str(p.open_cost_usd)}{SEP}**{mult(p.multiple_now)}**"
+            for p in u.open_positions
+        ]
         embed.add_field(
-            name="Profit",
-            value=(f"Unrealized {pnl.fmt_usd(u.unrealized_usd, signed=True)} · realized {pnl.fmt_usd(u.realized_usd, signed=True)} · "
-                   f"gas {pnl.fmt_usd(u.gas_usd)} ({u.gas_eth:.5f} ETH) · **net {pnl.fmt_usd(u.pnl_usd, signed=True)}**"),
+            name="Open positions",
+            value=fit_lines(lines, 1024) if lines else "No open positions. `/rh buy` opens one.",
             inline=False,
         )
-        embed.set_footer(text="Cost and profit from your McCap trades; prices from KyberSwap at trade time and DexScreener now. /rh pnl for the chart.")
+        if u.positions:
+            embed.add_field(
+                name="Profit",
+                value=(f"Net **{usd_str(u.pnl_usd, signed=True)}**{SEP}unrealized {usd_str(u.unrealized_usd, signed=True)}"
+                       f"{SEP}realized {usd_str(u.realized_usd, signed=True)}{SEP}gas {usd_str(u.gas_usd)}"),
+                inline=False,
+            )
+        embed.set_footer(text=footer("Prices from DexScreener", "/rh pnl for the chart"))
         await inter.followup.send(embed=embed, ephemeral=priv)
 
     @rhc.command(name="history", description="Your recent trades and withdrawals")
-    @app_commands.describe(count="How many to show (default 10, max 25)", private="Reply only to you")
-    async def history(self, inter: discord.Interaction, count: Optional[int] = 10, private: bool = False):
-        priv = PRIVATE or private
+    @app_commands.describe(count="How many to show (default 10, max 25)", public="Show it to the channel instead of just you")
+    async def history(self, inter: discord.Interaction, count: Optional[int] = 10, public: bool = False):
+        priv = PRIVATE or not public
         w = wallets.get(inter.user.id)
         if w is None:
             await self._send_private(inter, "You have no wallet yet.")
@@ -640,32 +665,31 @@ class RhcCog(commands.Cog):
         icons = {"confirmed": "✅", "reverted": "❌", "dropped": "🚫", "submitted": "⏳", "pending": "⏳"}
         lines = []
         for e in rows:
-            when = time.strftime("%m-%d %H:%M", time.gmtime(float(e.get("ts") or 0)))
-            icon = icons.get(e.get("final_status"), "•")
+            icon = icons.get(e.get("final_status"), "❔")
+            stamp = when(float(e.get("ts") or 0))
             dec = int(e.get("decimals") or 18)
             tx = e.get("tx") or ""
             link = f" [tx]({chain.explorer_tx(tx)})" if tx else ""
             if e.get("kind") == "buy":
-                got = e.get("actual_out_estimate") or e.get("quoted_out") or "0"
-                mc = f" at ${humanize(float(e['mc_usd']))} MC" if e.get("mc_usd") else ""
-                lines.append(f"{icon} `{when}` BUY {chain.fmt_units(int(float(e.get('amount_in') or 0)), 18)} ETH → "
-                             f"{chain.fmt_units(int(float(got)), dec)} {e.get('symbol')} ({pnl.fmt_usd(pnl._f(e.get('usd_in')))}{mc}){link}")
+                got = int(float(e.get("actual_out_estimate") or e.get("quoted_out") or 0))
+                lines.append(f"{icon} {stamp} Bought {chain.fmt_units(got, dec)} {e.get('symbol')} for "
+                             f"{_eth(int(float(e.get('amount_in') or 0)))} ETH ({usd_str(pnl._f(e.get('usd_in')))}){link}")
             elif e.get("kind") == "sell":
-                out = e.get("actual_out_estimate") or e.get("quoted_out") or "0"
-                mult = f" · {pnl.fmt_x(float(e['multiple']))}" if e.get("multiple") else ""
-                lines.append(f"{icon} `{when}` SELL {chain.fmt_units(int(float(e.get('amount_in') or 0)), dec)} {e.get('symbol')} → "
-                             f"{chain.fmt_units(int(float(out)), 18)} ETH ({pnl.fmt_usd(pnl._f(e.get('usd_out')))}{mult}){link}")
+                out = int(float(e.get("actual_out_estimate") or e.get("quoted_out") or 0))
+                x = f"{SEP}{mult(float(e['multiple']))}" if e.get("multiple") else ""
+                lines.append(f"{icon} {stamp} Sold {chain.fmt_units(int(float(e.get('amount_in') or 0)), dec)} "
+                             f"{e.get('symbol')} for {_eth(out)} ETH ({usd_str(pnl._f(e.get('usd_out')))}){x}{link}")
             else:
-                lines.append(f"{icon} `{when}` WITHDRAW {chain.fmt_units(int(float(e.get('amount') or 0)), 18)} ETH → "
-                             f"`{_short_addr(e.get('to') or '')}`{link}")
-        embed = discord.Embed(title=f"{inter.user.display_name}'s last {len(rows)} transaction(s)",
-                              colour=0x2B90D9, description="\n".join(lines)[:4000])
+                lines.append(f"{icon} {stamp} Sent {_eth(int(float(e.get('amount') or 0)))} ETH to "
+                             f"`{short_ca(e.get('to') or '')}`{link}")
+        embed = discord.Embed(title=f"{inter.user.display_name}'s last {plural(len(rows), 'transaction')}",
+                              colour=NEUTRAL, description=fit_lines(lines, 4000))
         await inter.followup.send(embed=embed, ephemeral=priv)
 
     @rhc.command(name="pnl", description="Your profit per token, gas spent, and a chart")
-    @app_commands.describe(private="Reply only to you")
-    async def pnl_cmd(self, inter: discord.Interaction, private: bool = False):
-        priv = PRIVATE or private
+    @app_commands.describe(public="Show it to the channel instead of just you")
+    async def pnl_cmd(self, inter: discord.Interaction, public: bool = False):
+        priv = PRIVATE or not public
         w = wallets.get(inter.user.id)
         if w is None:
             await self._send_private(inter, "You have no wallet yet.")
@@ -675,23 +699,18 @@ class RhcCog(commands.Cog):
         if not u.positions:
             await inter.followup.send(f"**{inter.user.display_name}** has no trades yet.", ephemeral=priv)
             return
-        rows = [[
-            p.symbol[:10],
-            pnl.fmt_usd(p.cost_usd),
-            pnl.fmt_usd(p.realized_usd, signed=True),
-            pnl.fmt_usd(p.unrealized_usd, signed=True),
-            pnl.fmt_usd(p.pnl_usd, signed=True),
-            pnl.fmt_x(p.multiple_now),
-        ] for p in u.positions]
         embed = discord.Embed(
             title=f"{inter.user.display_name}'s profit",
-            colour=0x57F287 if u.pnl_usd >= 0 else 0xED4245,
-            description=(f"Bought {pnl.fmt_usd(u.cost_usd)} of tokens · realized {pnl.fmt_usd(u.realized_usd, signed=True)} · "
-                         f"unrealized {pnl.fmt_usd(u.unrealized_usd, signed=True)} · gas {pnl.fmt_usd(u.gas_usd)} "
-                         f"({u.gas_eth:.5f} ETH)\n**Net {pnl.fmt_usd(u.pnl_usd, signed=True)}**"),
+            colour=colour_for(u.pnl_usd),
+            description=(f"**Net {usd_str(u.pnl_usd, signed=True)}**{SEP}bought {usd_str(u.cost_usd)} of tokens{SEP}"
+                         f"realized {usd_str(u.realized_usd, signed=True)}{SEP}unrealized {usd_str(u.unrealized_usd, signed=True)}"
+                         f"{SEP}gas {usd_str(u.gas_usd)}"),
         )
-        add_table_fields(embed, "By token", ["Token", "Cost", "Realized", "Unreal.", "Net", "x"], rows,
-                         ["l", "r", "r", "r", "r", "r"], max_fields=3)
+        lines = [
+            f"**{p.symbol}**{SEP}net **{usd_str(p.pnl_usd, signed=True)}**{SEP}{mult(p.multiple_now)}{SEP}cost {usd_str(p.cost_usd)}"
+            for p in u.positions
+        ]
+        embed.add_field(name="By token", value=fit_lines(lines, 1024), inline=False)
         png = await asyncio.to_thread(pnl.render_chart, u, f"{inter.user.display_name}'s profit by token")
         files = []
         if png:
@@ -706,19 +725,19 @@ class RhcCog(commands.Cog):
         await inter.response.defer(thinking=True, ephemeral=priv)
         g = pnl.group_stats()
         eth_usd = await self._eth_usd()
-        gas_usd = f" ({pnl.fmt_usd(g.gas_wei / 1e18 * eth_usd)})" if eth_usd else ""
-        best = f"{pnl.fmt_x(g.best_multiple)} on {g.best_symbol}" if g.best_multiple else "none yet"
         summary = await portfolio.summary()
+        gas = usd_str(g.gas_wei / 1e18 * eth_usd) if eth_usd else f"{eth_str(g.gas_wei / 1e18)} ETH"
+        best = f"{mult(g.best_multiple)} {g.best_symbol}".strip() if g.best_multiple else UNKNOWN
+        holding = f"{eth_str(summary.eth)} ETH"
+        if summary.positions:
+            holding += f" + {plural(len(summary.positions), 'token')}"
         embed = discord.Embed(
-            title="Robinhood Chain · group stats",
-            colour=0x2B90D9,
+            title=f"Group stats{SEP}Robinhood Chain",
+            colour=NEUTRAL,
             description=(
-                f"**{g.wallets}** wallet(s), **{g.traders}** with trades · holding "
-                f"{summary.eth:.4f} ETH{(' + ' + str(len(summary.positions)) + ' token position(s)') if summary.positions else ''}"
-                f" ≈ {pnl.fmt_usd(summary.total_usd)}\n"
-                f"**{g.buys}** buys, **{g.sells}** sells · volume {pnl.fmt_usd(g.volume_usd)}\n"
-                f"Gas spent **{g.gas_wei / 1e18:.5f} ETH**{gas_usd}\n"
-                f"Realized profit {pnl.fmt_usd(g.realized_usd, signed=True)} · best sell {best}"
+                f"**{plural(g.wallets, 'wallet')}**, {g.traders} trading{SEP}holding **{usd_str(summary.total_usd)}** ({holding})\n"
+                f"{plural(g.buys, 'buy')}, {plural(g.sells, 'sell')}{SEP}{usd_str(g.volume_usd)} traded{SEP}gas {gas}\n"
+                f"Realized **{usd_str(g.realized_usd, signed=True)}**{SEP}best sell {best}"
             ),
         )
         await inter.followup.send(embed=embed, ephemeral=priv)
@@ -740,11 +759,17 @@ class RhcCog(commands.Cog):
         lines = [f"{t.symbol[:10]:<10} {t.address}" for t in tokens[:15]]
         if lines:
             embed.add_field(name="Addresses (for /rh buy and /mc)", value="```\n" + "\n".join(lines) + "\n```", inline=False)
-        links = " · ".join(f"[{t.symbol[:10]}]({t.deepest.url()})" for t in tokens[:10])
+        # Whole links only: cutting the field at 1024 characters left a broken URL.
+        links = []
+        for t in tokens[:10]:
+            piece = f"[{t.symbol[:10]}]({t.deepest.url()})"
+            if len(SEP.join(links + [piece])) > 1024:
+                break
+            links.append(piece)
         if links:
-            embed.add_field(name="Charts", value=links[:1024], inline=False)
+            embed.add_field(name="Charts", value=SEP.join(links), inline=False)
 
-    @rhc.command(name="trending", description="Busiest and fastest-moving tokens on the Robinhood chain")
+    @rhc.command(name="trending", description="Busiest and fastest-moving tokens on Robinhood Chain")
     @app_commands.describe(
         window="Volume and market-cap change over 5m to 24h (default 24h)",
         sort="volume (default), gainers, losers, or newest pools",
@@ -780,7 +805,7 @@ class RhcCog(commands.Cog):
 
         pools = await rhchain.top_pools()
         if not pools:
-            await inter.followup.send("Couldn't reach GeckoTerminal for Robinhood chain pools. Try again shortly.")
+            await inter.followup.send("Couldn't reach GeckoTerminal for Robinhood Chain pools. Try again shortly.")
             return
         tokens = rhchain.aggregate(pools)
         top = rhchain.rank(tokens, w, mode, include_majors=include_majors, n=n)
@@ -788,51 +813,47 @@ class RhcCog(commands.Cog):
             await inter.followup.send("Nothing to show for that filter.")
             return
 
-        def pct(v: Optional[float]) -> str:
-            return f"{v:+.1f}%" if v is not None else "—"
-
         def mc(v: Optional[float]) -> str:
-            return f"${humanize(v)}" if v else "—"
+            return usd_str(v) if v else UNKNOWN
 
-        # "MC then → now" is the number people want for a mover: $800K to $1.1M
-        # inside the window, not just a percentage.
         rows = [[
             t.symbol[:10],
-            f"${humanize(t.volume(w))}",
+            usd_str(t.volume(w)),
             pct(t.change(w)),
-            mc(t.mc_before(w)),
             mc(t.mc_usd),
-            f"${humanize(t.liq_usd)}",
+            usd_str(t.liq_usd),
         ] for t in top]
 
         shown_tokens = [t for t in tokens if include_majors or t.symbol.upper() not in rhchain.CHAIN_MAJORS]
         total_vol = sum(t.volume(w) for t in shown_tokens)
         venues = sorted({p.dex for t in shown_tokens for p in t.pools})
-        titles = {"volume": f"top by {label} volume", "gainers": f"{label} gainers",
+        titles = {"volume": f"busiest by {label} volume", "gainers": f"{label} gainers",
                   "losers": f"{label} losers", "new": "newest of the busy pools"}
-        embed = discord.Embed(
-            title=f"Robinhood chain · {titles[mode]}",
-            colour=0x2ECC71 if mode != "losers" else 0xE74C3C,
-            description=(
-                f"{len(shown_tokens)} token(s) in the {len(pools)} busiest pools · "
-                f"**${humanize(total_vol)}** traded in {label} · "
-                f"{', '.join(venues) if venues else 'no venues'}"
-            ),
-        )
+        desc = (f"**{usd_str(total_vol)}** traded in {label} across {plural(len(shown_tokens), 'token')}"
+                + (f"{SEP}{', '.join(venues)}" if venues else ""))
+        if mode in ("gainers", "losers"):
+            # "$800K to $1.1M inside the window" is the number people want for
+            # a mover, not just a percentage; say it for the top few.
+            movers = [f"{t.symbol[:10]} {mc(t.mc_before(w))} → {mc(t.mc_usd)} ({pct(t.change(w))})"
+                      for t in top[:3] if t.mc_usd and t.mc_before(w)]
+            if movers:
+                desc += "\n" + SEP.join(movers)
+        embed = discord.Embed(title=f"Robinhood Chain{SEP}{titles[mode]}", colour=NEUTRAL, description=desc)
         shown, total = add_table_fields(
-            embed, f"Volume, market cap {label} ago → now, liquidity",
-            ["Token", f"Vol {label}", f"Δ {label}", f"MC {label} ago", "MC now", "Liq"], rows,
-            ["l", "r", "r", "r", "r", "r"], max_fields=3,
+            embed, "Tokens",
+            ["Token", f"Vol {label}", label, "MC", "Liq"], rows,
+            ["l", "r", "r", "r", "r"], max_fields=3,
         )
         self._addresses_field(embed, top)
-        foot = "GeckoTerminal · Robinhood chain DEX pools · /rh new for brand-new pairs"
-        foot += "" if include_majors else " · WETH/USDG/stables hidden (include_majors to show)"
-        if shown < total:
-            foot += f" · {total - shown} row(s) not shown"
-        embed.set_footer(text=foot)
+        embed.set_footer(text=footer(
+            "GeckoTerminal",
+            "" if include_majors else "majors hidden (include_majors to show)",
+            "/rh new for brand-new pairs",
+            f"{plural(total - shown, 'row')} not shown" if shown < total else "",
+        ))
         await inter.followup.send(embed=embed, ephemeral=priv)
 
-    @rhc.command(name="new", description="Brand-new pairs on the Robinhood chain, newest first")
+    @rhc.command(name="new", description="Brand-new pairs on Robinhood Chain, newest first")
     @app_commands.describe(
         count="How many to show (default 10, max 25)",
         min_liquidity="Hide pools with less than this many dollars of liquidity (default 1000)",
@@ -846,7 +867,7 @@ class RhcCog(commands.Cog):
         floor = max(0, int(min_liquidity if min_liquidity is not None else 1000))
         pools = await rhchain.new_pools()
         if not pools:
-            await inter.followup.send("Couldn't reach GeckoTerminal for new Robinhood chain pools. Try again shortly.")
+            await inter.followup.send("Couldn't reach GeckoTerminal for new Robinhood Chain pools. Try again shortly.")
             return
         tokens = rhchain.aggregate(pools)
         tokens = [t for t in tokens if t.symbol.upper() not in rhchain.CHAIN_MAJORS]
@@ -854,38 +875,33 @@ class RhcCog(commands.Cog):
         kept.sort(key=lambda t: -t.created_ts)
         top = kept[:n]
         if not top:
-            await inter.followup.send(f"No new pairs with at least ${floor:,} of liquidity right now "
+            await inter.followup.send(f"No new pairs with at least {usd_str(floor)} of liquidity right now "
                                       f"({len(tokens)} seen). Lower min_liquidity to see the dust.")
             return
-
-        def pct(v: Optional[float]) -> str:
-            return f"{v:+.1f}%" if v is not None else "—"
 
         rows = [[
             t.symbol[:10],
             rhchain.age_str(t.created_ts),
-            f"${humanize(t.liq_usd)}",
-            f"${humanize(t.volume('h1'))}",
-            pct(t.change("h1")),
-            f"${humanize(t.mc_usd)}" if t.mc_usd else "—",
+            usd_str(t.liq_usd),
+            usd_str(t.volume("h1")),
+            usd_str(t.mc_usd) if t.mc_usd else UNKNOWN,
         ] for t in top]
         embed = discord.Embed(
-            title="Robinhood chain · newest pairs",
-            colour=0x3498DB,
-            description=(f"{len(kept)} of the {len(tokens)} newest pools have ≥ ${floor:,} liquidity · "
-                         f"oldest shown {rhchain.age_str(top[-1].created_ts)} · most are dust: check the sell-back "
-                         f"line in /rh buy before touching one"),
+            title=f"Robinhood Chain{SEP}newest pairs",
+            colour=NEUTRAL,
+            description=(f"{plural(len(kept), 'new pair')} with ≥ {usd_str(floor)} liquidity ({len(tokens)} seen){SEP}"
+                         f"most are dust: check the sell-back line in /rh buy first"),
         )
         shown, total = add_table_fields(
-            embed, "Age, liquidity, 1h volume, 1h change, market cap",
-            ["Token", "Age", "Liq", "Vol 1h", "Δ 1h", "MC"], rows,
-            ["l", "r", "r", "r", "r", "r"], max_fields=3,
+            embed, "Pairs",
+            ["Token", "Age", "Liq", "Vol 1h", "MC"], rows,
+            ["l", "r", "r", "r", "r"], max_fields=3,
         )
         self._addresses_field(embed, top)
-        foot = "GeckoTerminal new-pools feed · WETH/USDG/stables hidden"
-        if shown < total:
-            foot += f" · {total - shown} row(s) not shown"
-        embed.set_footer(text=foot)
+        embed.set_footer(text=footer(
+            "GeckoTerminal new-pools feed", "majors hidden",
+            f"{plural(total - shown, 'row')} not shown" if shown < total else "",
+        ))
         await inter.followup.send(embed=embed, ephemeral=priv)
 
     # ---------------- autocomplete ----------------
@@ -925,9 +941,9 @@ class RhcCog(commands.Cog):
             if q and q not in sym.lower() and q not in addr.lower():
                 continue
             amount = raw / 10 ** dec
-            label = f"{sym} · {pnl.fmt_amount(amount)}"
-            if p and p.entry_mc:
-                label += f" · bought at ${humanize(p.entry_mc)} MC"
+            label = f"{sym}{SEP}{qty(amount)}"
+            if p and p.avg_cost:
+                label += f"{SEP}cost {usd_str(amount * p.avg_cost)}"
             choices.append(app_commands.Choice(name=label[:100], value=chain.to_checksum(addr)))
         return choices[:25]
 
@@ -953,8 +969,9 @@ class RhcCog(commands.Cog):
         for t in tokens:
             if q and q not in t.symbol.lower() and q not in t.address.lower():
                 continue
-            label = f"{t.symbol} · ${humanize(t.volume('h24'))} 24h vol · ${humanize(t.mc_usd)} MC" if t.mc_usd else \
-                    f"{t.symbol} · ${humanize(t.volume('h24'))} 24h vol"
+            label = f"{t.symbol}{SEP}{usd_str(t.volume('h24'))} 24h vol"
+            if t.mc_usd:
+                label += f"{SEP}{usd_str(t.mc_usd)} MC"
             choices.append(app_commands.Choice(name=label[:100], value=chain.to_checksum(t.address)))
             if len(choices) == 25:
                 break
@@ -988,7 +1005,7 @@ class RhcCog(commands.Cog):
         followup fails: the tx hash must reach the user."""
         priv = private
         if not priv:
-            text = f"**{inter.user.display_name}** · {text}"
+            text = f"**{inter.user.display_name}**{SEP}{text}"
         try:
             await inter.followup.send(text, ephemeral=priv, suppress_embeds=True)
         except Exception:
@@ -1020,30 +1037,27 @@ class RhcCog(commands.Cog):
 
     @staticmethod
     def _quote_text(rt: kyber.Route, addr: str, sym: str, dec: int, back: Optional[kyber.Route],
-                    unavailable: bool) -> str:
-        impact = rt.price_impact_pct
-        lines = [
-            f"**{chain.fmt_units(rt.amount_in, 18)} ETH** ({_fmt_usd(rt.amount_in_usd)}) → "
-            f"**{chain.fmt_units(rt.amount_out, dec)} {sym}** ({_fmt_usd(rt.amount_out_usd)})",
-            f"Token `{addr}`",
-            f"Route: {', '.join(rt.hops) or '?'} · gas ≈ {_fmt_usd(rt.gas_usd)}"
-            + (f" · impact {impact:+.2f}%" if impact is not None else ""),
-        ]
+                    unavailable: bool, liq: Optional[float] = None) -> str:
+        """The confirm prompt's body: the deal in one line, then what backs it."""
+        head = (f"Buy **{chain.fmt_units(rt.amount_out, dec)} {sym}** for "
+                f"**{_eth(rt.amount_in)} ETH ({usd_str(rt.amount_in_usd)})**?")
         if unavailable:
-            lines.append("⚠️ Could not check the sell route back to ETH (KyberSwap did not answer).")
+            back_line = "⚠️ Could not check the sell route back to ETH (KyberSwap did not answer)"
         elif back is None:
-            lines.append("⚠️ **No sell route back to ETH.** Honeypot until proven otherwise.")
+            back_line = "⚠️ **No sell route back to ETH.** Honeypot until proven otherwise"
         elif rt.amount_in > 0:
             rt_pct = (back.amount_out / rt.amount_in - 1.0) * 100.0
             flag = "⚠️ " if rt_pct < -25 else ""
-            lines.append(f"{flag}Sell straight back: {chain.fmt_units(back.amount_out, 18)} ETH ({rt_pct:+.1f}% round trip)")
-        return "\n".join(lines)
+            back_line = f"{flag}Sells straight back for {_eth(back.amount_out)} ETH ({pct(rt_pct)} round trip)"
+        else:
+            back_line = ""
+        facts = footer(back_line, f"liquidity {usd_str(liq)}" if liq is not None else "", f"gas ≈ {usd_str(rt.gas_usd)}")
+        return f"{head}\n{facts}\n`{addr}`"
 
     @staticmethod
     def _describe(res: swap.SwapResult, success: str) -> str:
         if res.ok:
-            gas = f" · gas {chain.fmt_units(res.gas_cost_wei, 18)} ETH" if res.gas_cost_wei else ""
-            return f"✅ {success}{gas}\n[Transaction]({res.explorer})"
+            return f"✅ {success}\n[Transaction]({res.explorer})"
         if res.pending:
             return f"⏳ {res.error}\n[Transaction]({res.explorer})"
         link = f"\n[Transaction]({res.explorer})" if res.tx else ""

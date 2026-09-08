@@ -4,7 +4,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from ..dex import fetch_dex_token, summarize_lp_venues, table_lp
+from ..dex import fetch_dex_token, summarize_lp_venues
+from ..helpers import NEUTRAL, SEP, footer, plural, usd
 
 
 class LpCog(commands.Cog):
@@ -31,22 +32,34 @@ class LpCog(commands.Cog):
             await inter.followup.send("No eligible pools found on Meteora, Raydium, or Pumpswap.")
             return
 
-        if best:
-            best_name, a = best
-            rec_title = f"✅ Best LP venue: **{best_name.capitalize()}**"
-            rec_link = a.get("best_url")
-            rec_line = f"[Open pool]({rec_link})" if rec_link else ""
-            notes = "Scored by liquidity + 24h volume + 24h tx count (log-weighted)."
-        else:
-            rec_title, rec_line, notes = "✅ Best LP venue", "", "No single venue dominated; compare metrics below."
+        symbol = next(
+            ((p.get("baseToken") or {}).get("symbol") or "" for p in data["pairs"]
+             if ((p.get("baseToken") or {}).get("address") or "").lower() == ca.lower()),
+            "",
+        )
+        # Best first; only venues that actually have pools get a line.
+        ranked = sorted(agg.items(), key=lambda kv: (-kv[1]["score"], -kv[1]["liq"], -kv[1]["vol"]))
+        lines = []
+        for venue, a in ranked:
+            quotes = ", ".join(sorted(a["quotes"].keys())[:2])
+            line = footer(
+                f"**{venue.capitalize()}**",
+                f"{usd(a['liq'])} liquidity",
+                f"{usd(a['vol'])} 24h volume",
+                plural(int(a["tx"]), "trade"),
+                quotes,
+            )
+            if a.get("best_url"):
+                line += f"\n[Open pool]({a['best_url']})"
+            lines.append(line)
 
         embed = discord.Embed(
-            title="LP Venue Suggestion",
-            description=f"{rec_title}\n{rec_line}\n\n{notes}",
-            color=0x00B894,
+            title=footer("Best LP venue", symbol),
+            description="\n".join(lines),
+            color=NEUTRAL,
         )
-        embed.add_field(name="Meteora / Raydium / Pumpswap (aggregated)", value=table_lp(agg), inline=False)
-        embed.set_footer(text="Heuristic suggestion — always double-check slippage/fees for your pool.")
+        embed.set_footer(text=footer("Ranked by liquidity, volume and trade count",
+                                     "check fees and slippage on the pool"))
         await inter.followup.send(embed=embed)
 
 

@@ -7,15 +7,26 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from ..helpers import NEUTRAL, SEP, chunk_lines
+
 # Where each top-level command belongs on the help card. Anything unlisted
 # lands in "Other", so a new cog still shows up.
 AREAS = [
     ("Robinhood Chain wallets & trading", ("rh",)),
-    ("Market-cap alerts", ("mc", "mc_move", "mc_list", "mc_remove", "mc_recent", "mc_status", "mc_check", "mc_lp")),
+    ("Market-cap alerts", ("mc", "mc_move", "mc_list", "mc_remove", "mc_clear", "mc_recent", "mc_status",
+                           "mc_check", "mc_lp")),
     ("Watchlists", ("watch",)),
     ("Chat memory", ("memory",)),
     ("Scan watching", ("scans",)),
 ]
+
+EMBED_FIELD_LIMIT = 1024
+
+
+def _add_area(embed: discord.Embed, area: str, lines: List[str]) -> None:
+    """One field per area, spilling into "(cont.)" fields rather than cutting a line in half."""
+    for i, block in enumerate(chunk_lines(lines, EMBED_FIELD_LIMIT)):
+        embed.add_field(name=area if i == 0 else f"{area} (cont.)", value=block, inline=False)
 
 
 def _flatten(cmd, prefix: str = "") -> List[tuple]:
@@ -38,22 +49,23 @@ def build_help(tree: app_commands.CommandTree) -> discord.Embed:
 
     embed = discord.Embed(
         title="McCap commands",
-        colour=0x2B90D9,
-        description="Trading results and quotes post to the channel; anything about your keys or a refusal is only shown to you.",
+        colour=NEUTRAL,
+        description=("Market-cap alerts, watchlists and Robinhood Chain trading. Confirm prompts, refusals and "
+                     "anything about your keys are only ever shown to you."),
     )
     placed = set()
     for area, names in AREAS:
         lines = []
         for n in names:
             for qual, desc in by_top.get(n, []):
-                lines.append(f"`/{qual}` · {desc}")
+                lines.append(f"`/{qual}`{SEP}{desc}")
                 placed.add(n)
         if lines:
-            embed.add_field(name=area, value="\n".join(lines)[:1024], inline=False)
-    other = [f"`/{qual}` · {desc}" for n, entries in by_top.items() if n not in placed for qual, desc in entries]
+            _add_area(embed, area, lines)
+    other = [f"`/{qual}`{SEP}{desc}" for n, entries in by_top.items() if n not in placed for qual, desc in entries]
     if other:
-        embed.add_field(name="Other", value="\n".join(other)[:1024], inline=False)
-    embed.set_footer(text="Buy/sell ask you to press Confirm within the time limit; expired means nothing happened.")
+        _add_area(embed, "Other", other)
+    embed.set_footer(text="Buy and sell ask you to press Confirm within the time limit; expired means nothing happened.")
     return embed
 
 

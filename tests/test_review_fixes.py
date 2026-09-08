@@ -128,7 +128,7 @@ def test_removal_reply_fits_discord(store):
     ]
     out = _fit(lines)
     assert len(out) <= 2000
-    assert "more line(s)" in out, "truncation must be disclosed"
+    assert "more line" in out, "truncation must be disclosed"
 
 
 def test_short_reply_is_untouched():

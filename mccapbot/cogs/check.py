@@ -5,8 +5,6 @@ Concentration, holder count, mint/freeze authority and dev mints come from
 Jupiter; the market cap comes from whichever source actually has one.
 """
 
-from typing import Optional
-
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -14,13 +12,7 @@ from discord.ext import commands
 from .. import jupiter
 from ..config import TOP_HOLDER_WARN_PCT
 from ..dex import token_summary
-from ..helpers import humanize, short_ca
-
-
-def _yes_no(v: Optional[bool], good: str, bad: str) -> str:
-    if v is None:
-        return "—"
-    return good if v else bad
+from ..helpers import BAD, NEUTRAL, SEP, footer, pct, plural, short_ca, usd
 
 
 class CheckCog(commands.Cog):
@@ -50,63 +42,33 @@ class CheckCog(commands.Cog):
         symbol = (summary or {}).get("symbol") or (tok.symbol if tok else "")
         # Prefer DexScreener's consensus market cap; fall back to Jupiter.
         mc = (summary or {}).get("mc") or (tok.mcap if tok else None)
-        mc_src = "DexScreener" if (summary or {}).get("mc") else ("Jupiter" if tok and tok.mcap else "")
+        from_jupiter = not (summary or {}).get("mc") and bool(tok and tok.mcap)
 
         concentrated = tok is not None and tok.concentrated(TOP_HOLDER_WARN_PCT)
         risky = concentrated or (tok is not None and tok.authorities_live())
-        colour = 0xE74C3C if risky else 0x2ECC71
+
+        head = f"**{usd(mc)}** MC" + (" (Jupiter's figure)" if from_jupiter else "")
+        if summary:
+            head += (f"{SEP}24h {pct(summary.get('change24'))}{SEP}liquidity {usd(summary.get('liq'))} "
+                     f"in {plural(int(summary.get('pools') or 0), 'pool')}")
+        desc = head
+        # One line of what Jupiter actually knows; missing fields are omitted,
+        # never shown as zero. The same line rides on fired alerts.
+        risk = jupiter.risk_line(tok, TOP_HOLDER_WARN_PCT)
+        if risk:
+            desc += f"\n🔎 {risk}"
 
         embed = discord.Embed(
-            title=f"{name} ({symbol})",
+            title=f"{name} ({symbol})" if symbol else name,
             url=(summary or {}).get("url") or f"https://gmgn.ai/sol/token/{ca}",
-            colour=colour,
-            description=f"**MC** ${humanize(mc)}" + (f"  ·  _{mc_src}_" if mc_src else ""),
+            colour=BAD if risky else NEUTRAL,
+            description=desc,
         )
         if summary and summary.get("image_url"):
             embed.set_thumbnail(url=summary["image_url"])
 
-        if tok is not None:
-            embed.add_field(
-                name="Holders",
-                value=(f"{tok.holders:,}" if tok.holders is not None else "—"),
-                inline=True,
-            )
-            top10 = "—"
-            if tok.top10_pct is not None:
-                top10 = f"{'⚠️ ' if concentrated else ''}{tok.top10_pct:.1f}%"
-            embed.add_field(name="Top 10 hold", value=top10, inline=True)
-            embed.add_field(
-                name="Dev mints",
-                value=(str(tok.dev_mints) if tok.dev_mints is not None else "—"),
-                inline=True,
-            )
-            embed.add_field(
-                name="Mint authority",
-                value=_yes_no(tok.mint_disabled, "revoked", "⚠️ live"),
-                inline=True,
-            )
-            embed.add_field(
-                name="Freeze authority",
-                value=_yes_no(tok.freeze_disabled, "revoked", "⚠️ live"),
-                inline=True,
-            )
-            embed.add_field(name="Organic activity", value=(tok.organic or "—"), inline=True)
-
-        if summary:
-            embed.add_field(
-                name="Market",
-                value=(
-                    f"24h {summary.get('change24', 0):+.1f}%  ·  "
-                    f"liquidity ${humanize(summary.get('liq'))} across "
-                    f"{summary.get('pools', 0)} pool(s)"
-                ),
-                inline=False,
-            )
-
         # These are third-party measurements, not verdicts. Say so.
-        embed.set_footer(
-            text="Holder data from Jupiter · not financial advice, and not a safety guarantee"
-        )
+        embed.set_footer(text=footer("Holder data from Jupiter", "not financial advice"))
         await inter.followup.send(embed=embed)
 
 

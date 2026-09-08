@@ -41,6 +41,8 @@ def test_robinhood_chain_total_sits_next_to_the_sol_balance():
     s = portfolio.Summary(wallets=2, readable=2, eth_wei=5 * 10**16, eth_usd=2500.0,
                           tokens_usd=25.2, positions=[("PONS", 36.0, 25.2)])
     line = Bot._presence_text(1.0, s)
-    assert line == "💰 1.00 SOL · RH 0.050 ETH + 1 token ($150)"
+    assert line == "💰 1.00 SOL · RH $150.20"
     assert len(line) <= DISCORD_ACTIVITY_LIMIT
-    assert Bot._presence_text(None, s) == "RH 0.050 ETH + 1 token ($150)"
+    assert Bot._presence_text(None, s) == "RH $150.20"
+    no_price = portfolio.Summary(wallets=1, readable=1, eth_wei=10**18)
+    assert Bot._presence_text(None, no_price) == "RH 1 ETH", "ETH when there is no ETH price, never $0"

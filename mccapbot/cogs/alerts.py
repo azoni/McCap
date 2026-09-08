@@ -1,4 +1,4 @@
-"""Alert commands: /mc, /mc_move, /mc_list, /mc_remove, /mc_recent, /mc_status."""
+"""Alert commands: /mc, /mc_move, /mc_list, /mc_remove, /mc_recent, /mc_status, /mc_clear."""
 
 import re
 import time
@@ -14,12 +14,20 @@ from ..config import MOVE_DEFAULT_COOLDOWN
 from ..logging_setup import log
 from ..dex import build_token_url, choose_consensus_pair, fetch_dex_token, get_image_url, resolve_mc_value
 from ..helpers import (
+    NEUTRAL,
+    SEP,
+    UNKNOWN,
     RelativeTargetError,
+    fit_lines,
+    footer,
     human_window,
-    humanize,
     parse_target,
     parse_window,
+    pct,
+    plural,
+    usd,
     username_from_id,
+    when,
 )
 from ..alerts import NO_DATA_GIVE_UP
 from ..alerts import _no_data as watcher_no_data
@@ -27,40 +35,19 @@ from ..models import MoveAlert, Reminder
 from ..scheduler import (
     describe_tiers,
     estimated_requests_per_minute,
-    interval_for_move,
     interval_for_reminder,
 )
 from ..storage import alert_events, move_alerts, reminders, save_moves, save_reminders
 from ..views import ConfirmOrder
-from ..tables import (
-    ALERTS_ALIGNS,
-    ALERTS_HEADERS,
-    add_table_fields,
-    alerts_rows,
-    fixed_table,
-)
+from ..tables import add_table_fields
 
 MESSAGE_LIMIT = 2000
 
-
-def _fit(lines: List[str], limit: int = MESSAGE_LIMIT) -> str:
-    """Join lines into one message Discord will accept.
-
-    Removing 40 alerts produced a 2015-character reply, which Discord rejects —
-    and since the interaction was already deferred, the command just hung.
-    """
-    out, used = [], 0
-    for i, line in enumerate(lines):
-        tail = f"…and {len(lines) - i} more line(s)"
-        if used + len(line) + 1 + len(tail) > limit:
-            out.append(tail)
-            break
-        out.append(line)
-        used += len(line) + 1
-    return "\n".join(out)[:limit]
-
+# Kept under its old name: the reply-length regression test imports it.
+_fit = fit_lines
 
 _ID_RE = re.compile(r"^[0-9a-f]{6}$")
+ARROWS = {"up": "▲", "down": "▼", "both": "±"}
 
 
 def resolve_targets(raw: str, scoped: List, scope: str = "in this server") -> Tuple[List, List[str]]:
@@ -139,6 +126,16 @@ async def _lookup(ca: str):
     }
 
 
+def _level_label(r) -> str:
+    """PONS ≥ $2M: how a level alert is named everywhere it is listed."""
+    return f"{r.symbol or r.name} {'≥' if r.direction == 'above' else '≤'} {usd(r.target_mc)}"
+
+
+def _move_label(m) -> str:
+    """PONS ▲30% / 1h."""
+    return f"{m.symbol or m.name} {ARROWS[m.direction]}{pct(m.pct, signed=False)} / {human_window(m.window_sec)}"
+
+
 class AlertsCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -206,7 +203,7 @@ class AlertsCog(commands.Cog):
             target_val, spec = parse_target(target, mc_now)
         except RelativeTargetError:
             await inter.followup.send(
-                f"`{info['name']}` has no reported market cap yet, so `{target}` has nothing to "
+                f"**{info['name']}** has no reported market cap yet, so `{target}` has nothing to "
                 "anchor to. Use an absolute target like `250k`."
             )
             return
@@ -225,20 +222,18 @@ class AlertsCog(commands.Cog):
             image_url=info["image"],
         )
 
+        name = info["symbol"] or info["name"]
         if mc_now is None:
             direction = "above"
             msg = (
-                f"⚠️ `{info['name']}` has no reported MC/FDV yet. I'll watch and alert when it "
-                f"reaches **${humanize(target_val)} MC**."
+                f"⚠️ **{name}** has no reported market cap yet. I'll watch and alert when it "
+                f"reaches **{usd(target_val)} MC**."
             )
         else:
             direction = "below" if target_val < mc_now else "above"
             sym = "≤" if direction == "below" else "≥"
-            headline = f"{spec} → ${humanize(target_val)}" if spec else f"${humanize(target_val)}"
-            msg = (
-                f"⏰ Alert set for **{info['name']} ({info['symbol']})** — MC {sym} "
-                f"**{headline}** (now ${humanize(mc_now)})."
-            )
+            anchor = f"{spec} from {usd(mc_now)} now" if spec else f"now {usd(mc_now)}"
+            msg = f"⏰ **{name}** alert set: MC {sym} **{usd(target_val)}** ({anchor})"
 
         rem = Reminder(
             ca=ca, target_mc=float(target_val), direction=direction,
@@ -249,9 +244,11 @@ class AlertsCog(commands.Cog):
         reminders.append(rem)
         await save_reminders()
 
-        msg += f"\n🆔 `{rem.id}` · checking every {interval_for_reminder(rem, mc_now)}s"
-        if note:
-            msg += " · 📝 note saved"
+        msg += "\n" + footer(
+            f"`{rem.id}`",
+            f"checks every {human_window(interval_for_reminder(rem, mc_now))}",
+            "note saved" if note else "",
+        )
         await inter.followup.send(msg)
 
     # ---------------- /mc_move ----------------
@@ -334,19 +331,18 @@ class AlertsCog(commands.Cog):
         except Exception:
             log.debug("Backfill failed for %s", ca, exc_info=True)
 
-        label = {"up": "pumps", "down": "dumps", "both": "moves"}[dir_val]
-        every = interval_for_move(mv)
+        label = {"up": "pump", "down": "dump", "both": "move"}[dir_val]
+        now = f" (now {usd(info['mc'])})" if info["mc"] else ""
         readiness = (
-            "✅ Armed now — seeded with historical data."
+            "✅ Armed now"
             if armed
-            else f"_Warming up: needs about {human_window(window_sec // 2)} of history before it can trigger._"
+            else f"Warming up: needs about {human_window(window_sec // 2)} of history first"
         )
         await inter.followup.send(
-            f"📊 Momentum alert set for **{info['name']} ({info['symbol']})** — "
-            f"fires when it {label} **{percent:g}%** within **{human_window(window_sec)}** "
-            f"(now ${humanize(info['mc'])}).\n"
-            f"🆔 `{mv.id}` · sampling every {every}s · re-arms after {human_window(cooldown_sec)}\n"
-            f"{readiness}"
+            f"📊 **{info['symbol'] or info['name']}** momentum alert set: fires on a "
+            f"**{pct(percent, signed=False)}** {label} within **{human_window(window_sec)}**{now}\n"
+            + footer(f"`{mv.id}`", f"re-arms after {human_window(cooldown_sec)}", "note saved" if note else "")
+            + f"\n{readiness}"
         )
 
     # ---------------- /mc_list ----------------
@@ -370,7 +366,7 @@ class AlertsCog(commands.Cog):
         where = "in this server" if inter.guild_id else "on your account"
         if not sr and not mv:
             await inter.followup.send(
-                f"No active alerts {where}." + (f" (filtered by {user.display_name})" if user else ""),
+                f"No active alerts {where}." + (f" None by {user.display_name}." if user else ""),
                 ephemeral=not public,
             )
             return
@@ -381,12 +377,7 @@ class AlertsCog(commands.Cog):
         uids = {x.creator_id for x in (*sr, *mv)}
         names = {uid: await username_from_id(self.bot, uid) for uid in uids}
 
-        filt = f" (filtered by {user.display_name})" if user else ""
-        embed = discord.Embed(
-            title="Alerts",
-            description=f"Cached market caps{filt}.",
-            color=0x2B90D9,
-        )
+        embed = discord.Embed(title=footer("Alerts", user.display_name if user else ""), color=NEUTRAL)
 
         # Indices are only offered inside a server. From a user installation the
         # listing spans every server, while /mc_remove run in a server numbers
@@ -394,25 +385,22 @@ class AlertsCog(commands.Cog):
         # two places. Ids are unambiguous everywhere, so DMs get ids only.
         numbered = bool(inter.guild_id)
         pos = {r.id: i for i, r in enumerate(self._scoped(inter), 1)} if numbered else {}
-        headers = (["#"] if numbered else []) + ["ID", "Token", "Target", "Current", "By"]
+        headers = (["#"] if numbered else []) + ["ID", "Token", "Target", "Now", "By"]
         aligns = (["r"] if numbered else []) + ["l", "l", "r", "r", "l"]
         rows_ge, rows_le = [], []
+        unchecked = no_data = 0
         for r in sr:
             s = snap.get(r.ca)
-            # "—" used to mean four different things at once. Distinguish
-            # "not checked yet" from "checked, and there is no market cap" so a
-            # dead token doesn't look identical to a cold start.
+            # Both render as the unknown mark; the footer says how many of each
+            # there are, so a cold start still reads differently from a dead token.
             if s is None:
-                curr = "…"
+                unchecked += 1
             elif s.mc is None:
-                curr = "n/a"
-            else:
-                curr = f"${humanize(s.mc)}"
-            tgt = f"{'≥' if r.direction == 'above' else '≤'} ${humanize(r.target_mc)}"
-            if r.spec:
-                tgt = f"{r.spec} ${humanize(r.target_mc)}"
+                no_data += 1
+            curr = usd(s.mc) if s is not None and s.mc is not None else UNKNOWN
+            tgt = usd(r.target_mc) + (f" ({r.spec})" if r.spec else "")
             row = ([str(pos[r.id])] if numbered else []) + [
-                r.id, r.symbol or r.name, tgt, curr, names.get(r.creator_id, "?")
+                r.id, r.symbol or r.name, tgt, curr, names.get(r.creator_id, UNKNOWN)
             ]
             (rows_ge if r.direction == "above" else rows_le).append(row)
 
@@ -421,35 +409,34 @@ class AlertsCog(commands.Cog):
         # server had roughly 18 alerts in one direction.
         hidden = 0
         if rows_ge:
-            shown, total = add_table_fields(
-                embed, "📈 Breakouts (MC ≥ target)", headers, rows_ge, aligns, max_fields=4
-            )
+            shown, total = add_table_fields(embed, "📈 Breakouts", headers, rows_ge, aligns, max_fields=4)
             hidden += total - shown
         if rows_le:
-            shown, total = add_table_fields(
-                embed, "📉 Pullbacks (MC ≤ target)", headers, rows_le, aligns, max_fields=3
-            )
+            shown, total = add_table_fields(embed, "📉 Pullbacks", headers, rows_le, aligns, max_fields=3)
             hidden += total - shown
 
         if mv:
-            mheaders = ["ID", "Token", "Trigger", "Window", "Now", "By"]
+            mheaders = ["ID", "Token", "Move", "Window", "Now", "By"]
             maligns = ["l", "l", "r", "r", "r", "l"]
             mrows = []
             for m in mv:
                 s = snap.get(m.ca)
-                arrow = {"up": "▲", "down": "▼", "both": "±"}[m.direction]
                 mrows.append([
-                    m.id, m.symbol or m.name, f"{arrow}{m.pct:g}%", human_window(m.window_sec),
-                    f"${humanize(s.mc)}" if s and s.mc is not None else "—",
-                    names.get(m.creator_id, "?"),
+                    m.id, m.symbol or m.name, f"{ARROWS[m.direction]}{pct(m.pct, signed=False)}",
+                    human_window(m.window_sec),
+                    usd(s.mc) if s is not None and s.mc is not None else UNKNOWN,
+                    names.get(m.creator_id, UNKNOWN),
                 ])
             shown, total = add_table_fields(embed, "📊 Momentum", mheaders, mrows, maligns, max_fields=3)
             hidden += total - shown
 
-        foot = f"{len(sr)} level + {len(mv)} momentum alert(s){filt} • /mc_remove to delete"
-        if hidden:
-            foot += f" • {hidden} row(s) not shown — filter with user: to narrow"
-        embed.set_footer(text=foot)
+        embed.set_footer(text=footer(
+            f"{len(sr)} level + {plural(len(mv), 'momentum alert')}",
+            f"{unchecked} not checked yet" if unchecked else "",
+            f"{no_data} with no market cap" if no_data else "",
+            "/mc_remove to delete",
+            f"{plural(hidden, 'row')} not shown (filter with user:)" if hidden else "",
+        ))
         await inter.followup.send(embed=embed, ephemeral=not public)
 
     # ---------------- /mc_remove ----------------
@@ -461,22 +448,21 @@ class AlertsCog(commands.Cog):
         for r in self._scoped(inter):
             if not self._may_remove(inter.user, r.creator_id, can_manage):
                 continue
-            label = f"{r.symbol or r.name} {'≥' if r.direction == 'above' else '≤'} ${humanize(r.target_mc)} ({r.id})"
+            label = f"{_level_label(r)} ({r.id})"
             if q and q not in label.lower() and q not in r.ca.lower():
                 continue
             out.append(app_commands.Choice(name=label[:100], value=r.id))
         for m in self._scoped_moves(inter):
             if not self._may_remove(inter.user, m.creator_id, can_manage):
                 continue
-            arrow = {"up": "▲", "down": "▼", "both": "±"}[m.direction]
-            label = f"{m.symbol or m.name} {arrow}{m.pct:g}%/{human_window(m.window_sec)} ({m.id})"
+            label = f"{_move_label(m)} ({m.id})"
             if q and q not in label.lower() and q not in m.ca.lower():
                 continue
             out.append(app_commands.Choice(name=label[:100], value=m.id))
         return out[:25]
 
     @app_commands.command(name="mc_remove", description="Remove alerts (pick from the list, or pass ids)")
-    @app_commands.describe(alerts="Alert id(s) or /mc_list index/indices, e.g. 'a1b2c3' or '1 3 5'")
+    @app_commands.describe(alerts="Alert ids or /mc_list numbers, e.g. 'a1b2c3' or '1 3 5'")
     @app_commands.autocomplete(alerts=_remove_autocomplete)
     # /mc_list works from a user installation and points people here, so this has
     # to be reachable in the same places. Unlike /mc and /mc_move it posts
@@ -515,7 +501,7 @@ class AlertsCog(commands.Cog):
             picked, parse_errs = resolve_targets(alerts, scoped, scope)
 
         if not picked and not move_hits:
-            reason = "\n".join(f"• {e}" for e in parse_errs) or "• No alerts specified."
+            reason = "\n".join(f"- {e}" for e in parse_errs) or "- No alerts specified."
             await inter.followup.send(f"❌ Nothing to remove:\n{reason}")
             return
 
@@ -550,25 +536,20 @@ class AlertsCog(commands.Cog):
 
         lines = []
         if removed:
-            lines.append("🗑️ **Removed:**")
+            lines.append(f"🗑️ **Removed {plural(len(removed), 'alert')}**")
             for kind, x in removed:
-                if kind == "move":
-                    arrow = {"up": "▲", "down": "▼", "both": "±"}[x.direction]
-                    lines.append(f"• `{x.id}` {x.name} ({x.symbol}) — {arrow}{x.pct:g}% / {human_window(x.window_sec)}")
-                else:
-                    sym = "≥" if x.direction == "above" else "≤"
-                    lines.append(f"• `{x.id}` {x.name} ({x.symbol}) — MC {sym} ${humanize(x.target_mc)}")
+                lines.append(f"- `{x.id}` {_move_label(x) if kind == 'move' else _level_label(x)}")
         else:
             lines.append("No alerts removed.")
         if denied:
             lines.append(
-                "\n🔒 **Permission denied for:** " + ", ".join(f"`{x.id}`" for x in denied)
-                + " (only the creator or users with **Manage Server** can remove those)."
+                "\n🔒 **Not yours to remove:** " + ", ".join(f"`{x.id}`" for x in denied)
+                + " (only the creator or someone with **Manage Server** can)."
             )
         if parse_errs:
-            lines.append("\n⚠️ **Input issues:**")
-            lines += [f"• {e}" for e in parse_errs]
-        await inter.followup.send(_fit(lines))
+            lines.append("\n⚠️ **Not understood:**")
+            lines += [f"- {e}" for e in parse_errs]
+        await inter.followup.send(fit_lines(lines, MESSAGE_LIMIT))
 
     # ---------------- /mc_recent ----------------
 
@@ -597,29 +578,29 @@ class AlertsCog(commands.Cog):
         evs.sort(key=lambda e: e.ts, reverse=True)
         evs = evs[: max(1, min(int(count or 5), 50))]
         if not evs:
-            await inter.followup.send("No matching alerts found.", ephemeral=not public)
+            await inter.followup.send("No alerts have fired here yet.", ephemeral=not public)
             return
 
         name_by_id = {uid: await username_from_id(self.bot, uid) for uid in {e.creator_id for e in evs}}
-        async with TOKEN_CACHE_LOCK:
-            current_by_ca = {e.ca: (token_cache[e.ca].mc if e.ca in token_cache else None) for e in evs}
 
-        filt = f" — by: {user.name}" if user else ""
+        # The market cap at the moment it fired is on the event itself.
+        lines = []
+        for e in evs:
+            if getattr(e, "kind", "level") == "move":
+                up = e.direction == "up"
+                what = f"{'📈' if up else '📉'} **{e.symbol or e.name}** {'+' if up else '-'}{pct(e.target_mc, signed=False)} move"
+                at = f"at {usd(e.current_mc)}" if e.current_mc is not None else ""
+            else:
+                up = e.direction == "above"
+                what = f"{'📈' if up else '📉'} **{e.symbol or e.name}** {'≥' if up else '≤'} {usd(e.target_mc)}"
+                at = f"fired at {usd(e.current_mc)}" if e.current_mc is not None else ""
+            lines.append(footer(what, at, when(e.ts), name_by_id.get(e.creator_id, UNKNOWN)))
+
         embed = discord.Embed(
-            title="Recent Alerts", description=f"Most recent {len(evs)} alert(s){filt}", color=0xF39C12
+            title=footer("Recent alerts", user.display_name if user else ""),
+            description=fit_lines(lines, 4000),
+            color=NEUTRAL,
         )
-        # count accepts up to 50, which is far past what one embed field holds.
-        shown, total = add_table_fields(
-            embed,
-            "History",
-            ALERTS_HEADERS,
-            alerts_rows(evs, name_by_id, current_by_ca),
-            ALERTS_ALIGNS,
-            max_width=14,
-            max_fields=5,
-        )
-        if shown < total:
-            embed.set_footer(text=f"Showing {shown} of {total} — ask for fewer with count:")
         await inter.followup.send(embed=embed, ephemeral=not public)
 
     # ---------------- /mc_status ----------------
@@ -636,45 +617,32 @@ class AlertsCog(commands.Cog):
 
         tiers = describe_tiers(reminders, mc_all)
         rate = estimated_requests_per_minute(reminders, move_alerts, mc_all, watcher_no_data)
-
-        rows = [
-            ["🔥 hot (near target)", str(tiers["hot"])],
-            ["🌤 warm", str(tiers["warm"])],
-            ["🧊 cold", str(tiers["cold"])],
-            ["❔ no MC data", str(tiers["unknown"])],
-        ]
-        embed = discord.Embed(title="Watcher status", color=0x2B90D9)
-        embed.add_field(name="Level alerts by tier", value=fixed_table(["Tier", "Count"], rows, ["l", "r"]), inline=False)
-
         warming = sum(1 for m in move_alerts if history.pct_change(m.ca, m.window_sec, time.time()) is None)
         dead = sum(1 for ca in addresses if watcher_no_data.get(ca, 0) > 0)
         backed_off = sum(1 for ca in addresses if watcher_no_data.get(ca, 0) >= NO_DATA_GIVE_UP)
+        here = "in this server" if inter.guild_id else "on your account"
 
         lines = [
-            f"**{len(reminders)}** level + **{len(move_alerts)}** momentum alert(s)",
-            f"over **{len(addresses)}** token(s)",
-            f"≈ **{rate:.0f}** DexScreener req/min (limit 300)",
-            f"**{warming}** momentum alert(s) still filling their window",
-            f"**{len(self._scoped(inter))}** level alert(s) "
-            f"{'in this server' if inter.guild_id else 'on your account'}",
+            f"**{len(reminders)}** level + **{len(move_alerts)}** momentum alerts over "
+            f"**{len(addresses)}** tokens{SEP}≈ **{rate:.0f}** requests/min of 300",
+            footer(
+                f"Level alerts: 🔥 {tiers['hot']} near target",
+                f"🌤 {tiers['warm']} warm", f"🧊 {tiers['cold']} cold", f"❔ {tiers['unknown']} no data",
+            ),
+            footer(
+                f"{plural(warming, 'momentum alert')} still filling their window",
+                f"{plural(len(self._scoped(inter)), 'level alert')} {here}",
+            ),
         ]
-        embed.add_field(name="Load", value="\n".join(lines), inline=False)
-
         if dead:
             # These can never fire, so say so plainly rather than leaving the
-            # owner to wonder why a third of the list shows n/a.
-            embed.add_field(
-                name="⚠️ Tokens reporting no market cap",
-                value=(
-                    f"**{dead}** of {len(addresses)} tracked token(s) return no market cap, so "
-                    f"their alerts cannot fire. **{backed_off}** have been backed off to the "
-                    "slowest polling rate.\nUse `/mc_list` (shown as `n/a`) and `/mc_remove` "
-                    "to clear them out."
-                ),
-                inline=False,
+            # owner to wonder why a third of the list shows the unknown mark.
+            lines.append(
+                f"⚠️ {plural(dead, 'token')} return no market cap so their alerts cannot fire "
+                f"({backed_off} backed off). They show as {UNKNOWN} in /mc_list; /mc_remove clears them."
             )
+        embed = discord.Embed(title="Watcher status", color=NEUTRAL, description="\n".join(lines))
         await inter.followup.send(embed=embed, ephemeral=True)
-
 
     # ---------------- clear ----------------
 
@@ -693,8 +661,8 @@ class AlertsCog(commands.Cog):
             return
         view = ConfirmOrder(inter.user.id, 60)
         await inter.response.send_message(
-            f"Remove **{len(levels)}** level alert(s) and **{len(moves)}** momentum alert(s) from this server? "
-            f"This cannot be undone.", view=view, ephemeral=True,
+            f"Remove **{plural(len(levels), 'level alert')}** and **{plural(len(moves), 'momentum alert')}** "
+            f"from this server? This cannot be undone.", view=view, ephemeral=True,
         )
         await view.wait()
         if not view.value:
@@ -705,7 +673,9 @@ class AlertsCog(commands.Cog):
         await save_reminders()
         await save_moves()
         log.info("User %s cleared %d level + %d move alert(s) in guild %s", inter.user.id, len(levels), len(moves), inter.guild_id)
-        await inter.followup.send(f"🧹 Cleared {len(levels)} level and {len(moves)} momentum alert(s). /mc_list is empty here.")
+        await inter.followup.send(
+            f"🧹 Cleared {len(levels)} level and {plural(len(moves), 'momentum alert')}. /mc_list is empty here."
+        )
 
 
 async def setup(bot: commands.Bot):

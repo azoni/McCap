@@ -3,7 +3,7 @@ from typing import Dict, List, Optional, Tuple
 
 from .config import DEX_BLACKLIST, DEX_TOKEN_URL, SOLANA_USE_FDV
 from .constants import DEX_ALIASES, LP_VENUES, MAJOR_QUOTES
-from .helpers import _median, _percentile, humanize, is_solana_address
+from .helpers import _median, _percentile, is_solana_address
 from .http import dex_limiter, get_json
 
 
@@ -255,20 +255,3 @@ def summarize_lp_venues(pairs: List[Dict], ca: str):
     ranked=sorted(agg.items(), key=lambda kv:(-(kv[1]["score"]), -(kv[1]["liq"]), -(kv[1]["vol"])))
     best=ranked[0] if ranked else None
     return agg, best
-
-def table_lp(agg: Dict[str, Dict]) -> str:
-    headers=["Venue","Pools","Liq","Vol24","Tx24","Quotes","Score"]; widths=[9,5,12,12,8,10,6]; aligns=["l","r","r","r","r","l","r"]
-    def cut(s,w): s=str(s); return s if len(s)<=w else s[:max(1,w-1)]+"…"
-    def c(v,w,a): s=cut(v,w); return s.rjust(w) if a=="r" else (s.center(w) if a=="c" else s.ljust(w))
-    rows=[]
-    from .constants import LP_VENUES as ORDER
-    for v in ORDER:
-        a=agg.get(v)
-        if a:
-            rows.append([v.capitalize(), str(a["pools"]), f"${humanize(a['liq'])}", f"${humanize(a['vol'])}", f"{a['tx']}", ",".join(sorted(a["quotes"].keys())[:2]) or "—", f"{a['score']:.2f}"])
-        else:
-            rows.append([v.capitalize(), "0", "$—", "$—", "0", "—", "0.00"])
-    head="  ".join(c(h,w,'l') for h,w in zip(headers,widths))
-    sep="  ".join("─"*w for w in widths)
-    body="\n".join("  ".join(c(v,w,a) for v,w,a in zip(r,widths,aligns)) for r in rows) or "—"
-    return f"```\n{head}\n{sep}\n{body}\n```"

@@ -1,6 +1,5 @@
 import math
 import re
-import time
 from typing import List, Optional, Tuple
 
 import discord
@@ -14,17 +13,164 @@ def is_solana_address(addr: str) -> bool:
 def short_ca(ca: str) -> str: return f"{ca[:4]}…{ca[-4:]}"
 
 
-def money(x: float) -> str:
-    n=float(x)
-    for u in ["","K","M","B","T"]:
-        if abs(n) < 1000: return f"{n:,.2f}{u}"
-        n/=1000
-    return f"{n:,.2f}P"
+# ---------------- one way to write each kind of number ----------------
+#
+# Every command formats through these, so a market cap, a dollar figure or a
+# percentage looks the same in an alert, a table cell and a trade receipt.
+
+UNKNOWN = "—"                 # the only rendering of "no data"
+SEP = " · "                   # the only separator, footers included
+NEUTRAL, GOOD, BAD = 0x2B90D9, 0x57F287, 0xED4245
+
+
+def colour_for(v: Optional[float]) -> int:
+    """Embed colour from a signed figure: green at or above zero, red below, blue when unknown."""
+    if v is None:
+        return NEUTRAL
+    return GOOD if v >= 0 else BAD
+
+
+def compact(n: float) -> str:
+    """4.79, 24.80, 1.5K, 222K, 1.23M, 1.2M, 500M: two decimals under a thousand,
+    three significant figures above it, trailing zeros dropped."""
+    n = float(n)
+    sign = "-" if n < 0 else ""
+    n = abs(n)
+    if n < 999.5:
+        return f"{sign}{n:,.2f}"
+    units = ["", "K", "M", "B", "T", "Q"]
+    k = 0
+    while n >= 999.5 and k < len(units) - 1:
+        n /= 1000
+        k += 1
+    if n >= 99.95:
+        s = f"{n:.0f}"
+    elif n >= 9.995:
+        s = f"{n:.1f}"
+    else:
+        s = f"{n:.2f}"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return f"{sign}{s}{units[k]}"
 
 
 def humanize(x: Optional[float]) -> str:
-    if x is None: return "—"
-    return money(float(x))
+    """A bare compact number, or the unknown mark."""
+    if x is None:
+        return UNKNOWN
+    return compact(float(x))
+
+
+def usd(v: Optional[float], signed: bool = False) -> str:
+    """$4.79, $221K, $1.2M; signed gives +$4.95 / -$3.20."""
+    if v is None:
+        return UNKNOWN
+    v = float(v)
+    if signed:
+        return f"{'+' if v >= 0 else '-'}${compact(abs(v))}"
+    return f"-${compact(abs(v))}" if v < 0 else f"${compact(v)}"
+
+
+def pct(v: Optional[float], signed: bool = True) -> str:
+    """+37.5%, -12.3%, +4%; signed=False gives 30%."""
+    if v is None:
+        return UNKNOWN
+    v = float(v)
+    if abs(v) < 0.05:
+        v = 0.0
+    s = f"{v:+.1f}" if signed else f"{v:.1f}"
+    if s.endswith(".0"):
+        s = s[:-2]
+    return s + "%"
+
+
+def mult(m: Optional[float]) -> str:
+    """0.96x, 1.26x, 4x, 12.3x, 150x."""
+    if m is None:
+        return UNKNOWN
+    m = float(m)
+    if m >= 99.95:
+        s = f"{m:,.0f}"
+    elif m >= 9.995:
+        s = f"{m:.1f}"
+    else:
+        s = f"{m:.2f}"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s + "x"
+
+
+def qty(v: Optional[float]) -> str:
+    """Token amounts: 2,062 / 36 / 3.33 / 0.0004."""
+    if v is None:
+        return UNKNOWN
+    v = float(v)
+    if v >= 1000:
+        return f"{v:,.0f}"
+    s = f"{v:,.2f}" if v >= 1 else f"{v:.4f}"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s or "0"
+
+
+def eth_str(eth: Optional[float]) -> str:
+    """An ETH amount from a float: 1 / 0.05 / 0.0181 (six places at most)."""
+    if eth is None:
+        return UNKNOWN
+    s = f"{float(eth):,.6f}"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s or "0"
+
+
+def when(ts: float) -> str:
+    """Discord renders this as a relative time in the reader's own zone."""
+    return f"<t:{int(ts)}:R>"
+
+
+def plural(n: int, word: str, plural_word: Optional[str] = None) -> str:
+    """1 alert / 3 alerts."""
+    return f"{n:,} {word if n == 1 else (plural_word or word + 's')}"
+
+
+def footer(*parts) -> str:
+    """Join the non-empty pieces of a footer or a status line."""
+    return SEP.join(str(p) for p in parts if p)
+
+
+def chunk_lines(lines: List[str], limit: int) -> List[str]:
+    """Split lines into blocks that each fit ``limit`` characters (an embed field is 1024)."""
+    out: List[str] = []
+    cur: List[str] = []
+    used = 0
+    for line in lines:
+        line = line if len(line) <= limit else line[: limit - 1] + "…"
+        if cur and used + len(line) + 1 > limit:
+            out.append("\n".join(cur))
+            cur, used = [], 0
+        cur.append(line)
+        used += len(line) + (1 if used else 0)
+    if cur:
+        out.append("\n".join(cur))
+    return out
+
+
+def fit_lines(lines: List[str], limit: int = 2000) -> str:
+    """Join lines into one message Discord will accept, saying how many were cut.
+
+    Removing 40 alerts once produced a 2015-character reply, which Discord
+    rejects; since the interaction was already deferred, the command just hung.
+    """
+    out: List[str] = []
+    used = 0
+    for i, line in enumerate(lines):
+        tail = f"…and {plural(len(lines) - i, 'more line')}"
+        if used + len(line) + 1 + len(tail) > limit:
+            out.append(tail)
+            break
+        out.append(line)
+        used += len(line) + 1
+    return "\n".join(out)[:limit]
 
 
 def parse_mc_input(v: str) -> float:
@@ -136,7 +282,3 @@ async def username_from_id(client: discord.Client, user_id: int) -> str:
         try: user = await client.fetch_user(user_id)
         except Exception: user = None
     return user.name if user else f"user:{user_id}"
-
-
-def when_str(ts: float) -> str:
-    return time.strftime("%m-%d %H:%M", time.localtime(ts))

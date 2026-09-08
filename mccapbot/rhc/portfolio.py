@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from ..dex import token_summary
+from ..helpers import eth_str, footer, mult, plural, qty, usd
 from ..logging_setup import log
 from . import chain, ledger, wallets
 
@@ -105,46 +106,51 @@ async def summary(force: bool = False) -> Summary:
     return s
 
 
-def _usd(v: Optional[float]) -> str:
-    return f"${v:,.0f}" if v is not None and v >= 100 else (f"${v:,.2f}" if v is not None else "")
+ABOUT_ME_LIMIT = 400   # Discord's cap on an application's description
 
 
 def presence_fragment(s: Optional[Summary]) -> str:
-    """A short piece for the status line, or '' when there is nothing to say."""
+    """A short piece for the status line, or '' when there is nothing to say:
+    the group's total in dollars, or in ETH when there is no ETH price."""
     if s is None or s.wallets == 0:
         return ""
-    text = f"RH {s.eth:.3f} ETH"
-    if s.positions:
-        text += f" + {len(s.positions)} token{'s' if len(s.positions) != 1 else ''}"
     total = s.total_usd
-    if total is not None:
-        text += f" ({_usd(total)})"
-    return text
+    return f"RH {usd(total)}" if total is not None else f"RH {eth_str(s.eth)} ETH"
 
 
 def about_me(s: Optional[Summary]) -> str:
-    """The bot's profile text: what it does, and what the group's wallets hold."""
-    lines = ["Market-cap alerts (/mc) and Robinhood Chain trading (/rh)."]
+    """The bot's profile text: what it does, and what the group's wallets hold.
+
+    Built to fit Discord's limit rather than sliced at it: positions are
+    dropped from the end first, then the group line, so what remains is
+    always whole sentences.
+    """
+    intro = "Market-cap alerts (/mc) and Robinhood Chain trading (/rh)."
     if s is None or s.wallets == 0:
-        lines.append("No Robinhood Chain wallets yet. /rh wallet create makes one.")
-        return "\n".join(lines)
+        return f"{intro}\nNo Robinhood Chain wallets yet. /rh wallet create makes one."
     total = s.total_usd
-    lines.append(
-        f"Robinhood Chain: {s.wallets} wallet{'s' if s.wallets != 1 else ''}, {s.eth:.4f} ETH"
-        + (f" ({_usd(s.eth_value_usd)})" if s.eth_value_usd is not None else "")
-    )
-    for sym, amount, usd in s.positions[:6]:
-        lines.append(f"• {amount:,.2f} {sym}" + (f" ({_usd(usd)})" if usd else ""))
-    if total is not None:
-        lines.append(f"Total ≈ {_usd(total)}")
+    holdings = f"{eth_str(s.eth)} ETH" + (f" ({usd(s.eth_value_usd)})" if s.eth_value_usd is not None else "")
+    positions = [f"{qty(amount)} {sym}" + (f" ({usd(u)})" if u else "") for sym, amount, u in s.positions]
+    group = ""
     try:
         from . import pnl
         g = pnl.group_stats()
         if g.buys or g.sells:
-            gas = f", gas {g.gas_wei / 1e18:.4f} ETH" if g.gas_wei else ""
-            best = f", best {pnl.fmt_x(g.best_multiple)} {g.best_symbol}" if g.best_multiple else ""
-            lines.append(f"Group: {g.buys + g.sells} trades, {_usd(g.volume_usd)} volume{gas}{best}")
+            group = f"Group: {plural(g.buys + g.sells, 'trade')}, {usd(g.volume_usd)} volume"
+            if g.best_multiple:
+                group += f", best {mult(g.best_multiple)} {g.best_symbol}".rstrip()
     except Exception:
         log.debug("Group stats unavailable for About Me", exc_info=True)
-    lines.append(f"Updated {time.strftime('%H:%M', time.gmtime(s.fetched_ts))} UTC · /rh holdings, /rh pnl, /rh stats")
-    return "\n".join(lines)[:400]
+    tail = footer("/rh holdings", "/rh pnl", "/rh stats")
+
+    def build(n_positions: int, with_group: bool) -> str:
+        held = " + ".join([holdings] + positions[:n_positions])
+        head = f"{plural(s.wallets, 'wallet')} hold" + (f" {usd(total)}" if total is not None else "") + f": {held}"
+        return "\n".join([intro, head] + ([group] if with_group and group else []) + [tail])
+
+    for with_group in (True, False):
+        for n in range(len(positions), -1, -1):
+            text = build(n, with_group)
+            if len(text) <= ABOUT_ME_LIMIT:
+                return text
+    return build(0, False)[:ABOUT_ME_LIMIT]

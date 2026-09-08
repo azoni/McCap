@@ -227,7 +227,7 @@ async def test_token_lookup_by_address_reads_the_summary(monkeypatch):
                 "liq": 254_000, "vol24": 1_200_000, "change24": -12.3, "pools": 23}
     monkeypatch.setattr(chat, "token_summary", fake_summary)
     out = await chat.run_tool("token_lookup", {"query": "0x78b96280c3347e0f58a7147b73eb0ec5ffff025d"}, ctx())
-    assert "RSTR" in out and "$2.60M" in out and "-12.3%" in out
+    assert "RSTR" in out and "$2.6M" in out and "-12.3%" in out
 
 
 @pytest.mark.asyncio

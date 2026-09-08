@@ -36,7 +36,7 @@ from .config import (
     DEX_SEARCH_URL,
 )
 from .dex import token_summary
-from .helpers import humanize, is_solana_address, short_ca
+from .helpers import humanize, is_solana_address, pct, plural, short_ca
 from .http import dex_limiter, get_json
 from .logging_setup import log
 from .models import ChatTurn, MemoryNote
@@ -253,7 +253,7 @@ async def _tool_list_alerts(ctx: ChatContext) -> str:
         )
     for m in moves:
         lines.append(
-            f"[{m.id}] {m.symbol or m.name} moves {m.pct:g}% {m.direction} within {m.window_sec // 60}m, "
+            f"[{m.id}] {m.symbol or m.name} moves {pct(m.pct, signed=False)} {m.direction} within {m.window_sec // 60}m, "
             f"{now_str(m.ca)}, {short_ca(m.ca)}"
         )
     return "\n".join(lines)
@@ -266,8 +266,8 @@ def _looks_like_address(q: str) -> bool:
 
 def _describe_summary(s: Dict[str, Any]) -> str:
     return (
-        f"{s['name']} ({s['symbol']}): MC ${humanize(s['mc'])}, 24h {s['change24']:+.1f}%, "
-        f"liquidity ${humanize(s['liq'])}, 24h volume ${humanize(s['vol24'])}, {s['pools']} pool(s). "
+        f"{s['name']} ({s['symbol']}): MC ${humanize(s['mc'])}, 24h {pct(s['change24'])}, "
+        f"liquidity ${humanize(s['liq'])}, 24h volume ${humanize(s['vol24'])}, {plural(int(s['pools'] or 0), 'pool')}. "
         f"Address {s['ca']}."
     )
 

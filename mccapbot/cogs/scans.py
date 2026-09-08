@@ -39,7 +39,7 @@ from ..config import (
     SCANNER_BOT_IDS,
 )
 from ..dex import token_summary
-from ..helpers import humanize, short_ca
+from ..helpers import BAD, GOOD, NEUTRAL, SEP, footer, humanize, mult, pct, plural, short_ca
 from ..logging_setup import log
 from ..models import MoveAlert, ScanEvent, WatchItem
 from ..storage import (
@@ -53,10 +53,6 @@ from ..storage import (
     watchlist,
 )
 from ..tables import add_table_fields
-
-
-def _fmt_mult(m: Optional[float]) -> str:
-    return "—" if m is None else f"{m:.2f}x"
 
 
 def _median(vals: List[float]) -> float:
@@ -300,19 +296,18 @@ class ScansCog(commands.Cog):
         embed = discord.Embed(
             title=f"{ev.name} ({ev.symbol})",
             url=summary.get("url"),
-            colour=(0x2ECC71 if change >= 0 else 0xE74C3C),
+            colour=GOOD if change >= 0 else BAD,
             description=(
-                f"**MC** ${humanize(ev.mc_at_scan)}  |  **24h** {change:+.1f}%\n"
-                f"**Liquidity** ${humanize(summary.get('liq'))} across "
-                f"{summary.get('pools', 0)} pool(s)"
+                f"**${humanize(ev.mc_at_scan)}** MC{SEP}24h {pct(change)}\n"
+                f"liquidity ${humanize(summary.get('liq'))} in {plural(int(summary.get('pools') or 0), 'pool')}"
             ),
         )
         if summary.get("image_url"):
             embed.set_thumbnail(url=summary["image_url"])
-        foot = f"tracking from ${humanize(ev.mc_at_scan)} | scan {ev.id}"
-        if armed:
-            foot += f" | auto-alert +/-{armed.pct:g}%"
-        embed.set_footer(text=foot)
+        embed.set_footer(text=footer(
+            f"tracking from ${humanize(ev.mc_at_scan)}", f"scan {ev.id}",
+            f"auto-alert ±{pct(armed.pct, signed=False)}" if armed else "",
+        ))
 
         try:
             await message.reply(embed=embed, mention_author=False)
@@ -414,21 +409,21 @@ class ScansCog(commands.Cog):
         rows = [[
             s.symbol or s.name,
             f"${humanize(s.mc_at_scan)}",
-            _fmt_mult(s.multiple()),
-            _fmt_mult(s.current_multiple()),
+            mult(s.multiple()),
+            mult(s.current_multiple()),
         ] for s in evs[:20]]
 
         scored = [m for m in (s.multiple() for s in evs) if m is not None]
         winners = sum(1 for m in scored if m >= 2.0)
-        median = f" | median peak {_median(scored):.2f}x" if scored else ""
+        median = f"{SEP}median peak {mult(_median(scored))}" if scored else ""
 
         embed = discord.Embed(
             title=f"Scan performance - last {hours}h",
             description=(
-                f"**{len(evs)}** scan(s) | **{winners}** hit 2x or better{median}\n"
+                f"**{plural(len(evs), 'scan')}**{SEP}**{winners}** hit 2x or better{median}\n"
                 "Peak is the best it reached after the call; now is where it stands."
             ),
-            colour=0x2B90D9,
+            colour=NEUTRAL,
         )
         shown, total_rows = add_table_fields(
             embed, "Ranked by " + ("peak" if key == "peak" else "current"),
@@ -436,7 +431,7 @@ class ScansCog(commands.Cog):
         )
         foot = f"Each scan is tracked for {SCAN_TRACK_HOURS}h after detection"
         if shown < total_rows:
-            foot += f" · {total_rows - shown} row(s) not shown"
+            foot += f"{SEP}{plural(total_rows - shown, 'row')} not shown"
         embed.set_footer(text=foot)
         await inter.followup.send(embed=embed)
 
@@ -455,11 +450,11 @@ class ScansCog(commands.Cog):
             s.symbol or s.name,
             short_ca(s.ca),
             f"${humanize(s.mc_at_scan)}",
-            _fmt_mult(s.current_multiple()),
+            mult(s.current_multiple()),
         ] for s in evs]
-        embed = discord.Embed(title="Recent scans", colour=0xF39C12)
+        embed = discord.Embed(title="Recent scans", colour=NEUTRAL)
         add_table_fields(
-            embed, f"{len(evs)} detection(s)",
+            embed, plural(len(evs), "detection"),
             ["Token", "CA", "At scan", "Now"], rows, ["l", "l", "r", "r"], max_fields=3,
         )
         await inter.followup.send(embed=embed, ephemeral=True)

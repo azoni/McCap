@@ -1,7 +1,7 @@
 import unicodedata
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
-from .helpers import humanize, when_str
+from .helpers import UNKNOWN
 
 # Discord rejects an embed field value longer than 1024 characters with a 400,
 # which fails the whole interaction. A long table therefore has to be split
@@ -71,7 +71,7 @@ def _cell(v, w: int, a: str) -> str:
 def _render(headers: List[str], rows: List[List[str]], aligns: List[str], widths: List[int]) -> str:
     head = "  ".join(_cell(h, w, "l") for h, w in zip(headers, widths))
     sep = "  ".join("─" * w for w in widths)
-    body = "\n".join("  ".join(_cell(v, w, a) for v, w, a in zip(r, widths, aligns)) for r in rows) or "—"
+    body = "\n".join("  ".join(_cell(v, w, a) for v, w, a in zip(r, widths, aligns)) for r in rows) or UNKNOWN
     return f"```\n{head}\n{sep}\n{body}\n```"
 
 
@@ -185,39 +185,3 @@ def add_table_fields(
     # An empty table still emits one field: table_chunks returns a single empty
     # group, so the loop above has already handled it.
     return shown, total
-
-
-ALERTS_HEADERS = ["When", "Token", "Dir", "Trigger", "Current", "By"]
-ALERTS_ALIGNS = ["l", "l", "c", "r", "r", "l"]
-
-
-def alerts_rows(events, name_by_id: Dict[int, str], current_by_ca: Dict[str, Optional[float]]) -> List[List[str]]:
-    """Rows for the fired-alert history, so callers can chunk them."""
-    rows = []
-    for e in events:
-        kind = getattr(e, "kind", "level")
-        if kind == "move":
-            dir_sym = "▲" if e.direction == "up" else "▼"
-            trigger = f"{e.target_mc:g}%"
-        else:
-            dir_sym = "≥" if e.direction == "above" else "≤"
-            trigger = f"${humanize(e.target_mc)}"
-        rows.append([
-            when_str(e.ts),
-            e.symbol or e.name,
-            dir_sym,
-            trigger,
-            f"${humanize(current_by_ca.get(e.ca))}",
-            name_by_id.get(e.creator_id, f"user:{e.creator_id}"),
-        ])
-    return rows
-
-
-def alerts_table(events, name_by_id: Dict[int, str], current_by_ca: Dict[str, Optional[float]]) -> str:
-    """Single-string fired-alert history. Kept for callers that don't chunk."""
-    return fixed_table(
-        ALERTS_HEADERS,
-        alerts_rows(events, name_by_id, current_by_ca),
-        ALERTS_ALIGNS,
-        max_width=14,
-    )
