@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from mccapbot import rhchain
 from mccapbot.cogs import rhc as cog
 from mccapbot.rhc import chain, kyber, ledger, pnl, portfolio, swap, wallets
 
@@ -524,6 +525,50 @@ async def test_private_flag_keeps_one_call_to_yourself_even_in_public_mode(world
     await cog.RhcCog.buy.callback(cog.RhcCog(bot=None), quiet_buy2, PONS, eth="0.01", private=True)
     assert quiet_buy2.response.deferred_ephemeral is True and quiet_buy2.last_kw.get("ephemeral") is True
     assert not quiet_buy2.last.startswith("**tester**"), "no name prefix when nobody else can see it"
+
+
+@pytest.mark.asyncio
+async def test_sell_autocomplete_lists_holdings_with_amounts(world, monkeypatch):
+    ledger.journal({"ts": 1.0, "user_id": USER, "kind": "buy", "token": PONS, "symbol": "PONS", "decimals": 18,
+                    "amount_in": "10000000000000000", "quoted_out": str(36 * 10**18), "actual_out_estimate": str(36 * 10**18),
+                    "usd_in": 20.0, "mc_usd": 50_000.0, "tx": "0xb1", "status": "confirmed", "gas_cost_wei": "0"})
+    other = "0x" + "77" * 20
+    ledger.journal({"ts": 2.0, "user_id": USER, "kind": "buy", "token": other, "symbol": "GONE", "decimals": 18,
+                    "amount_in": "1", "quoted_out": "1", "actual_out_estimate": "1",
+                    "usd_in": 1.0, "tx": "0xb2", "status": "confirmed", "gas_cost_wei": "0"})
+
+    async def erc20_balance(token, owner):
+        return 36 * 10**18 if token.lower() == PONS else 0     # GONE was fully sold
+    monkeypatch.setattr(chain, "erc20_balance", erc20_balance)
+    cog.RhcCog._bal_cache.clear()
+
+    c = cog.RhcCog(bot=None)
+    choices = await c._holding_choices(USER, "")
+    assert [ch.value.lower() for ch in choices] == [PONS], "only tokens with a balance are offered"
+    assert choices[0].name == "PONS · 36.00 · bought at $50.00K MC"
+    assert await c._holding_choices(USER, "po") and not await c._holding_choices(USER, "zzz")
+    assert await c._holding_choices(999, "") == [], "no wallet, no choices"
+
+    inter = FakeInteraction()
+    assert [ch.value.lower() for ch in await c.sell_token_autocomplete(inter, "")] == [PONS]
+
+
+@pytest.mark.asyncio
+async def test_buy_autocomplete_suggests_the_busiest_tokens(world, monkeypatch):
+    def pool(addr, sym, base, vol, mc):
+        return rhchain.Pool(address=addr, name=f"{sym} / WETH", dex="Uniswap V3", base_symbol=sym, base_name=sym,
+                            base_address=base, quote_symbol="WETH", price_usd=1, liq_usd=1e6, mc_usd=mc,
+                            volume={"h24": vol}, change={"h24": 0.0}, buys_h24=0, sells_h24=0, created_ts=1.0)
+
+    async def pools():
+        return [pool("0xa", "PONS", PONS, 100e6, 500e6), pool("0xb", "MEME", "0x" + "2" * 40, 30e6, 90e6),
+                pool("0xc", "WETH", chain.WETH.lower(), 900e6, 6e9)]
+    monkeypatch.setattr(rhchain, "top_pools", pools)
+    c = cog.RhcCog(bot=None)
+    choices = await c.buy_token_autocomplete(FakeInteraction(), "")
+    assert [ch.name.split(" · ")[0] for ch in choices] == ["PONS", "MEME"], "majors hidden, busiest first"
+    assert choices[0].value.lower() == PONS and "$100.00M 24h vol" in choices[0].name
+    assert [ch.name.split(" · ")[0] for ch in await c.buy_token_autocomplete(FakeInteraction(), "me")] == ["MEME"]
 
 
 @pytest.mark.asyncio

@@ -888,6 +888,78 @@ class RhcCog(commands.Cog):
         embed.set_footer(text=foot)
         await inter.followup.send(embed=embed, ephemeral=priv)
 
+    # ---------------- autocomplete ----------------
+
+    _bal_cache: dict = {}   # (user_id, token) -> (ts, raw balance)
+
+    async def _holding_choices(self, user_id: int, current: str) -> list:
+        """What the caller holds, as pick-one choices for the sell command.
+
+        Autocomplete has about three seconds to answer, so balances come from a
+        short cache and a bounded RPC read; a token whose balance cannot be read
+        in time is simply left out this keystroke.
+        """
+        w = wallets.get(user_id)
+        if w is None:
+            return []
+        positions = pnl.aggregate(ledger.trades(user_id))
+        addrs = ledger.tokens_touched(user_id)[:15]
+        now = time.time()
+
+        async def balance(addr: str) -> int:
+            hit = self._bal_cache.get((user_id, addr))
+            if hit and now - hit[0] < 60:
+                return hit[1]
+            raw = await asyncio.wait_for(chain.erc20_balance(addr, w.address), 1.5)
+            self._bal_cache[(user_id, addr)] = (now, raw)
+            return raw
+
+        results = await asyncio.gather(*(balance(a) for a in addrs), return_exceptions=True)
+        q = (current or "").strip().lower()
+        choices = []
+        for addr, raw in zip(addrs, results):
+            if isinstance(raw, BaseException) or raw <= 0:
+                continue
+            p = positions.get(addr)
+            sym, dec = (p.symbol, p.decimals) if p else ("?", 18)
+            if q and q not in sym.lower() and q not in addr.lower():
+                continue
+            amount = raw / 10 ** dec
+            label = f"{sym} · {pnl.fmt_amount(amount)}"
+            if p and p.entry_mc:
+                label += f" · bought at ${humanize(p.entry_mc)} MC"
+            choices.append(app_commands.Choice(name=label[:100], value=chain.to_checksum(addr)))
+        return choices[:25]
+
+    @sell.autocomplete("token")
+    async def sell_token_autocomplete(self, inter: discord.Interaction, current: str):
+        try:
+            return await self._holding_choices(inter.user.id, current)
+        except Exception:
+            log.debug("sell autocomplete failed", exc_info=True)
+            return []
+
+    @buy.autocomplete("token")
+    async def buy_token_autocomplete(self, inter: discord.Interaction, current: str):
+        """The busiest tokens on the chain, from the trending board's cache."""
+        try:
+            pools = await asyncio.wait_for(rhchain.top_pools(), 2.5)
+        except Exception:
+            return []
+        q = (current or "").strip().lower()
+        tokens = [t for t in rhchain.aggregate(pools) if t.symbol.upper() not in rhchain.CHAIN_MAJORS]
+        tokens.sort(key=lambda t: -t.volume("h24"))
+        choices = []
+        for t in tokens:
+            if q and q not in t.symbol.lower() and q not in t.address.lower():
+                continue
+            label = f"{t.symbol} · ${humanize(t.volume('h24'))} 24h vol · ${humanize(t.mc_usd)} MC" if t.mc_usd else \
+                    f"{t.symbol} · ${humanize(t.volume('h24'))} 24h vol"
+            choices.append(app_commands.Choice(name=label[:100], value=chain.to_checksum(t.address)))
+            if len(choices) == 25:
+                break
+        return choices
+
     # ---------------- helpers ----------------
 
     async def _usd_basis(self, rt: kyber.Route, amount_wei: int,
