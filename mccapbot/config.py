@@ -248,3 +248,26 @@ RHC_REQUIRE_MOUNTED_DATA_DIR = _env_flag("RHC_REQUIRE_MOUNTED_DATA_DIR", False)
 RHC_WALLETS_FILE = str(DATA_DIR / "rhc_wallets.json")
 RHC_LEDGER_FILE = str(DATA_DIR / "rhc_ledger.json")
 RHC_JOURNAL_FILE = str(DATA_DIR / "rhc_trades.json")
+RHC_ORDERS_FILE = str(DATA_DIR / "rhc_orders.json")
+
+# Auto-orders: take-profit / stop-loss sells and one-shot dip or volume buys
+# that fire without a confirm click (the rule itself is confirmed when armed).
+# RHC_AUTO_ENABLE idles only the engine; RHC_TRADING_ENABLE still rules.
+RHC_AUTO_ENABLE = _env_flag("RHC_AUTO_ENABLE", True)
+RHC_AUTO_MAX_PER_USER = _env_int("RHC_AUTO_MAX_PER_USER", 10)
+# Every armed rule's token is polled through the same DexScreener bucket the
+# /mc watcher uses (a token near its target costs 6 requests a minute), so the
+# total is bounded.
+RHC_AUTO_MAX_TOTAL = _env_int("RHC_AUTO_MAX_TOTAL", 30)
+RHC_AUTO_SELL_TTL = os.getenv("RHC_AUTO_SELL_TTL", "7d")
+RHC_AUTO_BUY_TTL = os.getenv("RHC_AUTO_BUY_TTL", "24h")
+RHC_AUTO_MAX_TTL = os.getenv("RHC_AUTO_MAX_TTL", "30d")
+# Buy sizes offered as buttons (ordered). Sizes above RHC_MAX_TRADE_USD are
+# left off the buttons and refused on click, never clamped.
+RHC_BUTTON_USD_SIZES = [
+    float(x) for x in (os.getenv("RHC_BUTTON_USD_SIZES") or "5,20").replace(",", " ").split()
+    if x.replace(".", "", 1).isdigit()
+]
+# DexScreener's chainId slug for chain 4663 (verified live 2026-09-08). Trade
+# buttons ride on an alert only when its token reports this chain.
+RHC_DEX_CHAIN_ID = os.getenv("RHC_DEX_CHAIN_ID", "robinhood")

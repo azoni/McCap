@@ -85,6 +85,48 @@ class TokenSnapshot:
     consensus: float = 0.0
     delta: Optional[float] = None
     image_url: str = ""
+    # Dollar volume over the last hour, from the same DexScreener payload. None
+    # when the fetch had no pairs; auto-buy rules on volume never treat None as 0.
+    vol1h: Optional[float] = None
+
+
+@dataclass
+class AutoOrder:
+    """One-shot rule that trades without a confirm click: confirmed by its owner
+    when armed, consumed when it fires. Sells watch the market cap; buys watch
+    the market cap or the 1h volume. Plain defaults (0, "", False) on purpose:
+    storage._coerce drops falsy values only for default_factory fields."""
+
+    ca: str                  # checksummed EVM address on Robinhood Chain
+    symbol: str
+    decimals: int
+    side: str                # "buy" | "sell"
+    metric: str              # "mc" | "vol1h"  (sells are always "mc")
+    direction: str           # "above" | "below"  (helpers.meets semantics)
+    target: float            # USD market cap or USD 1h volume
+    size: float              # sell: percent 1..100 ; buy: USD (<= RHC_MAX_TRADE_USD)
+    slippage_bps: int
+    user_id: int
+    guild_id: int            # 0 in a DM
+    channel_id: int          # where reports go (unless private)
+    expires_ts: float
+    spec: str = ""                     # "2x", "-30%"; "" for an absolute target
+    anchor_mc: Optional[float] = None  # what spec was measured from
+    anchor: str = ""                   # "entry" | "now" | ""
+    private: bool = False              # report by DM instead of the channel
+    id: str = field(default_factory=new_id)
+    created_ts: float = field(default_factory=time.time)
+    status: str = "armed"              # "armed" | "firing" | "pending"
+    tx: str = ""                       # set while status == "pending"
+    fired_ts: float = 0.0
+    attempts: int = 0
+    last_attempt_ts: float = 0.0
+    last_error: str = ""
+
+    @property
+    def target_mc(self) -> Optional[float]:
+        """Duck-types as a level alert for the polling scheduler."""
+        return self.target if self.metric == "mc" else None
 
 
 @dataclass

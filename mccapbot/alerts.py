@@ -13,7 +13,7 @@ from .config import (
     POLL_TICK_SECONDS,
     TOP_HOLDER_WARN_PCT,
 )
-from .dex import build_token_url, choose_consensus_pair, fetch_dex_token, get_image_url, resolve_mc_value
+from .dex import build_token_url, choose_consensus_pair, fetch_dex_token, get_image_url, resolve_mc_value, volume_1h
 from .helpers import BAD, GOOD, SEP, footer, human_window, humanize, meets, pct, usd, username_from_id
 from .logging_setup import log
 from .models import AlertEvent, TokenSnapshot
@@ -27,6 +27,7 @@ from .scheduler import (
 from .storage import (
     alert_events,
     move_alerts,
+    order_watchers,
     reminders,
     save_alerts,
     save_moves,
@@ -144,9 +145,11 @@ async def _refresh(ca: str) -> bool:
         return False
 
     mc_val: Optional[float] = None
+    vol1h: Optional[float] = None
     src, link, dex, chain, quote, consensus, img = "none", None, "", "", "", 0.0, ""
 
     if isinstance(data, dict) and data.get("pairs"):
+        vol1h = volume_1h(data["pairs"], ca)
         best, consensus, _ = choose_consensus_pair(data["pairs"], ca)
         if best:
             mc_val, src = resolve_mc_value(best, ca)
@@ -178,6 +181,7 @@ async def _refresh(ca: str) -> bool:
             consensus=consensus,
             delta=(abs((mc_val or 0) - consensus) if mc_val and consensus else None),
             image_url=img,
+            vol1h=vol1h,
         )
     history.record(ca, mc_val, now)
     return True
@@ -439,7 +443,11 @@ async def watcher(client: discord.Client) -> None:
                     last_jup = mono
                     log.debug("Jupiter sweep resolved %d token(s)", got)
 
-                due = due_addresses(reminders, move_alerts, mc_by_ca, _last_checked, mono, _no_data)
+                # Armed auto-orders ride the same schedule as alerts (see
+                # storage.order_watchers), so one price path serves both.
+                order_levels, order_moves = order_watchers()
+                due = due_addresses([*reminders, *order_levels], [*move_alerts, *order_moves],
+                                    mc_by_ca, _last_checked, mono, _no_data)
 
                 if due:
                     results = await asyncio.gather(*(_refresh(ca) for ca in due), return_exceptions=True)
@@ -468,7 +476,9 @@ async def watcher(client: discord.Client) -> None:
                 if mono - last_rate_log > 900:
                     async with TOKEN_CACHE_LOCK:
                         warm = {ca: (token_cache[ca].mc if ca in token_cache else None) for ca in addresses}
-                    rate = estimated_requests_per_minute(reminders, move_alerts, warm, _no_data)
+                    order_levels, order_moves = order_watchers()
+                    rate = estimated_requests_per_minute([*reminders, *order_levels], [*move_alerts, *order_moves],
+                                                         warm, _no_data)
                     tiers = describe_tiers(reminders, warm)
                     # Report tokens currently returning nothing, not just those
                     # past the give-up threshold. The backoff slows how fast a

@@ -22,7 +22,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from .. import rhchain
+from .. import rhchain, views
 from ..config import (
     RHC_CONFIRM_TIMEOUT,
     RHC_DEFAULT_SLIPPAGE_BPS,
@@ -51,11 +51,11 @@ from ..helpers import (
     when,
 )
 from ..logging_setup import log
-from ..rhc import chain, guard, kyber, ledger, pnl, portfolio, swap, wallets
+from ..rhc import chain, kyber, ledger, pnl, portfolio, swap, trade, wallets
 from ..tables import add_table_fields
 from ..views import ConfirmOrder
 
-THIN_POOL_USD = 25_000   # below this, warn that 2% slippage will often not survive the send
+THIN_POOL_USD = trade.THIN_POOL_USD
 
 CUSTODY_WARNING = (
     "**Read this once.** McCap holds this wallet's key, encrypted, on its server. Whoever runs the "
@@ -67,6 +67,13 @@ CUSTODY_WARNING = (
 # Prompts, refusals, the withdraw flow and the key export never use this: they
 # are always private.
 PRIVATE = not RHC_PUBLIC_REPLIES
+
+# Shown once, privately, after someone's first buy lands.
+FIRST_BUY_TIP = (
+    f"💡 First buy{SEP}the buttons under the receipt sell part or all of it (each still asks you to confirm)"
+    f"{SEP}**TP / SL** arms a take-profit and stop-loss that fire once without asking again"
+    f"{SEP}`/rh holdings` any time{SEP}`/rh tutorial` for the rest"
+)
 
 
 def _gate() -> Optional[str]:
@@ -107,19 +114,23 @@ def clamp_slippage(bps: Optional[int]) -> int:
     return max(10, min(v, RHC_MAX_SLIPPAGE_BPS))
 
 
-def _eth(wei: Optional[int]) -> str:
-    """An ETH amount from integer wei, exact, trailing zeros dropped."""
-    return chain.fmt_units(wei, 18) if wei is not None else UNKNOWN
+# The money path lives in rhc/trade.py; these names stay for callers and tests.
+_eth = trade.eth
+_entry_mc = trade.entry_mc
 
 
-def _entry_mc(usd_in: Optional[float], tokens: float, info: Optional[dict]) -> Optional[float]:
-    """The market cap at the price just paid, in today's supply terms: what the
-    buyer will later compare against. None when the price is unknown."""
-    price = (info or {}).get("price")
-    mc = (info or {}).get("mc")
-    if not usd_in or tokens <= 0 or not price or not mc:
-        return None
-    return (usd_in / tokens) * (mc / price)
+def deny_reason(user_id: int, guild_id: Optional[int]) -> Optional[Tuple[str, str]]:
+    """Why this person may not trade here: (kind, text) or None. Allowlist first,
+    so a stranger learns nothing about the vault's state. Kinds: ``allowlist``,
+    ``guild``, ``gate`` (kill switch or vault; may pass later)."""
+    if not allowed(user_id):
+        return "allowlist", "You are not on the trader allowlist."
+    if not guild_ok(guild_id):
+        return "guild", "Trading commands are not enabled here."
+    reason = _gate()
+    if reason:
+        return "gate", reason
+    return None
 
 
 class RhcCog(commands.Cog):
@@ -144,30 +155,33 @@ class RhcCog(commands.Cog):
     # ---------------- gates ----------------
 
     @staticmethod
-    async def _send_private(inter: discord.Interaction, text: str) -> None:
+    async def _send_private(inter: discord.Interaction, text: str, view: Optional[discord.ui.View] = None) -> None:
         """An always-private message, whether or not the interaction was deferred yet."""
+        kw = {"ephemeral": True}
+        if view is not None:
+            kw["view"] = view
         if inter.response.is_done():
-            await inter.followup.send(text, ephemeral=True)
+            await inter.followup.send(text, **kw)
         else:
-            await inter.response.send_message(text, ephemeral=True)
+            await inter.response.send_message(text, **kw)
 
     async def _deny_trade(self, inter: discord.Interaction) -> bool:
-        """Reply and return True when the caller may not trade here.
-
-        Allowlist first, so a stranger learns nothing about the vault's state.
-        """
-        if not allowed(inter.user.id):
+        """Reply and return True when the caller may not trade here."""
+        why = deny_reason(inter.user.id, inter.guild_id)
+        if why is None:
+            return False
+        kind, text = why
+        if kind == "allowlist":
             log.warning("Rejected /rh trade command from non-allowlisted user %s", inter.user.id)
-            await self._send_private(inter, "🔒 You are not on the trader allowlist.")
-            return True
-        if not guild_ok(inter.guild_id):
-            await self._send_private(inter, "🔒 Trading commands are not enabled here.")
-            return True
-        reason = _gate()
-        if reason:
-            await self._send_private(inter, f"🔒 {reason}")
-            return True
-        return False
+            text += f"{SEP}`/rh tutorial` explains how trading works"
+        await self._send_private(inter, f"🔒 {text}")
+        return True
+
+    async def _no_wallet(self, inter: discord.Interaction) -> None:
+        """The refusal a newcomer meets first, so it points at the way in."""
+        await self._send_private(
+            inter, f"You have no wallet yet.{SEP}`/rh wallet create` makes one{SEP}`/rh tutorial` explains the rest",
+        )
 
     async def _deny_own_funds(self, inter: discord.Interaction) -> bool:
         """Export and withdraw: yours if you have a wallet, regardless of the kill switch."""
@@ -198,11 +212,7 @@ class RhcCog(commands.Cog):
         raise ValueError(f"Unknown token {q!r}. Pass a contract address (see /rh trending for the busy ones).")
 
     async def _eth_usd(self) -> Optional[float]:
-        try:
-            s = await token_summary(chain.WETH)
-            return (s or {}).get("price")
-        except Exception:
-            return None
+        return await trade.eth_usd()
 
     # ---------------- groups ----------------
 
@@ -224,6 +234,10 @@ class RhcCog(commands.Cog):
         if await self._deny_trade(inter):
             return
         await inter.response.defer(thinking=True, ephemeral=priv)
+        await self._create_wallet(inter, priv)
+
+    async def _create_wallet(self, inter: discord.Interaction, priv: bool) -> None:
+        """After the defer: mint the wallet and say what to do next. Shared with the Create wallet button."""
         try:
             w = await wallets.create(inter.user.id, label=inter.user.display_name)
         except wallets.VaultError as e:
@@ -237,7 +251,8 @@ class RhcCog(commands.Cog):
             f"✅ **{inter.user.display_name}**'s Robinhood Chain wallet\n`{w.address}`\n"
             f"Fund it by withdrawing **ETH on Robinhood Chain** from the Robinhood app to that address. "
             f"Gas is paid in ETH.\n\n{CUSTODY_WARNING}\n\n"
-            f"[Explorer]({chain.explorer_address(w.address)})",
+            f"Next{SEP}fund it, then `/rh buy <token> usd:5` or pick a token from `/rh trending`{SEP}"
+            f"`/rh tutorial` walks through it\n[Explorer]({chain.explorer_address(w.address)})",
             ephemeral=priv, suppress_embeds=True,
         )
 
@@ -248,7 +263,10 @@ class RhcCog(commands.Cog):
         w = wallets.get(inter.user.id)
         if w is None:
             problem = _vault_problem() if not wallets.loaded() else None
-            await self._send_private(inter, problem or "You have no wallet yet. `/rh wallet create` makes one.")
+            if problem:
+                await self._send_private(inter, problem)
+            else:
+                await self._no_wallet(inter)
             return
         await inter.response.defer(thinking=True, ephemeral=priv)
         try:
@@ -371,13 +389,20 @@ class RhcCog(commands.Cog):
             return
         w = wallets.get(inter.user.id)
         if w is None:
-            await self._send_private(inter, "You have no wallet yet. `/rh wallet create` makes one.")
+            await self._no_wallet(inter)
             return
         if (eth is None) == (usd is None):
             await self._send_private(inter, "Give either `eth` or `usd`, e.g. `/rh buy PONS eth:0.01` or `/rh buy PONS usd:5`.")
             return
         await inter.response.defer(thinking=True, ephemeral=True)
-        bps = clamp_slippage(slippage_bps)
+        await self._run_buy(inter, w, token, eth=eth, usd=usd, bps=clamp_slippage(slippage_bps), priv=priv, source="slash")
+
+    async def _run_buy(self, inter: discord.Interaction, w: wallets.Wallet, token: str, *, eth: Optional[str],
+                       usd: Optional[float], bps: int, priv: bool, source: str) -> None:
+        """From a deferred, private interaction to a receipt: quote, Confirm,
+        settle. The slash command and every Buy button end up here, so the
+        guards in rhc/trade.py are the guards each of them gets."""
+        uid = inter.user.id
         eth_usd = await self._eth_usd()
         try:
             addr, sym, dec = await self._resolve_token(token)
@@ -389,62 +414,19 @@ class RhcCog(commands.Cog):
                 amount = int(usd / eth_usd * 1e18)
             else:
                 amount = chain.to_units(eth, 18)
-            rt = await kyber.route(chain.NATIVE, addr, amount)
+            plan = await trade.plan_buy(uid, w.address, addr, sym, dec, amount, bps, eth_usd)
+        except trade.Refusal as r:
+            await inter.followup.send(str(r), ephemeral=True)
+            return
         except (ValueError, kyber.KyberError, chain.ChainError) as e:
             await inter.followup.send(f"❌ {e}", ephemeral=True)
             return
 
-        usd, why = await self._usd_basis(rt, amount, eth_usd)
-        if usd is None:
-            await inter.followup.send(f"🚫 {why}", ephemeral=True)
-            return
-        ok, why = ledger.check(inter.user.id, usd)
-        if not ok:
-            await inter.followup.send(f"🚫 {why}", ephemeral=True)
-            return
-        # Enough ETH for the trade AND its gas, said with numbers, before the
-        # confirm prompt rather than after a reservation.
-        try:
-            bal = await chain.native_balance(w.address)
-            gas_price = await chain.gas_price()
-        except chain.ChainError:
-            await inter.followup.send("❌ Could not read your balance on Robinhood Chain. Try again.", ephemeral=True)
-            return
-        need = amount + (rt.gas * (100 + swap.GAS_BUFFER_PCT) // 100) * gas_price * swap.FEE_MULTIPLIER
-        if bal < need:
-            await inter.followup.send(
-                f"🚫 Not enough ETH: you have {_eth(bal)} ETH and this needs about "
-                f"{_eth(need)} ETH including gas. Fund the wallet or size down.", ephemeral=True,
-            )
-            return
-        back, unavailable = await self._round_trip(addr, rt.amount_out)
-        if unavailable:
-            await inter.followup.send("❌ KyberSwap is not answering right now, so the sell-back check cannot run. "
-                                      "Try again in a minute.", ephemeral=True)
-            return
-        if back is None:
-            await inter.followup.send(
-                f"🚫 **{sym}** cannot be sold back for ETH right now (no route). That is what a honeypot looks "
-                f"like; refusing to buy.", ephemeral=True,
-            )
-            return
-
-        # Liquidity tells the user whether the default slippage will survive
-        # the few seconds between quote and send.
-        info = None
-        liq = None
-        try:
-            info = await token_summary(addr)
-            liq = (info or {}).get("liq")
-        except Exception:
-            pass
-        text = self._quote_text(rt, addr, sym, dec, back, False, liq)
-        if liq is not None and liq < THIN_POOL_USD and bps < 500:
-            text += (f"\n⚠️ **Thin pool**{SEP}{pct(bps / 100, signed=False)} slippage often fails here; "
-                     f"re-run with `slippage_bps:500` if it does")
+        text = trade.quote_text(plan.rt, addr, sym, dec, plan.back, False, plan.liq)
+        if plan.thin_pool:
+            text += "\n" + trade.thin_pool_line(bps)
         text += f"\nSlippage {pct(bps / 100, signed=False)}{SEP}expires {when(time.time() + RHC_CONFIRM_TIMEOUT)}"
-
-        view = ConfirmOrder(inter.user.id, RHC_CONFIRM_TIMEOUT)
+        view = ConfirmOrder(uid, RHC_CONFIRM_TIMEOUT)
         await inter.followup.send(text, view=view, ephemeral=True)
         await view.wait()
         if not view.value:
@@ -452,71 +434,28 @@ class RhcCog(commands.Cog):
                                       if view.value is None else "Cancelled, nothing was bought.", ephemeral=True)
             return
 
-        # The confirmed numbers are the deal. Always re-quote after the click (a
-        # route is good for ~10s and the button sat for longer than that) and
-        # refuse if the fresh output is below the floor the user confirmed; the
-        # price moved, they get to decide again.
-        confirmed_floor = kyber.min_out(rt.amount_out, bps)
+        # The confirmed numbers are the deal: the fresh quote taken at settle
+        # time may not undercut the floor the user agreed to.
+        floor = kyber.min_out(plan.rt.amount_out, bps)
+        first = not ledger.history(uid)
+        extra = {"decimals": dec, "eth_usd": eth_usd, "mc_usd": (plan.info or {}).get("mc"),
+                 "price_usd": (plan.info or {}).get("price"), "source": source}
         try:
-            rt = await kyber.route(chain.NATIVE, addr, amount)
+            res, built, _basis = await trade.settle_buy(uid, w.address, plan, confirmed_floor=floor, extra=extra)
+        except trade.Refusal as r:
+            await inter.followup.send(str(r), ephemeral=True)
+            return
         except kyber.KyberError as e:
-            await inter.followup.send(f"❌ {e}", ephemeral=True)
+            await self._reply(inter, f"❌ {e}", priv)
             return
-        if rt.amount_out < confirmed_floor:
-            await inter.followup.send(
-                f"🚫 The price moved while you were confirming: {chain.fmt_units(rt.amount_out, dec)} {sym} now "
-                f"vs the {chain.fmt_units(confirmed_floor, dec)} floor you confirmed. Nothing was bought; "
-                f"run the command again.", ephemeral=True,
-            )
-            return
-        # Reserve the spend BEFORE the swap so two confirms cannot both pass the
-        # cap. The ETH price was fetched before the prompt; no round trip here.
-        usd, why = await self._usd_basis(rt, amount, eth_usd)
-        if usd is None:
-            await inter.followup.send(f"🚫 {why}", ephemeral=True)
-            return
-        ok, why = ledger.check(inter.user.id, usd)
-        if not ok:
-            await inter.followup.send(f"🚫 {why}", ephemeral=True)
-            return
-        try:
-            ledger.record(inter.user.id, usd)
         except Exception:
-            log.exception("Ledger write failed for user %s", inter.user.id)
-            await inter.followup.send("❌ The spend ledger could not be written; refusing to trade.", ephemeral=True)
+            log.exception("Buy failed for user %s", uid)
+            await self._reply(inter, "❌ internal error; nothing should have been sent, but check the explorer", priv)
             return
-        # Journaled with the trade so holdings and profit can be built from it.
-        extra = {"decimals": dec, "eth_usd": eth_usd,
-                 "mc_usd": (info or {}).get("mc"), "price_usd": (info or {}).get("price")}
-        try:
-            built = await kyber.build(rt, w.address, bps)
-            built.min_out = max(built.min_out, confirmed_floor)
-            res = await swap.execute(inter.user.id, built, addr, sym, extra)
-            # A thin pool moves in the seconds between quote and send. When the
-            # pre-flight simulation says the slippage floor would not be met,
-            # nothing was sent, so one fresh quote and retry is free. The
-            # confirmed floor still applies: the user never gets less than they
-            # agreed to.
-            if not res.ok and not res.pending and guard.is_slippage_revert(res.error):
-                rt2 = await kyber.route(chain.NATIVE, addr, amount)
-                if rt2.amount_out >= confirmed_floor:
-                    built = await kyber.build(rt2, w.address, bps)
-                    built.min_out = max(built.min_out, confirmed_floor)
-                    res = await swap.execute(inter.user.id, built, addr, sym, extra)
-        except Exception as e:  # noqa: BLE001
-            log.exception("Buy failed for user %s", inter.user.id)
-            self._refund(inter.user.id, usd)
-            msg = str(e) if isinstance(e, kyber.KyberError) else "internal error; nothing should have been sent, but check the explorer"
-            await self._reply(inter, f"❌ {msg}", priv)
-            return
-        if not res.ok and not res.pending:
-            self._refund(inter.user.id, usd)
-        out_raw = res.amount_out if res.amount_out is not None else built.amount_out
-        got = f"{chain.fmt_units(out_raw, dec)} {sym}" + ("" if res.amount_out is not None else " (quoted)")
-        spent = f"{_eth(amount)} ETH ({usd_str(built.amount_in_usd)})"
-        entry = _entry_mc(built.amount_in_usd, out_raw / 10 ** dec, info)
-        tail = f"{SEP}in at {usd_str(entry)} MC" if entry else ""
-        await self._reply(inter, self._describe(res, f"Bought {got} for {spent}{tail}"), priv)
+        if first and (res.ok or res.pending):
+            await inter.followup.send(FIRST_BUY_TIP, ephemeral=True)
+        await self._reply(inter, trade.describe(res, trade.buy_success(res, built, plan)), priv,
+                          view=self._receipt_view(uid, addr) if (res.ok or res.pending) else None)
 
     @rhc.command(name="sell", description="Sell a percentage of a token you hold for ETH (asks to confirm)")
     @app_commands.describe(
@@ -530,28 +469,30 @@ class RhcCog(commands.Cog):
             return
         w = wallets.get(inter.user.id)
         if w is None:
-            await self._send_private(inter, "You have no wallet yet.")
+            await self._no_wallet(inter)
             return
         await inter.response.defer(thinking=True, ephemeral=True)
-        pct_sold = max(1, min(int(percent), 100))
-        bps = clamp_slippage(slippage_bps)
+        await self._run_sell(inter, w, token, percent, bps=clamp_slippage(slippage_bps), priv=priv, source="slash")
+
+    async def _run_sell(self, inter: discord.Interaction, w: wallets.Wallet, token: str, percent: int, *,
+                        bps: int, priv: bool, source: str) -> None:
+        """Deferred, private interaction to a receipt; the slash command and every Sell button end up here."""
+        uid = inter.user.id
         try:
             addr, sym, dec = await self._resolve_token(token)
-            have = await chain.erc20_balance(addr, w.address)
-            if have <= 0:
-                await inter.followup.send(f"You hold no {sym}.", ephemeral=True)
-                return
-            amount = have * pct_sold // 100
-            rt = await kyber.route(addr, chain.NATIVE, amount)
+            plan = await trade.plan_sell(uid, w.address, addr, sym, dec, percent, bps)
+        except trade.Refusal as r:
+            await inter.followup.send(str(r).strip(), ephemeral=True)
+            return
         except (ValueError, kyber.KyberError, chain.ChainError) as e:
             await inter.followup.send(f"❌ {e}", ephemeral=True)
             return
 
-        view = ConfirmOrder(inter.user.id, RHC_CONFIRM_TIMEOUT)
+        view = ConfirmOrder(uid, RHC_CONFIRM_TIMEOUT)
         await inter.followup.send(
-            f"Sell **{chain.fmt_units(amount, dec)} {sym}** ({pct_sold}% of {chain.fmt_units(have, dec)}) for "
-            f"**≈ {_eth(rt.amount_out)} ETH ({usd_str(rt.amount_out_usd)})**?\n`{addr}`\n"
-            f"Slippage {pct(bps / 100, signed=False)}{SEP}gas ≈ {usd_str(rt.gas_usd)}{SEP}"
+            f"Sell **{chain.fmt_units(plan.amount, dec)} {sym}** ({plan.pct}% of {chain.fmt_units(plan.have, dec)}) for "
+            f"**≈ {_eth(plan.rt.amount_out)} ETH ({usd_str(plan.rt.amount_out_usd)})**?\n`{addr}`\n"
+            f"Slippage {pct(bps / 100, signed=False)}{SEP}gas ≈ {usd_str(plan.rt.gas_usd)}{SEP}"
             f"expires {when(time.time() + RHC_CONFIRM_TIMEOUT)}",
             view=view, ephemeral=True,
         )
@@ -560,52 +501,30 @@ class RhcCog(commands.Cog):
             await inter.followup.send("⏲️ Expired, nothing was sold. Run it again and press Confirm."
                                       if view.value is None else "Cancelled, nothing was sold.", ephemeral=True)
             return
-        confirmed_floor = kyber.min_out(rt.amount_out, bps)
-        # Where this token stands against the entry: the multiple people quote
-        # ("bought at 50K, sold at 200K, 4x") is the price now over the price
-        # paid, with the entry restated as a market cap at today's supply.
-        info = None
+        floor = kyber.min_out(plan.rt.amount_out, bps)
+        info = await trade.summary(addr)
+        extra = {**trade.sell_extra(uid, addr, dec, info), "source": source}
         try:
-            info = await token_summary(addr)
-        except Exception:
-            pass
-        entry = pnl.entry_for(inter.user.id, addr)
-        mc_now = (info or {}).get("mc")
-        multiple = entry_mc = None
-        if entry is not None:
-            entry.price_now = (info or {}).get("price")
-            entry.mc_now = mc_now
-            multiple, entry_mc = entry.multiple_now, entry.entry_mc
-        extra = {"decimals": dec, "mc_usd": mc_now, "price_usd": (info or {}).get("price"),
-                 "entry_mc": entry_mc, "multiple": multiple}
-        try:
-            rt = await kyber.route(addr, chain.NATIVE, amount)   # always fresh after the click
-            if rt.amount_out < confirmed_floor:
-                await inter.followup.send(
-                    f"🚫 The price moved while you were confirming: {_eth(rt.amount_out)} ETH now vs "
-                    f"the {_eth(confirmed_floor)} floor you confirmed. Nothing was sold; run it again.",
-                    ephemeral=True,
-                )
-                return
-            built = await kyber.build(rt, w.address, bps)
-            built.min_out = max(built.min_out, confirmed_floor)
-            res = await swap.execute(inter.user.id, built, addr, sym, extra)
+            res, built = await trade.settle_sell(uid, w.address, plan, confirmed_floor=floor, extra=extra)
+        except trade.Refusal as r:
+            await inter.followup.send(str(r), ephemeral=True)
+            return
         except kyber.KyberError as e:
             await inter.followup.send(f"❌ {e}", ephemeral=True)
             return
         except Exception:
-            log.exception("Sell failed for user %s", inter.user.id)
+            log.exception("Sell failed for user %s", uid)
             await inter.followup.send("❌ Internal error during the sell. Check your balances and the explorer "
                                       "before retrying.", ephemeral=True)
             return
-        out_raw = res.amount_out if res.amount_out is not None else built.amount_out
-        got = f"{_eth(out_raw)} ETH ({usd_str(built.amount_out_usd)})" + ("" if res.amount_out is not None else " (quoted)")
-        tail = ""
-        if res.ok and multiple is not None:
-            tail = f"{SEP}**{mult(multiple)}** from your entry"
-            if entry_mc and mc_now:
-                tail += f" ({usd_str(entry_mc)} → {usd_str(mc_now)} MC)"
-        await self._reply(inter, self._describe(res, f"Sold {chain.fmt_units(amount, dec)} {sym} for {got}{tail}"), priv)
+        panel = self._receipt_view(uid, addr, partial=True) if (res.ok and plan.pct < 100) else None
+        await self._reply(inter, trade.describe(res, trade.sell_success(res, built, plan, extra)), priv, view=panel)
+
+    @staticmethod
+    def _receipt_view(uid: int, addr: str, partial: bool = False):
+        """The buttons under a receipt, or None until the button layer exists."""
+        maker = getattr(views, "partial_sell_row" if partial else "receipt_row", None)
+        return maker(uid, addr) if maker else None
 
     # ---------------- your book ----------------
 
@@ -615,7 +534,7 @@ class RhcCog(commands.Cog):
         priv = PRIVATE or not public
         w = wallets.get(inter.user.id)
         if w is None:
-            await self._send_private(inter, "You have no wallet yet.")
+            await self._no_wallet(inter)
             return
         await inter.response.defer(thinking=True, ephemeral=priv)
         u = await pnl.user_pnl(inter.user.id, w.address)
@@ -654,7 +573,7 @@ class RhcCog(commands.Cog):
         priv = PRIVATE or not public
         w = wallets.get(inter.user.id)
         if w is None:
-            await self._send_private(inter, "You have no wallet yet.")
+            await self._no_wallet(inter)
             return
         await inter.response.defer(thinking=True, ephemeral=priv)
         n = max(1, min(int(count or 10), 25))
@@ -692,7 +611,7 @@ class RhcCog(commands.Cog):
         priv = PRIVATE or not public
         w = wallets.get(inter.user.id)
         if w is None:
-            await self._send_private(inter, "You have no wallet yet.")
+            await self._no_wallet(inter)
             return
         await inter.response.defer(thinking=True, ephemeral=priv)
         u = await pnl.user_pnl(inter.user.id, w.address)
@@ -978,36 +897,27 @@ class RhcCog(commands.Cog):
         return choices
 
     # ---------------- helpers ----------------
+    # Thin delegations to rhc/trade.py, kept so callers and tests have one
+    # stable place to patch.
 
     async def _usd_basis(self, rt: kyber.Route, amount_wei: int,
                          eth_usd: Optional[float] = None) -> Tuple[Optional[float], str]:
-        """Dollar size of an ETH-in trade for the caps: the LARGER of Kyber's
-        amountInUsd and amount × DexScreener's ETH price, so a single wrong feed
-        cannot shrink a trade under the cap. (None, reason) when neither prices it.
-        Pass ``eth_usd`` when it was already fetched; the post-confirm path must
-        not spend a network round trip while a fresh quote is aging."""
-        if eth_usd is None:
-            eth_usd = await self._eth_usd()
-        alt = amount_wei / 1e18 * eth_usd if eth_usd else None
-        kyber_usd = rt.amount_in_usd if rt.amount_in_usd > 0 else None
-        if kyber_usd and alt:
-            if abs(alt - kyber_usd) / max(alt, kyber_usd) > 0.2:
-                log.warning("USD disagreement for %s wei: Kyber $%.2f vs DexScreener $%.2f", amount_wei, kyber_usd, alt)
-            return max(kyber_usd, alt), ""
-        if kyber_usd or alt:
-            return kyber_usd or alt, ""
-        return None, ("Could not price this trade in USD (neither KyberSwap nor DexScreener gave a figure), "
-                      "so the caps cannot be checked. Refusing.")
+        return await trade.usd_basis(rt, amount_wei, eth_usd)
 
     @staticmethod
-    async def _reply(inter: discord.Interaction, text: str, private: bool = False) -> None:
+    async def _reply(inter: discord.Interaction, text: str, private: bool = False,
+                     view: Optional[discord.ui.View] = None) -> None:
         """Deliver a trade result, publicly when configured, and even if the
-        followup fails: the tx hash must reach the user."""
+        followup fails: the tx hash must reach the user. A view (the receipt's
+        buttons) rides along when the followup works; the DM fallback drops it."""
         priv = private
         if not priv:
             text = f"**{inter.user.display_name}**{SEP}{text}"
+        kw = {"ephemeral": priv, "suppress_embeds": True}
+        if view is not None:
+            kw["view"] = view
         try:
-            await inter.followup.send(text, ephemeral=priv, suppress_embeds=True)
+            await inter.followup.send(text, **kw)
         except Exception:
             log.exception("Followup failed for user %s; falling back to DM", inter.user.id)
             try:
@@ -1017,51 +927,19 @@ class RhcCog(commands.Cog):
 
     @staticmethod
     def _refund(user_id: int, usd: float) -> None:
-        try:
-            ledger.refund(user_id, usd)
-        except Exception:
-            log.exception("Ledger refund failed for user %s", user_id)
+        trade.refund(user_id, usd)
 
     async def _round_trip(self, token: str, amount_out: int) -> Tuple[Optional[kyber.Route], bool]:
-        """(sell-back route or None, kyber_unavailable).
-
-        None with unavailable=False means Kyber says there is no way back: honeypot
-        territory. None with unavailable=True means we simply could not ask.
-        """
-        try:
-            return await kyber.route(token, chain.NATIVE, amount_out), False
-        except kyber.NoRoute:
-            return None, False
-        except kyber.KyberError:
-            return None, True
+        return await trade.round_trip(token, amount_out)
 
     @staticmethod
     def _quote_text(rt: kyber.Route, addr: str, sym: str, dec: int, back: Optional[kyber.Route],
                     unavailable: bool, liq: Optional[float] = None) -> str:
-        """The confirm prompt's body: the deal in one line, then what backs it."""
-        head = (f"Buy **{chain.fmt_units(rt.amount_out, dec)} {sym}** for "
-                f"**{_eth(rt.amount_in)} ETH ({usd_str(rt.amount_in_usd)})**?")
-        if unavailable:
-            back_line = "⚠️ Could not check the sell route back to ETH (KyberSwap did not answer)"
-        elif back is None:
-            back_line = "⚠️ **No sell route back to ETH.** Honeypot until proven otherwise"
-        elif rt.amount_in > 0:
-            rt_pct = (back.amount_out / rt.amount_in - 1.0) * 100.0
-            flag = "⚠️ " if rt_pct < -25 else ""
-            back_line = f"{flag}Sells straight back for {_eth(back.amount_out)} ETH ({pct(rt_pct)} round trip)"
-        else:
-            back_line = ""
-        facts = footer(back_line, f"liquidity {usd_str(liq)}" if liq is not None else "", f"gas ≈ {usd_str(rt.gas_usd)}")
-        return f"{head}\n{facts}\n`{addr}`"
+        return trade.quote_text(rt, addr, sym, dec, back, unavailable, liq)
 
     @staticmethod
     def _describe(res: swap.SwapResult, success: str) -> str:
-        if res.ok:
-            return f"✅ {success}\n[Transaction]({res.explorer})"
-        if res.pending:
-            return f"⏳ {res.error}\n[Transaction]({res.explorer})"
-        link = f"\n[Transaction]({res.explorer})" if res.tx else ""
-        return f"❌ {res.error}{link}"
+        return trade.describe(res, success)
 
 
 async def setup(bot: commands.Bot):

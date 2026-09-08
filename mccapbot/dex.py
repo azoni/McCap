@@ -50,6 +50,19 @@ def _liq_vol_tx(p: Dict) -> Tuple[float,float,int]:
     txc=int(tx.get("buys") or 0)+int(tx.get("sells") or 0)
     return liq,vol,txc
 
+def volume_1h(pairs: List[Dict], ca: str) -> float:
+    """Dollar volume in the last hour across every pool where this token is the
+    base asset. A pair without an ``h1`` figure counts as zero, so a token
+    with no trades reads 0.0 rather than None."""
+    total = 0.0
+    for p in _own_pairs(pairs, ca):
+        try:
+            total += float((p.get("volume") or {}).get("h1") or 0.0)
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
 def _lp_score(liq: float, vol: float, tx: int) -> float:
     return (math.log10(1+liq)*0.5) + (math.log10(1+vol)*0.4) + (math.log10(1+tx)*0.2)
 
@@ -223,6 +236,8 @@ async def token_summary(ca: str) -> Optional[Dict]:
         "price": (float(best.get("priceUsd")) if best.get("priceUsd") else None),
         "liq": liq,
         "vol24": vol,
+        "vol1h": volume_1h(data["pairs"], ca),
+        "chain": best.get("chainId", "") or "",
         "change24": change24,
         "pools": len(own),
         "url": build_token_url(ca, best),

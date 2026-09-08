@@ -38,7 +38,9 @@ def progress_to_target(direction: str, current_mc: Optional[float], target_mc: f
     approaches the target from above, so the ratio inverts to target/current.
     Returns None when there is no usable market cap to judge from.
     """
-    if current_mc is None or current_mc <= 0 or target_mc <= 0:
+    # ``not target_mc`` also covers None: an auto-order on 1h volume duck-types
+    # as a level alert with no market-cap target.
+    if current_mc is None or current_mc <= 0 or not target_mc or target_mc <= 0:
         return None
     if direction == "above":
         return current_mc / target_mc

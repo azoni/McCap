@@ -5,200 +5,18 @@ pending broadcast, and a stale re-quote below the confirmed floor stops the
 trade. The chain, Kyber and the executor are all faked; nothing is signed.
 """
 
-import os
-import time
-from types import SimpleNamespace
-
 import pytest
 
 from mccapbot import rhchain
 from mccapbot.cogs import rhc as cog
-from mccapbot.rhc import chain, kyber, ledger, pnl, portfolio, swap, wallets
-
-USER = 7
-PONS = "0x39dbed3a2bd333467115de45665cc57f813c4571"
-WALLET = "0x" + "a1" * 20
-
-
-class FakeFollowup:
-    def __init__(self):
-        self.sent = []
-
-    async def send(self, content=None, **kw):
-        self.sent.append((content, kw))
-        return SimpleNamespace()
-
-
-class FakeResponse:
-    """Tracks whether the interaction was answered, like discord.py's InteractionResponse."""
-
-    def __init__(self, sink):
-        self.done = False
-        self.deferred_ephemeral = None
-        self._sink = sink
-
-    def is_done(self):
-        return self.done
-
-    async def defer(self, **kw):
-        self.done = True
-        self.deferred_ephemeral = kw.get("ephemeral")
-
-    async def send_message(self, content=None, **kw):
-        self.done = True
-        self._sink.append((content, {**kw, "via": "response"}))
-
-
-class FakeInteraction:
-    def __init__(self, user_id=USER, guild_id=1):
-        self.user = SimpleNamespace(id=user_id, display_name="tester", send=self._dm)
-        self.guild_id = guild_id
-        self.followup = FakeFollowup()
-        self.response = FakeResponse(self.followup.sent)
-        self.dms = []
-
-    async def _dm(self, content=None, **kw):
-        self.dms.append(content)
-
-    @property
-    def texts(self):
-        return [c for c, _ in self.followup.sent if c]
-
-    @property
-    def last(self):
-        return self.texts[-1] if self.texts else ""
-
-    @property
-    def last_kw(self):
-        return self.followup.sent[-1][1] if self.followup.sent else {}
-
-
-class Confirmed:
-    """Stands in for ConfirmOrder: the click already happened."""
-    value = True
-
-    def __init__(self, owner_id, timeout):
-        pass
-
-    async def wait(self):
-        return
-
-
-def route(token_in, token_out, amount_in, amount_out, usd_in=24.8, usd_out=24.7):
-    return kyber.Route(token_in=token_in, token_out=token_out, amount_in=amount_in, amount_out=amount_out,
-                       amount_in_usd=usd_in, amount_out_usd=usd_out, gas=1, gas_usd=0.49,
-                       router=kyber.RHC_KYBER_ROUTER, summary={}, hops=["uniswap-v4"])
-
-
-class World:
-    """Everything the command touches, in one mutable place."""
-
-    def __init__(self):
-        self.buy_route = route(chain.NATIVE, PONS, 10**16, 36 * 10**18)
-        self.requotes = []                  # routes returned on re-quote, in order
-        self.back = route(PONS, chain.NATIVE, 36 * 10**18, 10**16 * 99 // 100)
-        self.back_error = None
-        self.sell_route = route(PONS, chain.NATIVE, 18 * 10**18, 5 * 10**15)
-        self.eth_usd = 2500.0
-        self.result = swap.SwapResult(ok=True, tx="0xabc", amount_out=36 * 10**18, gas_cost_wei=10**14)
-        self.executed = []                  # BuiltSwap objects handed to swap.execute
-        self.token_balance = 36 * 10**18
-        self.eth_balance = 10**18
-        self.liquidity = 500_000.0
-        self.mc_now = 500_000_000.0
-        self.results = []                   # optional sequence of results for successive executes
-        self.route_calls = 0
-
-    def install(self, monkeypatch):
-        w = self
-
-        async def kroute(token_in, token_out, amount_in):
-            w.route_calls += 1
-            if token_in.lower() == chain.NATIVE.lower():
-                if w.requotes and w.route_calls > 1:
-                    return w.requotes.pop(0)
-                return w.buy_route
-            if w.back_error:
-                raise w.back_error
-            return w.sell_route if amount_in == 18 * 10**18 else w.back
-
-        async def kbuild(rt, sender, bps, recipient=None):
-            assert sender.lower() == WALLET.lower()
-            return kyber.BuiltSwap(router=rt.router, data="0xe21fd0e9", value=rt.amount_in if rt.token_in == chain.NATIVE else 0,
-                                   amount_in=rt.amount_in, amount_out=rt.amount_out, amount_in_usd=rt.amount_in_usd,
-                                   amount_out_usd=rt.amount_out_usd, gas=1, gas_usd=0.49, slippage_bps=bps,
-                                   min_out=kyber.min_out(rt.amount_out, bps), route=rt)
-
-        async def execute(user_id, built, token, symbol, extra=None):
-            w.executed.append(built)
-            w.last_extra = extra
-            if w.results:
-                return w.results.pop(0)
-            return w.result
-
-        async def summary(addr):
-            if addr.lower() == chain.WETH.lower():
-                return {"price": w.eth_usd}
-            return {"liq": w.liquidity, "price": 0.7, "mc": w.mc_now}
-        monkeypatch.setattr(cog, "token_summary", summary)
-        monkeypatch.setattr(pnl, "token_summary", summary)
-        monkeypatch.setattr(portfolio, "token_summary", summary)
-        portfolio._cache = None
-
-        async def eth_usd(self_):
-            return w.eth_usd
-
-        async def meta(addr):
-            return ("PONS", 18)
-
-        async def erc20_balance(token, owner):
-            return w.token_balance
-
-        async def native_balance(addr):
-            return w.eth_balance
-
-        async def gas_price():
-            return 300_000_000
-
-        async def estimate_gas(tx):
-            return 21_000
-
-        monkeypatch.setattr(chain, "native_balance", native_balance)
-        monkeypatch.setattr(chain, "gas_price", gas_price)
-        monkeypatch.setattr(chain, "estimate_gas", estimate_gas)
-        monkeypatch.setattr(kyber, "route", kroute)
-        monkeypatch.setattr(kyber, "build", kbuild)
-        monkeypatch.setattr(swap, "execute", execute)
-        monkeypatch.setattr(cog.RhcCog, "_eth_usd", eth_usd)
-        monkeypatch.setattr(chain, "erc20_meta", meta)
-        monkeypatch.setattr(chain, "erc20_balance", erc20_balance)
-
+from mccapbot.rhc import chain, guard, kyber, ledger, swap, wallets
+from tests.rhc_fakes import PONS, USER, FakeInteraction, arm_world, disarm_world, route
 
 @pytest.fixture
 def world(monkeypatch):
-    monkeypatch.setattr(cog, "RHC_TRADING_ENABLE", True)
-    monkeypatch.setattr(cog, "RHC_TRADER_IDS", {USER})
-    monkeypatch.setattr(cog, "RHC_GUILD_IDS", set())
-    monkeypatch.setattr(cog, "ConfirmOrder", Confirmed)
-    monkeypatch.setattr(cog, "PRIVATE", True)          # the visibility test flips this
-    monkeypatch.setattr(wallets, "unlockable", lambda: True)
-    wallets.wallets.clear()
-    wallets._loaded = True
-    wallets.wallets.append(wallets.Wallet(user_id=USER, address=WALLET, salt="", nonce="", ciphertext="", ops=1, mem=1))
-    for p in (ledger.RHC_LEDGER_FILE, ledger.RHC_JOURNAL_FILE):
-        try:
-            os.remove(p)
-        except FileNotFoundError:
-            pass
-    w = World()
-    w.install(monkeypatch)
+    w = arm_world(monkeypatch)
     yield w
-    wallets.wallets.clear()
-    for p in (ledger.RHC_LEDGER_FILE, ledger.RHC_JOURNAL_FILE):
-        try:
-            os.remove(p)
-        except FileNotFoundError:
-            pass
+    disarm_world()
 
 
 async def run_buy(inter, eth="0.01", slippage=None, usd=None):
@@ -427,7 +245,7 @@ async def test_public_mode_posts_results_but_keeps_prompts_and_refusals_private(
 async def test_thin_pool_warning_and_one_retry_on_a_slippage_revert(world):
     world.liquidity = 4_000.0
     world.results = [
-        swap.SwapResult(ok=False, error=cog.guard.SLIPPAGE_TEXT),   # simulation said the floor would not be met
+        swap.SwapResult(ok=False, error=guard.SLIPPAGE_TEXT),   # simulation said the floor would not be met
         swap.SwapResult(ok=True, tx="0xretry", amount_out=36 * 10**18, gas_cost_wei=10**14),
     ]
     inter = FakeInteraction()
@@ -441,8 +259,8 @@ async def test_thin_pool_warning_and_one_retry_on_a_slippage_revert(world):
 @pytest.mark.asyncio
 async def test_slippage_revert_twice_is_reported_plainly_and_refunded(world):
     world.results = [
-        swap.SwapResult(ok=False, error=cog.guard.SLIPPAGE_TEXT),
-        swap.SwapResult(ok=False, error=cog.guard.SLIPPAGE_TEXT),
+        swap.SwapResult(ok=False, error=guard.SLIPPAGE_TEXT),
+        swap.SwapResult(ok=False, error=guard.SLIPPAGE_TEXT),
     ]
     inter = FakeInteraction()
     await run_buy(inter)

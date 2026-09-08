@@ -194,6 +194,18 @@ def trades(user_id: int) -> List[Dict[str, Any]]:
     return [e for e in history(user_id) if e.get("kind") in ("buy", "sell") and e["final_status"] == "confirmed"]
 
 
+def final_status(tx_hash: str) -> Optional[str]:
+    """The latest status the journal holds for a transaction, or None if it was never journaled."""
+    want = (tx_hash or "").lower()
+    if not want:
+        return None
+    status = None
+    for e in _all():
+        if (e.get("tx") or "").lower() == want and e.get("status"):
+            status = str(e["status"])
+    return status
+
+
 def entry_for_tx(user_id: int, tx_hash: str) -> Optional[Dict[str, Any]]:
     """The original (non-resolution) record of a transaction, if journaled."""
     for e in entries_for(user_id):

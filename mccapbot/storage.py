@@ -8,6 +8,8 @@ from dataclasses import MISSING, asdict, fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Type, TypeVar
 
+from types import SimpleNamespace
+
 from .config import (
     ALERTS_FILE,
     CHAT_HISTORY_FILE,
@@ -17,11 +19,12 @@ from .config import (
     MAX_SCAN_EVENTS,
     MOVES_FILE,
     REM_FILE,
+    RHC_ORDERS_FILE,
     SCANS_FILE,
     WATCH_FILE,
 )
 from .logging_setup import log
-from .models import AlertEvent, ChatTurn, MemoryNote, MoveAlert, Reminder, ScanEvent, WatchItem
+from .models import AlertEvent, AutoOrder, ChatTurn, MemoryNote, MoveAlert, Reminder, ScanEvent, WatchItem
 
 # In-memory
 reminders: List[Reminder] = []
@@ -31,6 +34,7 @@ alert_events: List[AlertEvent] = []
 scan_events: List[ScanEvent] = []
 memory_notes: List[MemoryNote] = []
 chat_turns: List[ChatTurn] = []
+auto_orders: List[AutoOrder] = []
 
 # Locks
 REM_LOCK = asyncio.Lock()
@@ -262,8 +266,57 @@ def scans_to_track(track_seconds: float, now: float) -> List[ScanEvent]:
 
 
 def watched_addresses() -> List[str]:
-    """Every contract address the watcher needs to poll."""
-    return list({r.ca for r in reminders} | {m.ca for m in move_alerts})
+    """Every contract address the watcher needs to poll: alerts and armed auto-orders."""
+    return list({r.ca for r in reminders} | {m.ca for m in move_alerts} | {o.ca for o in live_orders()})
+
+
+# ---- Auto-orders (take-profit / stop-loss sells, one-shot buys) ----
+ORDERS_LOCK = asyncio.Lock()
+
+# An armed order's token needs a steady price feed however far it sits from its
+# target: a stop-loss in the watcher's 300s cold tier would see a dump five
+# minutes late. This window makes interval_for_move land on its 60s floor.
+ORDER_POLL_WINDOW_SEC = 720
+
+
+async def save_orders() -> None:
+    async with ORDERS_LOCK:
+        _atomic_write(RHC_ORDERS_FILE, [asdict(o) for o in auto_orders])
+
+
+async def load_orders() -> None:
+    await _load_list(RHC_ORDERS_FILE, AutoOrder, auto_orders, "auto order(s)")
+
+
+def live_orders() -> List[AutoOrder]:
+    """Orders that still need a price feed: armed or mid-fire."""
+    return [o for o in auto_orders if o.status in ("armed", "firing")]
+
+
+def orders_for(user_id: int) -> List[AutoOrder]:
+    return [o for o in auto_orders if o.user_id == user_id]
+
+
+def find_order(order_id: str, user_id: int) -> Optional[AutoOrder]:
+    """One of this user's orders by id, or None; never someone else's."""
+    for o in auto_orders:
+        if o.id == order_id and o.user_id == user_id:
+            return o
+    return None
+
+
+def order_watchers():
+    """(level_proxies, move_proxies): what the polling scheduler should treat
+    the armed orders as. Every live order yields a move-like proxy (steady 60s
+    sampling, never backed off); market-cap orders also yield a level-like
+    proxy so the hot tier kicks in within 15% of the target. Keeps one price
+    path for alerts and orders, and puts the orders in the request-rate log."""
+    levels, moves = [], []
+    for o in live_orders():
+        moves.append(SimpleNamespace(ca=o.ca, window_sec=ORDER_POLL_WINDOW_SEC, last_fired_ts=0.0, cooldown_sec=0))
+        if o.metric == "mc":
+            levels.append(SimpleNamespace(ca=o.ca, direction=o.direction, target_mc=o.target))
+    return levels, moves
 
 
 # ---- Chat memory (long-term notes) and rolling conversation ----

@@ -51,12 +51,27 @@ class SwapResult:
 _locks: Dict[int, asyncio.Lock] = {}
 _pending: Dict[int, Tuple[str, float]] = {}   # user_id -> (tx hash, when it was broadcast)
 
+IN_FLIGHT_TEXT = "You already have a transaction in flight. Wait for it to finish."
+
 
 def _lock(user_id: int) -> asyncio.Lock:
     lk = _locks.get(user_id)
     if lk is None:
         lk = _locks[user_id] = asyncio.Lock()
     return lk
+
+
+def has_inflight(user_id: int) -> bool:
+    """True while this wallet is signing/sending or has an unresolved broadcast.
+    The auto-order engine asks before it spawns a fire, so a rule never burns
+    an attempt on a wallet that is busy with the user's own trade."""
+    return _lock(user_id).locked() or user_id in _pending
+
+
+def is_busy_error(msg: Optional[str]) -> bool:
+    """Whether a failed SwapResult only says 'not now' rather than 'no'."""
+    m = msg or ""
+    return m == IN_FLIGHT_TEXT or "is still unconfirmed" in m
 
 
 def restore_pending() -> int:
@@ -86,13 +101,14 @@ def describe_error(e: BaseException) -> str:
     return msg[:200]
 
 
-async def _pending_block(user_id: int) -> Optional[str]:
-    """Reason to refuse because an earlier transaction is still unresolved, or None.
+async def _resolve_pending(user_id: int) -> Optional[str]:
+    """Look at this wallet's unresolved transaction, if any.
 
-    When the receipt finally shows up the journal gets the resolution. When the
-    grace period passes with no receipt, the transaction is treated as dropped
-    by the sequencer: journaled as such and, for a buy, its budget reservation
-    is returned.
+    Returns ``None`` when nothing is pending, ``"pending"`` while the chain has
+    not answered yet, or the final word (``confirmed`` / ``reverted`` /
+    ``dropped``) the moment it is known. Resolution is journaled here; when the
+    grace period passes with no receipt the transaction is treated as dropped
+    by the sequencer and, for a buy, its budget reservation is returned.
     """
     entry = _pending.get(user_id)
     if not entry:
@@ -107,7 +123,7 @@ async def _pending_block(user_id: int) -> Optional[str]:
         status = "confirmed" if int(rec.get("status", 0)) == 1 else "reverted"
         ledger.journal({"ts": time.time(), "user_id": user_id, "tx": tx_hash, "status": status,
                         "kind": "resolution", "gas_cost_wei": str(int(rec.get("gasUsed", 0)) * int(rec.get("effectiveGasPrice", 0) or 0))})
-        return None
+        return status
     if time.time() - since > RHC_PENDING_BLOCK_SECONDS:
         log.warning("Giving up on pending tx %s for user %s; treating it as dropped", tx_hash, user_id)
         _pending.pop(user_id, None)
@@ -118,9 +134,28 @@ async def _pending_block(user_id: int) -> Optional[str]:
                 ledger.refund(user_id, float(original["usd_in"]))
             except Exception:
                 log.exception("Could not refund the reservation for dropped tx %s", tx_hash)
+        return "dropped"
+    return "pending"
+
+
+async def _pending_block(user_id: int) -> Optional[str]:
+    """Reason to refuse because an earlier transaction is still unresolved, or None."""
+    if await _resolve_pending(user_id) != "pending":
         return None
+    tx_hash, _since = _pending[user_id]
     return (f"Your earlier transaction {tx_hash} is still unconfirmed. Check it on the explorer "
             f"({chain.explorer_tx(tx_hash)}) before trading again.")
+
+
+async def poll_pending(user_id: int, tx_hash: str) -> Optional[str]:
+    """Final status of a broadcast this wallet made: ``confirmed`` / ``reverted``
+    / ``dropped``, ``"pending"`` while unknown, or None if the journal never saw
+    it. Used by the auto-order engine to report a fill that was pending when
+    it was made."""
+    entry = _pending.get(user_id)
+    if entry and entry[0].lower() == (tx_hash or "").lower():
+        return await _resolve_pending(user_id)
+    return ledger.final_status(tx_hash)
 
 
 async def _sign_and_send(user_id: int, tx: Dict[str, Any]) -> str:
@@ -214,7 +249,7 @@ async def execute(user_id: int, built: BuiltSwap, token: str, symbol: str,
     """
     lk = _lock(user_id)
     if lk.locked():
-        return SwapResult(ok=False, error="You already have a transaction in flight. Wait for it to finish.")
+        return SwapResult(ok=False, error=IN_FLIGHT_TEXT)
     async with lk:
         blocked = await _pending_block(user_id)
         if blocked:
@@ -369,7 +404,7 @@ async def send_native(user_id: int, to: str, amount_wei: int) -> SwapResult:
     """Withdraw ETH from a user's wallet to an address they gave."""
     lk = _lock(user_id)
     if lk.locked():
-        return SwapResult(ok=False, error="You already have a transaction in flight. Wait for it to finish.")
+        return SwapResult(ok=False, error=IN_FLIGHT_TEXT)
     async with lk:
         blocked = await _pending_block(user_id)
         if blocked:

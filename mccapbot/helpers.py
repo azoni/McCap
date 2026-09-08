@@ -13,6 +13,11 @@ def is_solana_address(addr: str) -> bool:
 def short_ca(ca: str) -> str: return f"{ca[:4]}…{ca[-4:]}"
 
 
+def is_evm_address(s: Optional[str]) -> bool:
+    """0x plus 40 hex characters; the shape a Robinhood Chain token address has."""
+    return re.fullmatch(r"0x[0-9a-fA-F]{40}", s or "") is not None
+
+
 # ---------------- one way to write each kind of number ----------------
 #
 # Every command formats through these, so a market cap, a dollar figure or a
