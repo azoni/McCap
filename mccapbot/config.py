@@ -64,6 +64,7 @@ DEX_MAX_REQUESTS_PER_MIN = _env_int("DEX_MAX_REQUESTS_PER_MIN", 240)
 DEX_BURST = _env_int("DEX_BURST", 50)
 
 DEX_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{address}"
+DEX_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search?q={query}"
 SOLANA_USE_FDV = True
 DEX_BLACKLIST = {"heaven"}
 
@@ -185,10 +186,85 @@ RH_TIMEOUT = _env_int("RH_TIMEOUT", 15)
 # Spend ledger lives on the volume so a redeploy cannot reset the daily cap.
 RH_SPEND_FILE = str(DATA_DIR / "rh_spend.json")
 
-# ---- CoinGecko (movement data for Robinhood-listed coins) ----
-# Robinhood's API has no trending/movers endpoint and its quotes carry no
-# historical reference, so "what's moving" has to come from somewhere else.
-# Free and keyless; one request covers the whole top N.
-COINGECKO_URL = os.getenv("COINGECKO_URL", "https://api.coingecko.com/api/v3/coins/markets")
-COINGECKO_TOP_N = _env_int("COINGECKO_TOP_N", 250)
-COINGECKO_TIMEOUT = _env_int("COINGECKO_TIMEOUT", 15)
+# ---- Robinhood chain (DEX activity for /rh_trending) ----
+# Robinhood's own API is execution-only and has no chain data at all, and
+# DexScreener has no per-chain listing. GeckoTerminal lists a network's pools
+# sorted by 24h volume, 20 per page, keyless.
+RHCHAIN_NETWORK = os.getenv("RHCHAIN_NETWORK", "robinhood").strip()
+RHCHAIN_PAGES = _env_int("RHCHAIN_PAGES", 2)
+RHCHAIN_CACHE_SECONDS = _env_int("RHCHAIN_CACHE_SECONDS", 60)
+
+# ---- Chat (talk to McCap by @mentioning it, or in a DM) ----
+# Answers come from the Claude API. Off until a key is set; a mention then gets
+# a one-line hint so a missing key is visible rather than silently ignored.
+ANTHROPIC_API_KEY = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
+CHAT_ENABLE = _env_flag("CHAT_ENABLE", True) and bool(ANTHROPIC_API_KEY)
+# Haiku is the cheap tier; every @mention is a paid call in a shared server.
+CHAT_MODEL = os.getenv("CHAT_MODEL", "claude-haiku-4-5").strip()
+CHAT_MAX_TOKENS = _env_int("CHAT_MAX_TOKENS", 1024)
+CHAT_TIMEOUT = _env_int("CHAT_TIMEOUT", 60)
+# Rolling conversation kept per channel, on the volume, so a redeploy does not
+# lose the thread of a discussion.
+CHAT_HISTORY_TURNS = _env_int("CHAT_HISTORY_TURNS", 30)
+# Long-term notes per server, all of them injected into every request.
+CHAT_MAX_NOTES = _env_int("CHAT_MAX_NOTES", 200)
+# Spend guards. In-memory, so they reset on redeploy — good enough to stop a
+# spam loop from running up the bill overnight.
+CHAT_DAILY_CAP = _env_int("CHAT_DAILY_CAP", 300)
+CHAT_USER_COOLDOWN_SECONDS = _env_int("CHAT_USER_COOLDOWN_SECONDS", 3)
+CHAT_MAX_TOOL_ROUNDS = _env_int("CHAT_MAX_TOOL_ROUNDS", 5)
+CHAT_MEMORY_FILE = str(DATA_DIR / "chat_memory.json")
+CHAT_HISTORY_FILE = str(DATA_DIR / "chat_history.json")
+
+# ---- Robinhood Chain wallets + DEX trading (routed through KyberSwap) ----
+# CUSTODIAL. McCap generates one EVM wallet per Discord user and holds the key,
+# encrypted at rest under RHC_WALLET_SECRET. Whoever controls this host and the
+# volume controls every wallet. Off by default; nobody may trade until they are
+# on the allowlist; and every cap below is per user, per UTC day.
+RHC_TRADING_ENABLE = _env_flag("RHC_TRADING_ENABLE", False)
+RHC_WALLET_SECRET = (os.getenv("RHC_WALLET_SECRET") or "").strip()
+RHC_TRADER_IDS = {
+    int(x) for x in (os.getenv("RHC_TRADER_IDS") or "").replace(",", " ").split()
+    if x.isascii() and x.isdigit()
+}
+# Optional server allowlist for trade commands. Empty = any server the bot is in.
+RHC_GUILD_IDS = {
+    int(x) for x in (os.getenv("RHC_GUILD_IDS") or "").replace(",", " ").split()
+    if x.isascii() and x.isdigit()
+}
+RHC_CHAIN_ID = 4663
+RHC_RPC_URLS = [
+    u.strip() for u in (
+        os.getenv("RHC_RPC_URLS")
+        or "https://rpc.mainnet.chain.robinhood.com,https://robinhood-rpc.publicnode.com"
+    ).split(",") if u.strip()
+]
+RHC_RPC_TIMEOUT = _env_int("RHC_RPC_TIMEOUT", 15)
+RHC_EXPLORER = os.getenv("RHC_EXPLORER", "https://explorer.mainnet.chain.robinhood.com").rstrip("/")
+RHC_KYBER_URL = os.getenv("RHC_KYBER_URL", "https://aggregator-api.kyberswap.com/robinhood/api/v1").rstrip("/")
+RHC_KYBER_CLIENT_ID = os.getenv("RHC_KYBER_CLIENT_ID", "mccap")
+# KyberSwap's MetaAggregationRouterV2 lives at the same address on every chain.
+# Deliberately NOT env-overridable: the API's routerAddress must equal this or
+# the trade is refused (see rhc/guard.py for why an address from a response is
+# never trusted on this chain).
+RHC_KYBER_ROUTER = "0x6131B5fae19EA4f9D964eAc0408E4408b66337b5"
+RHC_MAX_TRADE_USD = float(os.getenv("RHC_MAX_TRADE_USD", "50"))
+RHC_MAX_DAILY_USD = float(os.getenv("RHC_MAX_DAILY_USD", "200"))
+RHC_DEFAULT_SLIPPAGE_BPS = _env_int("RHC_DEFAULT_SLIPPAGE_BPS", 200)
+RHC_MAX_SLIPPAGE_BPS = _env_int("RHC_MAX_SLIPPAGE_BPS", 1000)
+RHC_CONFIRM_TIMEOUT = _env_int("RHC_CONFIRM_TIMEOUT", 60)
+# Post quotes, trade results, addresses and balances to the channel. Confirm
+# prompts, refusals and the private-key export are always visible only to the
+# user. Set to 0 to keep everything private.
+RHC_PUBLIC_REPLIES = _env_flag("RHC_PUBLIC_REPLIES", True)
+RHC_TX_TIMEOUT = _env_int("RHC_TX_TIMEOUT", 120)
+# A wallet with an unresolved (unconfirmed) transaction refuses new ones for
+# this long, so "it timed out, try again" cannot become a double spend.
+RHC_PENDING_BLOCK_SECONDS = _env_int("RHC_PENDING_BLOCK_SECONDS", 900)
+# In production DATA_DIR must be a mounted volume; keys minted onto ephemeral
+# disk vanish on the next deploy together with the funds sent to them. The
+# Dockerfile turns this on; local development leaves it off.
+RHC_REQUIRE_MOUNTED_DATA_DIR = _env_flag("RHC_REQUIRE_MOUNTED_DATA_DIR", False)
+RHC_WALLETS_FILE = str(DATA_DIR / "rhc_wallets.json")
+RHC_LEDGER_FILE = str(DATA_DIR / "rhc_ledger.json")
+RHC_JOURNAL_FILE = str(DATA_DIR / "rhc_trades.json")

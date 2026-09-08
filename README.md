@@ -77,16 +77,20 @@ line instead of silence.
 | `/rh_buy <symbol> <usd>` | Buy a dollar amount. Asks to confirm before executing. |
 | `/rh_sell <symbol> <qty>` | Sell a quantity. Asks to confirm before executing. |
 | `/rh_orders` | Recent orders and their state. |
-| `/rh_trending [window] [count]` | Biggest movers among the coins Robinhood lists, by 1h / 24h / 7d. |
+| `/rh_trending [window] [sort] [count] [include_majors]` | Busiest tokens on the **Robinhood chain**, by DEX volume over 1h / 6h / 24h. Sort by volume, gainers, losers or newest pools. |
 
 All except `/rh_trending` are ephemeral — balances and orders are never posted
 to a channel. `/rh_trending` is public market data and needs no credentials or
 owner check, so anyone can run it.
 
-Robinhood's API has no trending or movers endpoint — it is execution-only. So
-`/rh_trending` takes the tradeable pair list from Robinhood (authoritative when
-credentials are set, a built-in approximation otherwise, and the footer says
-which) and the price movement from CoinGecko, which is free and keyless.
+`/rh_trending` is about the Robinhood *chain* (the L2 where PONS, RSTR and the
+new memecoin pairs trade), not the coins listed in the Robinhood app. Robinhood's
+own API has no chain data and DexScreener has no per-chain listing, so the board
+comes from GeckoTerminal: the chain's busiest pools by 24h volume, grouped by
+token, with volume summed across a token's pools and price change taken from its
+deepest one. WETH / USDG / stablecoin pools are hidden unless `include_majors` is
+set — they are plumbing, not something to watch. The top 15 rows' contract addresses are
+printed so they can go straight into `/mc` or `/mc_check`.
 
 **Setup.** Generate a keypair, register the public half, then set four variables:
 
@@ -121,6 +125,120 @@ US-only, and it needs an active Robinhood Crypto account.
 
 Note Robinhood lists roughly 15–30 mainstream coins. None of the Solana
 memecoins McCap alerts on are tradeable there — those exist only on DEXes.
+
+### Robinhood Chain wallets and trading (`/rhc`)
+
+**Off by default. Custodial. Real money.** McCap generates one Robinhood Chain
+(chain id 4663) wallet per Discord user, keeps the key encrypted on the volume,
+and swaps on that user's behalf after they press a confirm button. Whoever runs
+the host controls every wallet; the wallet-creation reply says so. Keep only
+what you are actively trading here.
+
+| Command | What it does |
+|---|---|
+| `/rhc wallet create` | Generate your wallet. Fund it by withdrawing ETH on Robinhood Chain from the Robinhood app. |
+| `/rhc wallet show` | Address, ETH balance, today's remaining buy budget. |
+| `/rhc wallet export` | Reveal your private key (ephemeral, confirm first, logged). |
+| `/rhc wallet withdraw <to> <eth>` | Send ETH out. Confirm first. |
+| `/rhc quote <token> <eth>` | Best route and expected output, gas, price impact, and whether it can be sold straight back. Needs only the allowlist; works while trading is disabled. |
+| `/rhc buy <token> <eth> [slippage_bps]` | Quote, honeypot check, confirm, swap, receipt. Counts against your daily cap. |
+| `/rhc sell <token> <percent> [slippage_bps]` | Sell part of a holding for ETH. Exits are never capped. |
+| `/rhc holdings` | ETH and every token you have traded here, with rough USD values. |
+
+`<token>` is a contract address or a symbol from `/rh_trending`. Quotes, trade
+results, wallet addresses, balances and holdings post to the channel so the
+group can see them (`RHC_PUBLIC_REPLIES=0` makes everything private). Confirm
+prompts, refusals and the private-key export are only ever visible to the user.
+
+**Routing.** Swaps go through the KyberSwap aggregator, which sees every DEX on
+the chain (Uniswap V2/V3/V4, Ramses, Pons, ...) and builds the calldata itself.
+Uniswap V3 alone sees about a tenth of the chain's volume, and new pairs launch
+on V2, so a single router was never going to give good fills. It also keeps us
+off the Robinhood-forked Uniswap V4 router, which breaks stock SDK encodings.
+
+**Why so many checks.** Robinhood Chain has live drainers squatting Uniswap's
+canonical mainnet addresses: 2,109-byte stubs that accept ETH and return
+success. So before anything is signed: the RPC must report chain 4663; the
+router must be the pinned canonical KyberSwap address (an address in an API
+response is never trusted), not on the denylist, and carry real code; the
+wallet must hold gas; sells approve exactly the trade's amount, never
+unlimited; and the exact calldata is simulated with `eth_call` and must return
+an ABI-encoded amount at or above the slippage floor. A drainer returns empty
+bytes there. Measured 2026-09-07: the real router simulated within 0.03% of the
+quote. One transaction at a time per wallet; a receipt timeout is reported as
+*pending* with the hash, never as a failure that invites a double spend.
+
+**Setup**
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(48))"      # a wallet secret; back it up offline
+printf %s "$SECRET" | railway variable set RHC_WALLET_SECRET --stdin -s mccap --skip-deploys
+railway variable set RHC_TRADER_IDS=<discord ids, comma separated> RHC_TRADING_ENABLE=1 -s mccap
+```
+
+`RH_OWNER_ID`, if set, is always on the trader allowlist too. New slash commands
+are synced globally at startup and can take up to an hour to show in Discord
+clients; DM the bot `!sync` (owner only) or restart the Discord client to hurry it.
+
+Losing `RHC_WALLET_SECRET` or `rhc_wallets.json` loses every wallet. Back both
+up before the first deposit (`railway volume files -v mccap-volume download
+rhc_wallets.json ./rhc_wallets.backup.json`, then check it decrypts). To rotate
+the secret without locking everyone out, run `scripts/rhc_rekey.py` locally
+(`RHC_OLD_SECRET=... RHC_NEW_SECRET=... python scripts/rhc_rekey.py rhc_wallets.json rhc_wallets.rekeyed.json`):
+it re-encrypts every record under the new secret and verifies each key still
+derives its address before writing anything. Upload the result over
+`rhc_wallets.json` and set the new secret in the same deploy.
+
+Two more things the code does that are worth knowing. Every broadcast is
+journaled before its receipt is awaited, and on startup the journal rebuilds the
+list of unresolved transactions, so a redeploy mid-trade cannot forget that a
+wallet has money in flight; that wallet refuses new trades until the transaction
+is found or `RHC_PENDING_BLOCK_SECONDS` (900) passes, at which point a buy's
+budget reservation is returned. And the dollar figure checked against the caps
+is the LARGER of KyberSwap's `amountInUsd` and the ETH amount times DexScreener's
+ETH price, so one wrong feed cannot shrink a trade under the cap. Optional: `RHC_GUILD_IDS` (server allowlist),
+`RHC_RPC_URLS` (add a paid endpoint such as QuickNode or Alchemy first in the
+list; the public RPC is rate limited), `RHC_MAX_TRADE_USD` (50) and
+`RHC_MAX_DAILY_USD` (200) per user, `RHC_DEFAULT_SLIPPAGE_BPS` (200),
+`RHC_MAX_SLIPPAGE_BPS` (1000).
+
+Start with one allowlisted user and a few dollars, and compare realised fills
+against quotes before opening it up. The design notes and the decisions behind
+them are in `docs/rh-chain-trading-plan.md`.
+
+### Chat (talk to McCap)
+
+@mention McCap, or DM it, and it answers through the Claude API. It has two kinds
+of memory, both on the data volume:
+
+- a rolling conversation per channel (`CHAT_HISTORY_TURNS`, default 30), so a
+  redeploy does not lose the thread; and
+- long-term **notes** per server: tell it to remember something, describe a
+  feature you want built, make a decision, and it saves a note it reads on every
+  later request. Ask "what's on the list" and it answers from those notes.
+
+It can read the live alert list and look tokens up (`what's RSTR at`), so those
+answers carry real numbers. It does **not** create alerts; it points at `/mc`.
+
+| Command | What it does |
+|---|---|
+| `/memory view` | The notes it keeps for this server (or your DM). |
+| `/memory forget <id>` | Delete one note. |
+| `/memory status` | Model in use and today's call count. |
+
+Setup: `ANTHROPIC_API_KEY` turns it on (`CHAT_ENABLE=0` turns it off again).
+`CHAT_MODEL` defaults to `claude-haiku-4-5`, the cheap tier. Two spend guards,
+because every mention in a shared server is a paid call: `CHAT_DAILY_CAP`
+(default 300 calls/day) and `CHAT_USER_COOLDOWN_SECONDS` (default 3). Both are
+in memory and reset on redeploy. Notes are
+scoped per server, and private per DM.
+
+```bash
+printf %s "$KEY" | railway variable set ANTHROPIC_API_KEY --stdin -s mccap
+```
+
+No privileged intent is needed: Discord delivers message content for DMs and
+for messages that mention the bot.
 
 ### Where commands work
 
@@ -227,7 +345,11 @@ the Dockerfile.
 **Keep one replica.** Two instances means every alert posts twice.
 
 State files on the volume: `reminders.json`, `moves.json`, `watchlists.json`,
-`alerts.json`, `scans.json`. To carry data over:
+`alerts.json`, `scans.json`, `rh_spend.json`, `chat_memory.json`, `chat_history.json`,
+`rhc_wallets.json` (encrypted keys; back it up), `rhc_ledger.json`, `rhc_trades.json`.
+The volume must be mounted at `DATA_DIR` itself: the image sets
+`RHC_REQUIRE_MOUNTED_DATA_DIR=1`, and wallet creation refuses when `DATA_DIR` is
+not a mount point (keys minted onto ephemeral disk would vanish on the next deploy). To carry data over:
 
 ```bash
 railway volume files -v mccap-volume upload ./reminders.json reminders.json
@@ -272,7 +394,10 @@ cap at all.
 | Source | Used for | Key | Limit |
 |---|---|---|---|
 | DexScreener | live MC, liquidity, 24h change, pairs | none | ~300 req/min |
-| GeckoTerminal | historical OHLCV to seed momentum alerts | none | ~30 req/min |
+| GeckoTerminal | historical OHLCV to seed momentum alerts; Robinhood-chain pools for `/rh_trending` | none | ~30 req/min |
+| Claude API | chat replies (`ANTHROPIC_API_KEY`) | yes | per account |
+| KyberSwap Aggregator API | routes and swap calldata on Robinhood Chain | none (`X-Client-Id`) | unpublished; kept under 30/min |
+| Robinhood Chain RPC | balances, simulation, broadcasting | none (public) or a paid provider | public endpoint is rate limited |
 
 They cross-validate: on a spot check GeckoTerminal's 1h candles over 23h gave
 BONK +8.79% against DexScreener's +9.53% h24. GeckoTerminal has its own rate
@@ -283,7 +408,11 @@ limiter, deliberately separate so backfill can never starve the alert watcher.
 Market cap, liquidity and 24h change are each resolved differently, because no
 single pool is trustworthy for all three:
 
-- **Market cap** — median across pools, with log-space IQR outlier rejection.
+- **Market cap** — pools under 1% of the deepest pool's liquidity are ignored,
+  log-space IQR outliers are rejected, then the *liquidity-weighted* median. A
+  plain median fails as soon as most pools are dust: RSTR had 23 pools, two funded
+  ones agreeing on ~$2.6M and twenty-one sub-$1K pools with stale prices, and the
+  plain median reported $1.04M.
 - **Liquidity / volume** — summed across every pool where the token is the base asset.
 - **24h change** — median across pools quoted in a *major* asset (SOL, USDC, …).
   Liquidity alone is not a safe filter: BONK's single deepest pool is quoted in an

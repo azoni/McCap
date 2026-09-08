@@ -18,6 +18,8 @@ from .solana import get_balance
 from .logging_setup import log
 from .storage import (
     load_alerts,
+    load_chat_history,
+    load_memory,
     load_moves,
     load_reminders,
     load_scans,
@@ -35,6 +37,8 @@ EXTENSIONS = (
     "mccapbot.cogs.check",
     "mccapbot.cogs.trade",
     "mccapbot.cogs.scans",
+    "mccapbot.cogs.chat",
+    "mccapbot.cogs.rhc",
 )
 
 
@@ -49,6 +53,23 @@ class Bot(commands.Bot):
         intents.message_content = SCAN_WATCH_ENABLE
         super().__init__(command_prefix="!", intents=intents)
         self._bg_tasks: list[asyncio.Task] = []
+        self.tree.on_error = self._on_app_command_error
+
+    async def _on_app_command_error(self, inter: discord.Interaction, error: Exception) -> None:
+        """Never leave a slash command hanging. A stale client (Discord caches
+        command definitions for up to an hour after a sync) sends option values
+        the new code no longer accepts; say so instead of failing silently."""
+        msg = "That command changed recently; try again in a moment or restart Discord."
+        if not isinstance(error, discord.app_commands.TransformerError):
+            log.exception("Slash command %s failed", getattr(inter.command, "qualified_name", "?"), exc_info=error)
+            msg = "Something went wrong running that command; it's in the logs."
+        try:
+            if inter.response.is_done():
+                await inter.followup.send(msg, ephemeral=True)
+            else:
+                await inter.response.send_message(msg, ephemeral=True)
+        except Exception:
+            log.debug("Could not report a slash command error", exc_info=True)
 
     # ---------------- background loops ----------------
 
@@ -98,6 +119,8 @@ class Bot(commands.Bot):
         await load_watchlist()
         await load_alerts()
         await load_scans()
+        await load_memory()
+        await load_chat_history()
 
         for ext in EXTENSIONS:
             try:

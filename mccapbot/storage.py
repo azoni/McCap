@@ -10,6 +10,8 @@ from typing import Any, Dict, List, Optional, Type, TypeVar
 
 from .config import (
     ALERTS_FILE,
+    CHAT_HISTORY_FILE,
+    CHAT_MEMORY_FILE,
     DATA_DIR,
     MAX_ALERT_EVENTS,
     MAX_SCAN_EVENTS,
@@ -19,7 +21,7 @@ from .config import (
     WATCH_FILE,
 )
 from .logging_setup import log
-from .models import AlertEvent, MoveAlert, Reminder, ScanEvent, WatchItem
+from .models import AlertEvent, ChatTurn, MemoryNote, MoveAlert, Reminder, ScanEvent, WatchItem
 
 # In-memory
 reminders: List[Reminder] = []
@@ -27,6 +29,8 @@ move_alerts: List[MoveAlert] = []
 watchlist: List[WatchItem] = []
 alert_events: List[AlertEvent] = []
 scan_events: List[ScanEvent] = []
+memory_notes: List[MemoryNote] = []
+chat_turns: List[ChatTurn] = []
 
 # Locks
 REM_LOCK = asyncio.Lock()
@@ -260,3 +264,26 @@ def scans_to_track(track_seconds: float, now: float) -> List[ScanEvent]:
 def watched_addresses() -> List[str]:
     """Every contract address the watcher needs to poll."""
     return list({r.ca for r in reminders} | {m.ca for m in move_alerts})
+
+
+# ---- Chat memory (long-term notes) and rolling conversation ----
+MEMORY_LOCK = asyncio.Lock()
+CHAT_HISTORY_LOCK = asyncio.Lock()
+
+
+async def save_memory() -> None:
+    async with MEMORY_LOCK:
+        _atomic_write(CHAT_MEMORY_FILE, [asdict(n) for n in memory_notes])
+
+
+async def load_memory() -> None:
+    await _load_list(CHAT_MEMORY_FILE, MemoryNote, memory_notes, "memory note(s)")
+
+
+async def save_chat_history() -> None:
+    async with CHAT_HISTORY_LOCK:
+        _atomic_write(CHAT_HISTORY_FILE, [asdict(t) for t in chat_turns])
+
+
+async def load_chat_history() -> None:
+    await _load_list(CHAT_HISTORY_FILE, ChatTurn, chat_turns, "chat turn(s)")

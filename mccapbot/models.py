@@ -138,3 +138,30 @@ class ScanEvent:
         if not self.mc_at_scan or self.mc_at_scan <= 0 or self.last_mc is None:
             return None
         return self.last_mc / self.mc_at_scan
+
+
+@dataclass
+class MemoryNote:
+    """Something McCap was told to remember: a fact, a preference, a task.
+
+    ``scope`` is "g<guild_id>" inside a server and "u<user_id>" in a DM, so one
+    server's notes never show up in another and DMs stay private.
+    """
+
+    scope: str
+    text: str
+    author_id: int
+    author_name: str
+    id: str = field(default_factory=new_id)
+    created_ts: float = field(default_factory=time.time)
+
+
+@dataclass
+class ChatTurn:
+    """One message in a channel's rolling conversation with McCap."""
+
+    channel_id: int
+    role: str                # "user" | "assistant"
+    content: str
+    author_name: str = ""
+    ts: float = field(default_factory=time.time)

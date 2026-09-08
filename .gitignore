@@ -11,3 +11,14 @@ bitquery_healthcheck.json
 reminders.json
 payments.json
 alerts.json
+moves.json
+watchlists.json
+scans.json
+rh_spend.json
+chat_memory.json
+chat_history.json
+# Encrypted wallet keys and per-user trade records. Never in git.
+rhc_wallets.json
+rhc_ledger.json
+rhc_trades.json
+*.corrupt

@@ -15,6 +15,9 @@ class LpCog(commands.Cog):
         name="mc_lp", description="Suggest the best LP venue (Meteora, Raydium, Pumpswap) for a token"
     )
     @app_commands.describe(ca="Contract address / mint")
+    # Read-only market data, same class as /mc_check: works from a user install anywhere.
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     async def mc_lp(self, inter: discord.Interaction, ca: str):
         await inter.response.defer(thinking=True)
         ca = ca.strip()

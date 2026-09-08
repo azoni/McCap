@@ -3,7 +3,8 @@ python-dotenv>=1.0
 aiohttp>=3.10
 pytz>=2024.1
 python-dateutil>=2.9
-gql[websockets]>=3.5.0
-websockets>=12.0
 audioop-lts>=0.2.1; python_version >= "3.13"
 pynacl
+anthropic>=1.4,<2
+web3>=7,<9
+eth-account>=0.13,<1

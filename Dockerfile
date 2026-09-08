@@ -15,7 +15,7 @@ COPY mccapbot ./mccapbot
 
 # Alert/payment state lives here. Mount a Railway volume at /data to make it
 # survive deploys — without one, every restart starts from an empty alert list.
-ENV DATA_DIR=/data
+ENV DATA_DIR=/data RHC_REQUIRE_MOUNTED_DATA_DIR=1
 RUN mkdir -p /data
 
 CMD ["python", "-u", "main.py"]

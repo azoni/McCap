@@ -22,7 +22,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from .. import coingecko, robinhood, spend
+from .. import rhchain, robinhood, spend
+from ..helpers import humanize
 from ..config import (
     RH_CONFIRM_TIMEOUT,
     RH_MAX_DAILY_USD,
@@ -64,21 +65,28 @@ class ConfirmOrder(discord.ui.View):
             return False
         return True
 
+    # stop() runs in a finally: if editing the message fails, the waiter must
+    # still wake up now. Otherwise it wakes at the timeout with value already
+    # set and the order executes a minute after the click.
     @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
     async def confirm(self, inter: discord.Interaction, _b: discord.ui.Button):
         self.value = True
-        for child in self.children:
-            child.disabled = True
-        await inter.response.edit_message(view=self)
-        self.stop()
+        try:
+            for child in self.children:
+                child.disabled = True
+            await inter.response.edit_message(view=self)
+        finally:
+            self.stop()
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, inter: discord.Interaction, _b: discord.ui.Button):
         self.value = False
-        for child in self.children:
-            child.disabled = True
-        await inter.response.edit_message(view=self)
-        self.stop()
+        try:
+            for child in self.children:
+                child.disabled = True
+            await inter.response.edit_message(view=self)
+        finally:
+            self.stop()
 
 
 class TradeCog(commands.Cog):
@@ -284,70 +292,95 @@ class TradeCog(commands.Cog):
 
     @app_commands.command(
         name="rh_trending",
-        description="Biggest movers among the coins Robinhood actually lists",
+        description="Busiest tokens on the Robinhood chain, by DEX volume",
     )
     @app_commands.describe(
-        window="Rank by 1h, 24h or 7d change (default 24h)",
+        window="Volume and change over 1h, 6h or 24h (default 24h)",
+        sort="volume (default), gainers, losers, or new pools",
         count="How many to show (default 10, max 25)",
+        include_majors="Also show WETH / USDG / stablecoin pools (hidden by default)",
     )
-    @app_commands.choices(window=[
-        app_commands.Choice(name="1 hour", value="1h"),
-        app_commands.Choice(name="24 hours", value="24h"),
-        app_commands.Choice(name="7 days", value="7d"),
-    ])
+    @app_commands.choices(
+        window=[
+            app_commands.Choice(name="1 hour", value="h1"),
+            app_commands.Choice(name="6 hours", value="h6"),
+            app_commands.Choice(name="24 hours", value="h24"),
+        ],
+        sort=[
+            app_commands.Choice(name="volume", value="volume"),
+            app_commands.Choice(name="gainers", value="gainers"),
+            app_commands.Choice(name="losers", value="losers"),
+            app_commands.Choice(name="new", value="new"),
+        ],
+    )
     @app_commands.allowed_installs(guilds=True, users=True)
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     async def rh_trending(
         self,
         inter: discord.Interaction,
         window: Optional[app_commands.Choice[str]] = None,
+        sort: Optional[app_commands.Choice[str]] = None,
         count: Optional[int] = 10,
+        include_majors: bool = False,
     ):
-        # Public market data only — no account details, so this needs no owner
-        # gate and is the one trading-adjacent command anyone can run.
+        # Public market data only, so no owner gate: anyone can run it.
         await inter.response.defer(thinking=True)
-        key = window.value if window else "24h"
+        w = window.value if window else "h24"
+        mode = sort.value if sort else "volume"
         n = max(1, min(int(count or 10), 25))
+        label = {"h1": "1h", "h6": "6h", "h24": "24h"}[w]
 
-        symbols, authoritative = await robinhood.get_trading_pairs()
-        coins = await coingecko.for_symbols(symbols)
-        if not coins:
-            await inter.followup.send(
-                "Couldn't reach CoinGecko for market data — try again shortly."
-            )
+        pools = await rhchain.top_pools()
+        if not pools:
+            await inter.followup.send("Couldn't reach GeckoTerminal for Robinhood chain pools. Try again shortly.")
+            return
+        tokens = rhchain.aggregate(pools)
+        top = rhchain.rank(tokens, w, mode, include_majors=include_majors, n=n)
+        if not top:
+            await inter.followup.send("Nothing to show for that filter.")
             return
 
-        field = {"1h": "change_1h", "24h": "change_24h", "7d": "change_7d"}[key]
-        ranked = [c for c in coins if getattr(c, field) is not None]
-        ranked.sort(key=lambda c: getattr(c, field), reverse=True)
-        top = ranked[:n]
+        def pct(v: Optional[float]) -> str:
+            return f"{v:+.1f}%" if v is not None else "—"
 
         rows = [[
-            c.symbol,
-            f"${c.price:,.4f}".rstrip("0").rstrip(".") if c.price else "—",
-            f"{getattr(c, field):+.2f}%",
-            f"{c.change_24h:+.1f}%" if c.change_24h is not None else "—",
-        ] for c in top]
+            t.symbol[:10],
+            f"${humanize(t.volume(w))}",
+            pct(t.change(w)),
+            f"${humanize(t.liq_usd)}",
+            f"${humanize(t.mc_usd)}" if t.mc_usd else "—",
+            str(len(t.pools)),
+        ] for t in top]
 
-        gainers = sum(1 for c in ranked if getattr(c, field) > 0)
+        shown_tokens = [t for t in tokens if include_majors or t.symbol.upper() not in rhchain.CHAIN_MAJORS]
+        total_vol = sum(t.volume(w) for t in shown_tokens)
+        venues = sorted({p.dex for t in shown_tokens for p in t.pools})
+        titles = {"volume": f"top by {label} volume", "gainers": f"{label} gainers",
+                  "losers": f"{label} losers", "new": "newest pools"}
         embed = discord.Embed(
-            title=f"Robinhood movers · {key}",
-            colour=0x2ECC71 if (top and getattr(top[0], field) > 0) else 0xE74C3C,
+            title=f"Robinhood chain · {titles[mode]}",
+            colour=0x2ECC71 if mode != "losers" else 0xE74C3C,
             description=(
-                f"{len(ranked)} tradeable coin(s) · **{gainers} up / "
-                f"{len(ranked) - gainers} down** over {key}"
+                f"{len(shown_tokens)} token(s) in the {len(pools)} busiest pools · "
+                f"**${humanize(total_vol)}** traded in {label} · "
+                f"{', '.join(venues) if venues else 'no venues'}"
             ),
         )
         shown, total = add_table_fields(
-            embed, f"Sorted by {key} change",
-            ["Coin", "Price", key, "24h"], rows, ["l", "r", "r", "r"], max_fields=3,
+            embed, f"Volume, change, liquidity and market cap over {label}",
+            ["Token", f"Vol {label}", f"Δ {label}", "Liq", "MC", "Pools"], rows,
+            ["l", "r", "r", "r", "r", "r"], max_fields=3,
         )
-        foot = "Prices from CoinGecko"
-        foot += (
-            " · pair list from your Robinhood account"
-            if authoritative
-            else " · pair list is a built-in approximation (no credentials configured)"
-        )
+        # Addresses are what /mc needs, and a table cell is not copyable.
+        addr_lines = [f"{t.symbol[:10]:<10} {t.address}" for t in top[:15]]
+        block = "```\n" + "\n".join(addr_lines) + "\n```"
+        embed.add_field(name="Addresses (for /mc and /mc_check)", value=block, inline=False)
+        links = " · ".join(f"[{t.symbol[:10]}]({t.deepest.url()})" for t in top[:10])
+        if links:
+            embed.add_field(name="Charts", value=links[:1024], inline=False)
+
+        foot = "GeckoTerminal · Robinhood chain DEX pools"
+        foot += "" if include_majors else " · WETH/USDG/stables hidden (include_majors to show)"
         if shown < total:
             foot += f" · {total - shown} row(s) not shown"
         embed.set_footer(text=foot)
