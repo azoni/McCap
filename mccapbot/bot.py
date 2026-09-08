@@ -9,11 +9,13 @@ from .config import (
     DEX_BLACKLIST,
     LOG_LEVEL,
     PRESENCE_REFRESH_SECONDS,
+    RHC_ABOUT_ME_ENABLE,
     SCAN_WATCH_ENABLE,
     SHOW_BALANCE,
     SOLANA_WALLET,
 )
 from .http import close_session
+from .rhc import portfolio
 from .solana import get_balance
 from .logging_setup import log
 from .storage import (
@@ -74,9 +76,12 @@ class Bot(commands.Bot):
     # ---------------- background loops ----------------
 
     async def _presence_loop(self):
-        """Status line: the bot's SOL balance plus what it is tracking."""
+        """Status line: the bot's SOL balance, the Robinhood Chain wallets' total,
+        and what it is tracking. The same summary goes into the bot's About Me
+        so it shows when someone clicks McCap."""
         await self.wait_until_ready()
         last_balance: Optional[float] = None
+        last_about: Optional[str] = None
 
         while not self.is_closed():
             if SHOW_BALANCE and SOLANA_WALLET:
@@ -87,24 +92,42 @@ class Bot(commands.Bot):
                 if balance is not None:
                     last_balance = balance
 
+            rh = None
+            try:
+                rh = await portfolio.summary()
+            except Exception:
+                log.exception("Could not summarise Robinhood Chain wallets")
+
             try:
                 await self.change_presence(
                     status=discord.Status.online,
                     activity=discord.Activity(
                         type=discord.ActivityType.watching,
-                        name=self._presence_text(last_balance),
+                        name=self._presence_text(last_balance, rh),
                     ),
                 )
             except Exception:
                 log.exception("Failed to update presence")
+
+            if RHC_ABOUT_ME_ENABLE:
+                text = portfolio.about_me(rh)
+                if text != last_about and self.application is not None:
+                    try:
+                        await self.application.edit(description=text)
+                        last_about = text
+                    except Exception:
+                        log.exception("Failed to update the About Me text")
             await asyncio.sleep(PRESENCE_REFRESH_SECONDS)
 
     @staticmethod
-    def _presence_text(balance: Optional[float]) -> str:
+    def _presence_text(balance: Optional[float], rh=None) -> str:
         """Build the status line from whatever is actually known."""
         parts = []
         if balance is not None:
             parts.append(f"💰 {balance:,.2f} SOL")
+        fragment = portfolio.presence_fragment(rh)
+        if fragment:
+            parts.append(fragment)
         total = len(reminders) + len(move_alerts)
         if total:
             parts.append(f"{total} alert(s)")

@@ -145,6 +145,11 @@ what you are actively trading here.
 | `/rhc sell <token> <percent> [slippage_bps]` | Sell part of a holding for ETH. Exits are never capped. |
 | `/rhc holdings` | ETH and every token you have traded here, with rough USD values. |
 
+The bot's status line and its About Me (click McCap) show the combined total
+across all wallets: ETH, tokens traded through McCap, and a rough dollar value,
+refreshed every `PRESENCE_REFRESH_SECONDS`. Per-person figures stay behind
+`/rhc holdings`. `RHC_ABOUT_ME_ENABLE=0` leaves the profile text alone.
+
 `<token>` is a contract address or a symbol from `/rh_trending`. Quotes, trade
 results, wallet addresses, balances and holdings post to the channel so the
 group can see them (`RHC_PUBLIC_REPLIES=0` makes everything private). Confirm

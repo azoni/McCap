@@ -257,6 +257,9 @@ RHC_CONFIRM_TIMEOUT = _env_int("RHC_CONFIRM_TIMEOUT", 60)
 # prompts, refusals and the private-key export are always visible only to the
 # user. Set to 0 to keep everything private.
 RHC_PUBLIC_REPLIES = _env_flag("RHC_PUBLIC_REPLIES", True)
+# Put the wallets' combined holdings in the bot's About Me (visible when someone
+# clicks McCap) alongside the status line. Aggregate only; never per person.
+RHC_ABOUT_ME_ENABLE = _env_flag("RHC_ABOUT_ME_ENABLE", True)
 RHC_TX_TIMEOUT = _env_int("RHC_TX_TIMEOUT", 120)
 # A wallet with an unresolved (unconfirmed) transaction refuses new ones for
 # this long, so "it timed out, try again" cannot become a double spend.
