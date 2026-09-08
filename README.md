@@ -89,6 +89,40 @@ what you are actively trading here.
 | `/rh stats` | Group metrics: wallets, trades, volume, gas spent, realized profit, best multiple. |
 | `/rh trending [window] [sort] [count] [include_majors]` | Busiest and fastest-moving tokens on the chain: volume, change, market cap, liquidity. Windows 5m to 24h; sort by volume, gainers (with then → now market caps), losers or newest. |
 | `/rh new [count] [min_liquidity]` | Brand-new pairs from GeckoTerminal's new-pools feed, newest first, with age, liquidity, 1h volume and market cap. |
+| `/rh tutorial [topic] [public]` | How it all works, with a personal checklist (allowlist, wallet, funded, first trade) and buttons for the next step. Topics: getting started, buying, selling, buttons, auto-orders, safety. |
+| `/rh auto sell <token> <percent> <at> [anchor] [expires] [slippage_bps] [private]` | Take-profit or stop-loss: sell a percentage when the market cap reaches `2x`, `-30%` or `500k`. Confirmed once, fires once without asking again. |
+| `/rh auto buy <token> <usd> <condition> <value> [expires] [slippage_bps] [private]` | One-shot buy when the market cap is at or below / above a level, or the 1h volume is at or above one. Same caps and honeypot check as `/rh buy`, run again when it fires. |
+| `/rh auto list [public]` | Your armed rules, what each waits for, and whether the engine is on hold. |
+| `/rh auto cancel <id>` | Remove one of your rules (refused while it is executing). |
+
+**Buttons.** Every buy receipt carries **Sell 25% / Sell 50% / Sell all / TP · SL**;
+`/rh trending` and `/rh new` carry a token picker that leads to **Buy $5 / Buy $20 /
+Other amount**; an alert on a Robinhood Chain token carries **Buy $5 / Buy $20 /
+Sell 50% / Sell all**. Buttons are shortcuts into the same flow as the slash
+commands: each opens the same private quote and Confirm prompt, and they keep
+working after McCap restarts. Buttons that act on a position answer only to the
+wallet that made the trade; buttons that open a position act on whoever clicks,
+with the clicker's own wallet, allowlist and caps.
+
+**Auto-orders.** A rule is confirmed when armed and then fires **without asking
+again**, once, and is gone. It runs every guard a manual trade does at fire time
+(allowlist, kill switch, daily and per-trade cap for buys, sell-back honeypot
+check for buys, gas headroom, the rule's slippage as the floor, the in-flight
+lock) and reports every fill, failure, retirement and expiry in the channel it was created in
+(or by DM with `private:True`). Prices come from the same DexScreener feed the
+`/mc` watcher uses, checked every 10 to 60 seconds; a condition has to hold on
+two consecutive fresh reads and once more at fire time before anything is sent.
+A sell that cannot meet its slippage is retried about every minute and the rule
+is dropped after five failures; McCap never widens slippage for you. A rule that
+keeps waiting (a busy wallet, a price feed disagreement, a wick that was over by
+the fresh read) says why in `/rh auto list`. Rules expire (7 days for sells, 24
+hours for buys, 30 days at most), are limited
+to 10 per wallet and 30 in total, and hold rather than fire while
+`RHC_TRADING_ENABLE=0`. Relative sell targets (`2x`, `-30%`) anchor on your
+journaled entry so they match the receipt's multiple; `anchor:now` uses the
+current market cap instead. The **TP · SL** button under a receipt arms a
+take-profit and a stop-loss behind one Confirm. `RHC_AUTO_ENABLE=0` pauses the
+engine; rules live in `rhc_orders.json` under `DATA_DIR`.
 | `/help` | Every command with what it does. |
 
 The bot's status line and its About Me (click McCap) show the combined total

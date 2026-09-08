@@ -206,3 +206,31 @@ def test_fixed_table_autosizes_columns():
 def test_fixed_table_truncates_past_max_width():
     out = fixed_table(["Name"], [["x" * 50]], ["l"], max_width=10)
     assert "…" in out
+
+
+# ---------------- 1h volume and chain for the auto-order engine and alert buttons ----------------
+
+
+def test_volume_1h_sums_own_pairs_and_tolerates_a_missing_figure():
+    from mccapbot.dex import volume_1h
+    a = pair(fdv=1_000, liq=10); a["volume"]["h1"] = 100.0
+    b = pair(fdv=1_000, liq=10); b["volume"]["h1"] = 25.5
+    c = pair(fdv=1_000, liq=10)                      # no h1 at all
+    other = pair(fdv=1_000, liq=10, ca="Other111111111111111111111111111111111111111"); other["volume"]["h1"] = 999.0
+    assert volume_1h([a, b, c, other], SOL_CA) == pytest.approx(125.5)
+    assert volume_1h([c], SOL_CA) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_token_summary_returns_vol1h_and_chain(monkeypatch):
+    from mccapbot import dex
+    evm = "0x" + "ab" * 20
+    p = pair(fdv=2_000_000, liq=50_000, vol=1_000, chain="robinhood", ca=evm)
+    p["volume"]["h1"] = 40.0
+    p["priceUsd"] = "0.5"
+
+    async def fake_fetch(ca):
+        return {"pairs": [p]}
+    monkeypatch.setattr(dex, "fetch_dex_token", fake_fetch)
+    s = await dex.token_summary(evm)
+    assert s["vol1h"] == 40.0 and s["chain"] == "robinhood" and s["price"] == 0.5 and s["vol24"] == 1_000

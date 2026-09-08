@@ -1,6 +1,7 @@
 """The execution path, against a fake chain. Signing is real (offline); nothing
 is broadcast: ``send_raw`` is replaced and records what it was given."""
 
+import asyncio
 import os
 import time
 
@@ -434,3 +435,40 @@ def test_describe_error_maps_the_cases_a_trader_needs():
     assert "Nonce" in swap.describe_error(Exception("nonce too low"))
     assert "reverted" in swap.describe_error(Exception("execution reverted"))
     assert "reach" in swap.describe_error(chain.RpcUnavailable("all failed"))
+
+
+# ---------------- in-flight helpers for the auto-order engine ----------------
+
+
+def test_has_inflight_and_busy_errors(fc):
+    assert not swap.has_inflight(USER)
+    swap._pending[USER] = ("0xabc", time.time())
+    assert swap.has_inflight(USER), "an unresolved broadcast counts"
+    swap._pending.clear()
+    lk = swap._lock(USER)
+
+    async def hold():
+        async with lk:
+            return swap.has_inflight(USER)
+    assert asyncio.run(hold()) is True and not swap.has_inflight(USER)
+    assert swap.is_busy_error(swap.IN_FLIGHT_TEXT)
+    assert swap.is_busy_error("Your earlier transaction 0xabc is still unconfirmed. Check it ...")
+    assert not swap.is_busy_error("The transaction reverted.") and not swap.is_busy_error(None)
+
+
+def test_poll_pending_reports_the_final_word(fc):
+    now = time.time()
+    swap._pending[USER] = ("0xaaa", now)
+    assert asyncio.run(swap.poll_pending(USER, "0xaaa")) == "pending"
+    fc.receipts["0xaaa"] = {"status": 1, "gasUsed": 21_000, "effectiveGasPrice": 300_000_000}
+    assert asyncio.run(swap.poll_pending(USER, "0xaaa")) == "confirmed"
+    assert USER not in swap._pending
+    assert asyncio.run(swap.poll_pending(USER, "0xaaa")) == "confirmed", "answered from the journal afterwards"
+
+    swap._pending[USER] = ("0xbbb", now)
+    fc.receipts["0xbbb"] = {"status": 0, "gasUsed": 21_000, "effectiveGasPrice": 300_000_000}
+    assert asyncio.run(swap.poll_pending(USER, "0xbbb")) == "reverted"
+
+    swap._pending[USER] = ("0xccc", now - swap.RHC_PENDING_BLOCK_SECONDS - 1)
+    assert asyncio.run(swap.poll_pending(USER, "0xccc")) == "dropped"
+    assert asyncio.run(swap.poll_pending(USER, "0xnever")) is None

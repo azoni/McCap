@@ -31,11 +31,12 @@ class Refusal(Exception):
     sees in front of the text: 🚫 for a refusal, ❌ for something broken.
     """
 
-    def __init__(self, text: str, retry: bool = False, icon: str = "🚫"):
+    def __init__(self, text: str, retry: bool = False, icon: str = "🚫", usd: Optional[float] = None):
         super().__init__(text)
         self.text = text
         self.retry = retry
         self.icon = icon
+        self.usd = usd            # the dollar basis that tripped a cap, when that is the reason
 
     def __str__(self) -> str:
         return f"{self.icon} {self.text}"
@@ -150,6 +151,18 @@ def refund(user_id: int, amount_usd: float) -> None:
         log.exception("Ledger refund failed for user %s", user_id)
 
 
+async def _build(rt: kyber.Route, wallet_address: str, bps: int) -> kyber.BuiltSwap:
+    """kyber.build with its errors in Refusal shape: a stale quote or a 4xx may
+    pass on a retry; a 'Refusing' (wrong router, malformed calldata) never will."""
+    try:
+        return await kyber.build(rt, wallet_address, bps)
+    except kyber.KyberUnavailable as e:
+        raise Refusal(str(e), retry=True, icon="❌")
+    except kyber.KyberError as e:
+        text = str(e) or type(e).__name__
+        raise Refusal(text, retry="Refusing" not in text, icon="❌")
+
+
 # ---------------- texts (a receipt reads the same whichever door opened it) ----------------
 
 def quote_text(rt: kyber.Route, addr: str, sym: str, dec: int, back: Optional[kyber.Route],
@@ -226,7 +239,7 @@ async def plan_buy(user_id: int, wallet_address: str, addr: str, sym: str, dec: 
         raise Refusal(why, retry=True)
     ok, why = ledger.check(user_id, basis)
     if not ok:
-        raise Refusal(why)
+        raise Refusal(why, usd=basis)
 
     # Enough ETH for the trade AND its gas, said with numbers, before the
     # confirm prompt rather than after a reservation.
@@ -291,7 +304,7 @@ async def settle_buy(user_id: int, wallet_address: str, plan: BuyPlan, *, confir
         raise Refusal("The spend ledger could not be written; refusing to trade.", icon="❌")
     floor = confirmed_floor or 0
     try:
-        built = await kyber.build(rt, wallet_address, plan.bps)
+        built = await _build(rt, wallet_address, plan.bps)
         built.min_out = max(built.min_out, floor)
         res = await swap.execute(user_id, built, plan.addr, plan.sym, extra)
         # A thin pool moves in the seconds between quote and send. When the
@@ -301,7 +314,7 @@ async def settle_buy(user_id: int, wallet_address: str, plan: BuyPlan, *, confir
         if not res.ok and not res.pending and guard.is_slippage_revert(res.error):
             rt2 = await kyber.route(chain.NATIVE, plan.addr, plan.amount)
             if rt2.amount_out >= floor:
-                built = await kyber.build(rt2, wallet_address, plan.bps)
+                built = await _build(rt2, wallet_address, plan.bps)
                 built.min_out = max(built.min_out, floor)
                 res = await swap.execute(user_id, built, plan.addr, plan.sym, extra)
     except Exception:
@@ -358,13 +371,13 @@ async def settle_sell(user_id: int, wallet_address: str, plan: SellPlan, *, conf
         raise Refusal(f"The price moved while you were confirming: {eth(rt.amount_out)} ETH now vs "
                       f"the {eth(confirmed_floor)} floor you confirmed. Nothing was sold; run it again.", retry=True)
     floor = confirmed_floor or 0
-    built = await kyber.build(rt, wallet_address, plan.bps)
+    built = await _build(rt, wallet_address, plan.bps)
     built.min_out = max(built.min_out, floor)
     res = await swap.execute(user_id, built, plan.addr, plan.sym, extra)
     if not res.ok and not res.pending and guard.is_slippage_revert(res.error):
         rt2 = await kyber.route(plan.addr, chain.NATIVE, plan.amount)
         if rt2.amount_out >= floor:
-            built = await kyber.build(rt2, wallet_address, plan.bps)
+            built = await _build(rt2, wallet_address, plan.bps)
             built.min_out = max(built.min_out, floor)
             res = await swap.execute(user_id, built, plan.addr, plan.sym, extra)
     return res, built

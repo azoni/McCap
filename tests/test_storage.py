@@ -159,3 +159,43 @@ def test_watched_addresses_unions_both_alert_types(data_dir):
     )
     addrs = sorted(storage.watched_addresses())
     assert addrs == ["CA-a", "CA-b"], "a shared token must only be polled once"
+
+
+# ---------------- auto-orders ----------------
+
+
+def test_auto_order_roundtrip_keeps_zero_valued_fields(data_dir, monkeypatch):
+    from mccapbot.models import AutoOrder
+    monkeypatch.setattr(storage, "RHC_ORDERS_FILE", str(data_dir / "rhc_orders.json"))
+    storage.auto_orders.clear()
+    o = AutoOrder(ca="0x" + "ab" * 20, symbol="PONS", decimals=18, side="sell", metric="mc", direction="above",
+                  target=500_000.0, size=50.0, slippage_bps=200, user_id=7, guild_id=0, channel_id=99,
+                  expires_ts=1_800_000_000.0, spec="", anchor="", private=False, attempts=0)
+    storage.auto_orders.append(o)
+    asyncio.run(storage.save_orders())
+    storage.auto_orders.clear()
+    asyncio.run(storage.load_orders())
+    got = storage.auto_orders[0]
+    assert got.id == o.id and got.guild_id == 0 and got.spec == "" and got.attempts == 0 and got.private is False
+    assert got.status == "armed" and got.target_mc == 500_000.0
+    storage.auto_orders.clear()
+
+
+def test_watched_addresses_and_scheduler_proxies_include_armed_orders(data_dir):
+    from mccapbot.models import AutoOrder
+    storage.auto_orders.clear()
+    armed = AutoOrder(ca="0xORDER", symbol="X", decimals=18, side="buy", metric="vol1h", direction="above", target=50_000.0,
+                      size=10.0, slippage_bps=200, user_id=7, guild_id=1, channel_id=1, expires_ts=9e9)
+    done = AutoOrder(ca="0xDONE", symbol="Y", decimals=18, side="sell", metric="mc", direction="below", target=1.0,
+                     size=100.0, slippage_bps=200, user_id=7, guild_id=1, channel_id=1, expires_ts=9e9, status="pending")
+    mc_order = AutoOrder(ca="0xMC", symbol="Z", decimals=18, side="sell", metric="mc", direction="above", target=2e6,
+                         size=50.0, slippage_bps=200, user_id=8, guild_id=1, channel_id=1, expires_ts=9e9)
+    storage.auto_orders.extend([armed, done, mc_order])
+    storage.reminders.append(mk("alpha"))
+    assert set(storage.watched_addresses()) == {"CA-alpha", "0xORDER", "0xMC"}, "pending orders need no price feed"
+    levels, moves = storage.order_watchers()
+    assert [m.ca for m in moves] == ["0xORDER", "0xMC"] and all(m.window_sec == storage.ORDER_POLL_WINDOW_SEC for m in moves)
+    assert [(lv.ca, lv.direction, lv.target_mc) for lv in levels] == [("0xMC", "above", 2e6)], "only market-cap rules get a level proxy"
+    assert storage.find_order(mc_order.id, 8) is mc_order and storage.find_order(mc_order.id, 7) is None
+    assert storage.orders_for(7) == [armed, done]
+    storage.auto_orders.clear()

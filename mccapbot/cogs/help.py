@@ -7,7 +7,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from ..helpers import NEUTRAL, SEP, chunk_lines
+from ..helpers import NEUTRAL, SEP, chunk_lines, footer
 
 # Where each top-level command belongs on the help card. Anything unlisted
 # lands in "Other", so a new cog still shows up.
@@ -65,7 +65,8 @@ def build_help(tree: app_commands.CommandTree) -> discord.Embed:
     other = [f"`/{qual}`{SEP}{desc}" for n, entries in by_top.items() if n not in placed for qual, desc in entries]
     if other:
         _add_area(embed, "Other", other)
-    embed.set_footer(text="Buy and sell ask you to press Confirm within the time limit; expired means nothing happened.")
+    embed.set_footer(text=footer("New here? /rh tutorial",
+                                 "Buy and sell ask you to press Confirm within the time limit; expired means nothing happened."))
     return embed
 
 

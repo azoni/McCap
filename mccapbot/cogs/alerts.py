@@ -37,7 +37,7 @@ from ..scheduler import (
     estimated_requests_per_minute,
     interval_for_reminder,
 )
-from ..storage import alert_events, move_alerts, reminders, save_moves, save_reminders
+from ..storage import alert_events, live_orders, move_alerts, order_watchers, reminders, save_moves, save_reminders
 from ..views import ConfirmOrder
 from ..tables import add_table_fields
 
@@ -616,7 +616,8 @@ class AlertsCog(commands.Cog):
             mc_all = {ca: (token_cache[ca].mc if ca in token_cache else None) for ca in addresses}
 
         tiers = describe_tiers(reminders, mc_all)
-        rate = estimated_requests_per_minute(reminders, move_alerts, mc_all, watcher_no_data)
+        order_levels, order_moves = order_watchers()
+        rate = estimated_requests_per_minute([*reminders, *order_levels], [*move_alerts, *order_moves], mc_all, watcher_no_data)
         warming = sum(1 for m in move_alerts if history.pct_change(m.ca, m.window_sec, time.time()) is None)
         dead = sum(1 for ca in addresses if watcher_no_data.get(ca, 0) > 0)
         backed_off = sum(1 for ca in addresses if watcher_no_data.get(ca, 0) >= NO_DATA_GIVE_UP)
@@ -632,6 +633,7 @@ class AlertsCog(commands.Cog):
             footer(
                 f"{plural(warming, 'momentum alert')} still filling their window",
                 f"{plural(len(self._scoped(inter)), 'level alert')} {here}",
+                f"{plural(len(live_orders()), 'auto-order')} armed" if live_orders() else "",
             ),
         ]
         if dead:

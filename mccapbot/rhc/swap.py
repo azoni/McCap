@@ -42,6 +42,10 @@ class SwapResult:
     pending: bool = False          # broadcast, outcome unknown: do NOT retry blindly
     amount_out: Optional[int] = None
     gas_cost_wei: int = 0
+    # Which leg this result describes. A sell first needs a token approval; a
+    # pending or failed approval is not a pending or failed swap, and a caller
+    # that cannot tell them apart would report a sale that never happened.
+    stage: str = "swap"            # "swap" | "approve"
 
     @property
     def explorer(self) -> str:
@@ -147,6 +151,19 @@ async def _pending_block(user_id: int) -> Optional[str]:
             f"({chain.explorer_tx(tx_hash)}) before trading again.")
 
 
+def pending_tx(user_id: int) -> Optional[str]:
+    """The hash this wallet is still waiting on, or None."""
+    entry = _pending.get(user_id)
+    return entry[0] if entry else None
+
+
+async def refresh_pending(user_id: int) -> Optional[str]:
+    """Ask the chain about this wallet's unresolved transaction now, so
+    ``has_inflight`` clears as soon as it lands rather than at the wallet's
+    next trade. Returns what ``_resolve_pending`` learned."""
+    return await _resolve_pending(user_id)
+
+
 async def poll_pending(user_id: int, tx_hash: str) -> Optional[str]:
     """Final status of a broadcast this wallet made: ``confirmed`` / ``reverted``
     / ``dropped``, ``"pending"`` while unknown, or None if the journal never saw
@@ -209,19 +226,19 @@ async def _approve(user_id: int, token: str, owner: str, amount: int) -> SwapRes
         tx["gas"] = gas + gas * GAS_BUFFER_PCT // 100
         h = await _sign_and_send(user_id, tx)
     except Exception as e:  # noqa: BLE001
-        return SwapResult(ok=False, error=f"Approval failed: {describe_error(e)}")
+        return SwapResult(ok=False, error=f"Approval failed: {describe_error(e)}", stage="approve")
     ledger.journal({"ts": time.time(), "user_id": user_id, "kind": "approve", "token": token.lower(),
                     "amount": str(amount), "tx": h, "status": "submitted"})
     rec = await _wait(h)
     if rec is None:
         _mark_pending(user_id, h)
-        return SwapResult(ok=False, tx=h, pending=True,
+        return SwapResult(ok=False, tx=h, pending=True, stage="approve",
                           error="Approval submitted but unconfirmed. Check the explorer before retrying.")
     status = "confirmed" if int(rec.get("status", 0)) == 1 else "reverted"
     ledger.journal({"ts": time.time(), "user_id": user_id, "kind": "resolution", "tx": h, "status": status})
     if status != "confirmed":
-        return SwapResult(ok=False, tx=h, error="Token approval reverted. Nothing was swapped.")
-    return SwapResult(ok=True, tx=h)
+        return SwapResult(ok=False, tx=h, error="Token approval reverted. Nothing was swapped.", stage="approve")
+    return SwapResult(ok=True, tx=h, stage="approve")
 
 
 async def _ensure_allowance(user_id: int, token: str, owner: str, amount: int) -> SwapResult:

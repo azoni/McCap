@@ -24,6 +24,7 @@ from .storage import (
     load_chat_history,
     load_memory,
     load_moves,
+    load_orders,
     load_reminders,
     load_scans,
     load_watchlist,
@@ -53,6 +54,7 @@ class Bot(commands.Bot):
         intents.message_content = SCAN_WATCH_ENABLE
         super().__init__(command_prefix="!", intents=intents)
         self._bg_tasks: list[asyncio.Task] = []
+        self.auto_orders = None      # rhc.orders.Engine, started in setup_hook
         self.tree.on_error = self._on_app_command_error
 
     async def _on_app_command_error(self, inter: discord.Interaction, error: Exception) -> None:
@@ -140,6 +142,7 @@ class Bot(commands.Bot):
         await load_scans()
         await load_memory()
         await load_chat_history()
+        await load_orders()
 
         if not CHAT_ENABLE:
             log.info("Chat is off (no ANTHROPIC_API_KEY); /memory not registered.")
@@ -157,6 +160,13 @@ class Bot(commands.Bot):
             asyncio.create_task(self._presence_loop(), name="presence"),
             asyncio.create_task(alerts_watcher(self), name="alerts-watcher"),
         ]
+        # The auto-order engine is owned here, not by the cog: test and CI
+        # cog-load paths must never leave a task waiting on a gateway that
+        # never connects, and an extension reload must not orphan a running
+        # engine. Imported lazily for the same reason.
+        from .rhc import orders
+        self.auto_orders = orders.Engine(self)
+        self._bg_tasks.append(asyncio.create_task(self.auto_orders.run(), name="auto-orders"))
 
         synced = await self.tree.sync()
         log.info("Synced %d global slash command(s)", len(synced))
@@ -165,7 +175,13 @@ class Bot(commands.Bot):
         # Cancel and await the loops BEFORE closing the shared aiohttp session.
         # Closing it first left in-flight requests running against a dead
         # session, and the scan tracker (owned by its cog, cancelled later by
-        # cog_unload) outlived it entirely.
+        # cog_unload) outlived it entirely. The engine goes first so an
+        # in-flight auto-fill can finish journaling.
+        if self.auto_orders is not None:
+            try:
+                await self.auto_orders.stop()
+            except Exception:
+                log.exception("Auto-order engine did not stop cleanly")
         for t in self._bg_tasks:
             t.cancel()
         if self._bg_tasks:

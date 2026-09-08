@@ -22,3 +22,4 @@ rhc_wallets.json
 rhc_ledger.json
 rhc_trades.json
 *.corrupt
+rhc_orders.json

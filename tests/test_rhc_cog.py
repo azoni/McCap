@@ -139,3 +139,20 @@ async def test_resolve_token_by_address_symbol_and_ambiguity(monkeypatch):
         await c._resolve_token("DUP")
     with pytest.raises(ValueError, match="Unknown"):
         await c._resolve_token("NOPE")
+
+
+def test_deny_reason_orders_allowlist_then_guild_then_gate(monkeypatch):
+    monkeypatch.setattr(cog, "RHC_TRADING_ENABLE", False)
+    monkeypatch.setattr(cog, "RHC_TRADER_IDS", {5})
+    monkeypatch.setattr(cog, "RHC_GUILD_IDS", {1})
+    assert cog.deny_reason(9, 1)[0] == "allowlist", "a stranger learns nothing about the vault or the switch"
+    assert cog.deny_reason(5, 2)[0] == "guild"
+    kind, text = cog.deny_reason(5, 1)
+    assert kind == "gate" and "RHC_TRADING_ENABLE" in text
+    monkeypatch.setattr(cog, "RHC_TRADING_ENABLE", True)
+    monkeypatch.setattr(wallets, "RHC_WALLET_SECRET", "long-enough-secret-0123456789-abcdef")
+    monkeypatch.setattr(wallets, "unlockable", lambda: True)
+    assert cog.deny_reason(5, 1) is None
+    c = cog.RhcCog(bot=None)
+    assert c.deny(9, 1)[0] == "allowlist" and c.gate_reason() is None and c.is_allowed(5) and not c.is_allowed(9)
+    assert c.default_slippage() == cog.clamp_slippage(None) and c.results_private == cog.PRIVATE

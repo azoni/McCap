@@ -221,3 +221,26 @@ def test_production_shape_stays_far_under_the_limit():
     settled = estimated_requests_per_minute(rs, [], mc, {c: 5 for c in mc if mc[c] is None})
     assert settled < DEX_HARD_LIMIT
     assert settled < 5, f"dead tokens should barely register once backed off: {settled}"
+
+
+# ---------------- auto-order proxies ride the same schedule ----------------
+
+
+def test_progress_to_target_tolerates_a_missing_target():
+    """A 1h-volume rule duck-types as a level alert with no market-cap target."""
+    assert progress_to_target("above", 1_000_000, None) is None
+    assert progress_to_target("above", 1_000_000, 0) is None
+
+
+def test_order_proxies_get_a_steady_floor_and_the_hot_tier_near_target():
+    from types import SimpleNamespace
+    from mccapbot.storage import ORDER_POLL_WINDOW_SEC
+    move_like = SimpleNamespace(ca="CA1", window_sec=ORDER_POLL_WINDOW_SEC, last_fired_ts=0.0, cooldown_sec=0)
+    assert interval_for_move(move_like) == max(MOVE_MIN_SECONDS, ORDER_POLL_WINDOW_SEC // MOVE_SAMPLE_DIVISOR)
+    far = effective_intervals([], [move_like], {"CA1": 10_000.0}, {"CA1": 9})
+    assert far["CA1"] == interval_for_move(move_like), "never backed off, however far from target"
+    level_like = SimpleNamespace(ca="CA1", direction="above", target_mc=1_000_000.0)
+    near = effective_intervals([level_like], [move_like], {"CA1": 950_000.0})
+    assert near["CA1"] == POLL_HOT_SECONDS
+    rate = estimated_requests_per_minute([level_like], [move_like], {"CA1": 950_000.0})
+    assert rate == pytest.approx(60.0 / POLL_HOT_SECONDS)

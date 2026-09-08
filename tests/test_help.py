@@ -25,11 +25,34 @@ async def test_help_lists_every_leaf_command_with_its_description(tree):
     embed = build_help(tree)
     text = "\n".join(f"{f.name}\n{f.value}" for f in embed.fields)
     for leaf in ("/rh wallet create`", "/rh buy`", "/rh sell`", "/rh trending`", "/rh new`", "/rh holdings`",
-                 "/rh history`", "/rh pnl`", "/rh stats`", "`/mc`", "/mc_move`", "/mc_clear`", "/watch add`"):
+                 "/rh history`", "/rh pnl`", "/rh stats`", "/rh tutorial`", "/rh auto sell`", "/rh auto buy`",
+                 "/rh auto list`", "/rh auto cancel`", "`/mc`", "/mc_move`", "/mc_clear`", "/watch add`"):
         assert leaf in text, f"{leaf} missing from /help"
     assert "/help" not in text, "help does not list itself"
-    assert "Robinhood Chain wallets & trading" in [f.name for f in embed.fields]
+    assert "Robinhood Chain wallets & trading" in [f.name.split(" (cont.)")[0] for f in embed.fields]
     assert all(len(f.value) <= 1024 for f in embed.fields)
+    assert "/rh tutorial" in (embed.footer.text or ""), "the help card points newcomers at the tutorial"
+
+
+@pytest.mark.asyncio
+async def test_rh_command_options_follow_the_visibility_rules(tree):
+    """Personal views default private and expose ``public``; the rest expose ``private``."""
+    rh = next(c for c in tree.get_commands() if c.name == "rh")
+    leaves = {}
+
+    def walk(cmd, prefix=""):
+        name = f"{prefix}{cmd.name}"
+        if hasattr(cmd, "commands"):
+            for sub in cmd.commands:
+                walk(sub, name + " ")
+        else:
+            leaves[name] = [p.name for p in cmd.parameters]
+    walk(rh)
+    for name in ("rh holdings", "rh history", "rh pnl", "rh tutorial", "rh auto list"):
+        assert "public" in leaves[name] and "private" not in leaves[name], name
+    for name in ("rh buy", "rh sell", "rh stats", "rh trending", "rh new", "rh auto sell", "rh auto buy"):
+        assert "private" in leaves[name], name
+    assert leaves["rh auto buy"][:4] == ["token", "usd", "condition", "value"]
 
 
 @pytest.mark.asyncio

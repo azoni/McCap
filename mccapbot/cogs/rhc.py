@@ -22,13 +22,19 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from .. import rhchain, views
+from .. import rhchain, storage, views
 from ..config import (
+    RHC_AUTO_BUY_TTL,
+    RHC_AUTO_MAX_PER_USER,
+    RHC_AUTO_MAX_TOTAL,
+    RHC_AUTO_MAX_TTL,
+    RHC_AUTO_SELL_TTL,
     RHC_CONFIRM_TIMEOUT,
     RHC_DEFAULT_SLIPPAGE_BPS,
     RHC_GUILD_IDS,
     RHC_MAX_DAILY_USD,
     RHC_MAX_SLIPPAGE_BPS,
+    RHC_MAX_TRADE_USD,
     RHC_PUBLIC_REPLIES,
     RHC_TRADER_IDS,
     RHC_TRADING_ENABLE,
@@ -51,22 +57,22 @@ from ..helpers import (
     when,
 )
 from ..logging_setup import log
-from ..rhc import chain, kyber, ledger, pnl, portfolio, swap, trade, wallets
+from ..models import AutoOrder
+from ..rhc import chain, kyber, ledger, pnl, portfolio, swap, trade, tutorial, wallets
 from ..tables import add_table_fields
 from ..views import ConfirmOrder
 
 THIN_POOL_USD = trade.THIN_POOL_USD
-
-CUSTODY_WARNING = (
-    "**Read this once.** McCap holds this wallet's key, encrypted, on its server. Whoever runs the "
-    "server can control it. Keep only what you are actively trading here, withdraw profits, and "
-    "treat it like cash in a friend's drawer, not a bank."
-)
+# One wording, shown at wallet creation and under the tutorial's safety topic.
+CUSTODY_WARNING = tutorial.CUSTODY_WARNING
 
 # Visibility of trade results, balances, the trending board and group stats.
 # Prompts, refusals, the withdraw flow and the key export never use this: they
 # are always private.
 PRIVATE = not RHC_PUBLIC_REPLIES
+
+# The tutorial's chapters; mccapbot/rhc/tutorial.py renders them.
+TUTORIAL_TOPICS = tutorial.TOPICS
 
 # Shown once, privately, after someone's first buy lands.
 FIRST_BUY_TIP = (
@@ -140,6 +146,11 @@ class RhcCog(commands.Cog):
     async def cog_load(self):
         await wallets.load()
         swap.restore_pending()
+        # Buttons under receipts, boards and alerts keep working across restarts:
+        # their state lives in the custom_id, and the classes are registered once.
+        items = getattr(views, "DYNAMIC_ITEMS", ())
+        if self.bot is not None and items:
+            self.bot.add_dynamic_items(*items)
         log.info(
             "Robinhood Chain wallet vault: %d wallet(s), DATA_DIR %s is%s a mount point (mount check %s)",
             wallets.count(), wallets.DATA_DIR, "" if os.path.ismount(str(wallets.DATA_DIR)) else " NOT",
@@ -151,6 +162,51 @@ class RhcCog(commands.Cog):
                 log.warning("Robinhood Chain trading flag is on but blocked: %s", reason)
             else:
                 log.info("Robinhood Chain trading armed for %d allowlisted user(s)", len(RHC_TRADER_IDS))
+
+    async def cog_unload(self):
+        items = getattr(views, "DYNAMIC_ITEMS", ())
+        if self.bot is not None and items:
+            try:
+                self.bot.remove_dynamic_items(*items)
+            except Exception:
+                log.debug("Could not remove dynamic items", exc_info=True)
+
+    # ---------------- surface for the buttons and the auto-order engine ----------------
+    # views.py and rhc/orders.py never import this module (discord.py purges an
+    # unloaded extension from sys.modules), so they reach these through the cog.
+
+    @staticmethod
+    def deny(user_id: int, guild_id: Optional[int]) -> Optional[Tuple[str, str]]:
+        return deny_reason(user_id, guild_id)
+
+    @staticmethod
+    def gate_reason() -> Optional[str]:
+        return _gate()
+
+    @staticmethod
+    def default_slippage() -> int:
+        return clamp_slippage(None)
+
+    @property
+    def results_private(self) -> bool:
+        return PRIVATE
+
+    @staticmethod
+    def is_allowed(user_id: int) -> bool:
+        return allowed(user_id)
+
+    @staticmethod
+    def _view(name: str, *args):
+        """A button row from views.py, or None when it cannot be built: a view
+        bug must never take a receipt or an alert down with it."""
+        maker = getattr(views, name, None)
+        if maker is None:
+            return None
+        try:
+            return maker(*args)
+        except Exception:
+            log.exception("Could not build view %s", name)
+            return None
 
     # ---------------- gates ----------------
 
@@ -180,7 +236,9 @@ class RhcCog(commands.Cog):
     async def _no_wallet(self, inter: discord.Interaction) -> None:
         """The refusal a newcomer meets first, so it points at the way in."""
         await self._send_private(
-            inter, f"You have no wallet yet.{SEP}`/rh wallet create` makes one{SEP}`/rh tutorial` explains the rest",
+            inter, f"You have no wallet yet.{SEP}`/rh wallet create` makes one, or press the button{SEP}"
+                   f"`/rh tutorial` explains the rest",
+            view=self._view("wallet_nudge") if allowed(inter.user.id) else None,
         )
 
     async def _deny_own_funds(self, inter: discord.Interaction) -> bool:
@@ -253,8 +311,12 @@ class RhcCog(commands.Cog):
             f"Gas is paid in ETH.\n\n{CUSTODY_WARNING}\n\n"
             f"Next{SEP}fund it, then `/rh buy <token> usd:5` or pick a token from `/rh trending`{SEP}"
             f"`/rh tutorial` walks through it\n[Explorer]({chain.explorer_address(w.address)})",
-            ephemeral=priv, suppress_embeds=True,
+            ephemeral=priv, suppress_embeds=True, **self._view_kw(self._view("after_create_row")),
         )
+
+    @staticmethod
+    def _view_kw(view) -> dict:
+        return {"view": view} if view is not None else {}
 
     @wallet.command(name="show", description="Your address and ETH balance")
     @app_commands.describe(private="Reply only to you")
@@ -269,6 +331,9 @@ class RhcCog(commands.Cog):
                 await self._no_wallet(inter)
             return
         await inter.response.defer(thinking=True, ephemeral=priv)
+        await inter.followup.send(await self._wallet_text(inter, w), ephemeral=priv, suppress_embeds=True)
+
+    async def _wallet_text(self, inter: discord.Interaction, w: wallets.Wallet) -> str:
         try:
             bal = await chain.native_balance(w.address)
         except chain.ChainError:
@@ -281,11 +346,17 @@ class RhcCog(commands.Cog):
             if eth_usd:
                 balance += f" ({usd_str(bal / 1e18 * eth_usd)})"
         budget = f"{usd_str(ledger.remaining(inter.user.id))} of today's {usd_str(RHC_MAX_DAILY_USD)} buy budget left"
-        await inter.followup.send(
-            f"**{inter.user.display_name}**{SEP}`{w.address}`\n{balance}{SEP}{budget}\n"
-            f"[Explorer]({chain.explorer_address(w.address)})",
-            ephemeral=priv, suppress_embeds=True,
-        )
+        return (f"**{inter.user.display_name}**{SEP}`{w.address}`\n{balance}{SEP}{budget}\n"
+                f"[Explorer]({chain.explorer_address(w.address)})")
+
+    async def button_wallet_show(self, inter: discord.Interaction) -> None:
+        """The My wallet button: always private."""
+        w = wallets.get(inter.user.id)
+        if w is None:
+            await self._no_wallet(inter)
+            return
+        await inter.response.defer(thinking=True, ephemeral=True)
+        await inter.followup.send(await self._wallet_text(inter, w), ephemeral=True, suppress_embeds=True)
 
     @wallet.command(name="export", description="Reveal your private key (only you can see it)")
     async def wallet_export(self, inter: discord.Interaction):
@@ -585,6 +656,8 @@ class RhcCog(commands.Cog):
         lines = []
         for e in rows:
             icon = icons.get(e.get("final_status"), "❔")
+            if e.get("source") == "auto":
+                icon = f"🤖 {icon}"
             stamp = when(float(e.get("ts") or 0))
             dec = int(e.get("decimals") or 18)
             tx = e.get("tx") or ""
@@ -661,6 +734,418 @@ class RhcCog(commands.Cog):
         )
         await inter.followup.send(embed=embed, ephemeral=priv)
 
+    # ---------------- auto-orders ----------------
+    # A rule is confirmed once, here, and then fires without asking again (see
+    # rhc/orders.py). Creation runs every check a manual trade would, so a rule
+    # that could never fill is refused now rather than failing later.
+
+    auto = app_commands.Group(name="auto", description="Sells and buys that fire once, without asking again", parent=rhc)
+
+    @auto.command(name="sell", description="Take-profit or stop-loss: sell a percentage when the market cap reaches a level")
+    @app_commands.describe(
+        token="Contract address or a symbol from /rh trending", percent="How much of the holding to sell, 1 to 100",
+        at="2x, +50%, -30%, or a market cap like 500k", anchor="What 2x / -30% are measured from (default: your entry)",
+        expires="How long the rule stays armed, e.g. 12h or 3d (default 7d, max 30d)",
+        slippage_bps="Max slippage in basis points (default 200 = 2%)", private="Report the fill by DM instead of the channel",
+    )
+    @app_commands.choices(anchor=[
+        app_commands.Choice(name="my entry (default)", value="entry"),
+        app_commands.Choice(name="the market cap now", value="now"),
+    ])
+    async def auto_sell(self, inter: discord.Interaction, token: str, percent: int, at: str,
+                        anchor: Optional[app_commands.Choice[str]] = None, expires: Optional[str] = None,
+                        slippage_bps: Optional[int] = None, private: bool = False):
+        await self._arm(inter, side="sell", token=token, size=percent, at=at, anchor=anchor.value if anchor else "entry",
+                        expires=expires, slippage_bps=slippage_bps, private=private)
+
+    @auto.command(name="buy", description="Buy once when the market cap or 1h volume reaches a level (no confirm at that moment)")
+    @app_commands.describe(
+        token="Contract address or a symbol from /rh trending", usd="Dollars to spend when it fires",
+        condition="What to wait for", value="The level, e.g. 200k or 1.5m",
+        expires="How long the rule stays armed, e.g. 6h or 2d (default 24h, max 30d)",
+        slippage_bps="Max slippage in basis points (default 200 = 2%)", private="Report the fill by DM instead of the channel",
+    )
+    @app_commands.choices(condition=[
+        app_commands.Choice(name="Market cap at or below", value="mc_below"),
+        app_commands.Choice(name="Market cap at or above", value="mc_above"),
+        app_commands.Choice(name="1h volume at or above", value="vol1h_above"),
+    ])
+    async def auto_buy(self, inter: discord.Interaction, token: str, usd: float, condition: app_commands.Choice[str],
+                       value: str, expires: Optional[str] = None, slippage_bps: Optional[int] = None, private: bool = False):
+        await self._arm(inter, side="buy", token=token, size=usd, condition=condition.value, value=value,
+                        expires=expires, slippage_bps=slippage_bps, private=private)
+
+    @auto.command(name="list", description="Your armed auto-orders")
+    @app_commands.describe(public="Show it to the channel instead of just you")
+    async def auto_list(self, inter: discord.Interaction, public: bool = False):
+        from ..rhc import orders
+        priv = PRIVATE or not public
+        await inter.response.defer(thinking=True, ephemeral=priv)
+        mine = storage.orders_for(inter.user.id)
+        if not mine:
+            await inter.followup.send(f"**{inter.user.display_name}** has no auto-orders.{SEP}`/rh auto sell` or the "
+                                      f"**TP / SL** button under a receipt arms one.", ephemeral=priv)
+            return
+        engine = getattr(self.bot, "auto_orders", None)
+        held = engine.held_reason() if engine is not None else None
+        icons = {"sell": "🎯", "buy": "🛒"}
+        lines = []
+        for o in mine:
+            snap = storage.cache_snapshot(o.ca)
+            now_val = None
+            if snap is not None:
+                now_val = snap.mc if o.metric == "mc" else snap.vol1h
+            icon = "⏳" if o.status == "pending" else icons.get(o.side, "🤖")
+            waiting = engine.held_for(o.id) if engine is not None else None
+            lines.append(footer(f"`{o.id}` {icon} {orders.describe_rule(o)}", f"now {usd_str(now_val)}",
+                                f"expires {when(o.expires_ts)}",
+                                f"⏸ held {when(waiting[1])}: {waiting[0]}" if waiting else ""))
+        embed = discord.Embed(title=f"{inter.user.display_name}'s auto-orders", colour=NEUTRAL,
+                              description=(f"⏸ on hold: {held}\n" if held else "") + fit_lines(lines, 3800))
+        embed.set_footer(text=footer(plural(len(mine), "rule"), "/rh auto cancel <id> removes one",
+                                     "each fires once, without asking again"))
+        await inter.followup.send(embed=embed, ephemeral=priv)
+
+    async def _cancel_autocomplete(self, inter: discord.Interaction, current: str):
+        from ..rhc import orders
+        q = (current or "").lower()
+        out = []
+        for o in storage.orders_for(inter.user.id):
+            label = f"{o.id}{SEP}{orders.describe_rule(o)}"
+            if q and q not in label.lower():
+                continue
+            out.append(app_commands.Choice(name=label[:100], value=o.id))
+        return out[:25]
+
+    @auto.command(name="cancel", description="Remove one of your auto-orders")
+    @app_commands.describe(id="The rule id from /rh auto list")
+    @app_commands.autocomplete(id=_cancel_autocomplete)
+    async def auto_cancel(self, inter: discord.Interaction, id: str):
+        from ..rhc import orders
+        o = storage.find_order(id.strip().lower(), inter.user.id)
+        if o is None:
+            await self._send_private(inter, f"No auto-order `{id}` of yours here.{SEP}`/rh auto list` shows them.")
+            return
+        if o.status == "firing":
+            await self._send_private(inter, "This rule is executing right now; its result will post here in a moment.")
+            return
+        if o.status == "pending":
+            await self._send_private(inter, "This rule already fired; waiting for the chain to confirm it.")
+            return
+        try:
+            storage.auto_orders.remove(o)
+        except ValueError:
+            await self._send_private(inter, "That rule is already gone.")
+            return
+        await storage.save_orders()
+        await self._send_private(inter, f"Cancelled `{o.id}`{SEP}{orders.describe_rule(o)}")
+
+    async def _arm(self, inter: discord.Interaction, *, side: str, token: str, size: float, at: Optional[str] = None,
+                   anchor: str = "entry", condition: Optional[str] = None, value: Optional[str] = None,
+                   expires: Optional[str] = None, slippage_bps: Optional[int] = None, private: bool = False) -> None:
+        """Shared creation flow for /rh auto sell and /rh auto buy."""
+        from ..rhc import orders
+        uid = inter.user.id
+        if await self._deny_trade(inter):
+            return
+        w = wallets.get(uid)
+        if w is None:
+            await self._no_wallet(inter)
+            return
+        if await self._auto_limits(inter):
+            return
+        await inter.response.defer(thinking=True, ephemeral=True)
+        try:
+            addr, sym, dec = await self._resolve_token(token)
+            bps = clamp_slippage(slippage_bps)
+            expires_ts = orders.parse_expiry(expires, RHC_AUTO_SELL_TTL if side == "sell" else RHC_AUTO_BUY_TTL, RHC_AUTO_MAX_TTL)
+        except (ValueError, chain.ChainError) as e:
+            await inter.followup.send(f"❌ {e}", ephemeral=True)
+            return
+        info = await trade.summary(addr)
+        if info is None:
+            await inter.followup.send("❌ No DexScreener data for that token yet; try again in a few minutes.", ephemeral=True)
+            return
+        if side == "sell":
+            prepared = await self._prepare_auto_sell(inter, w, addr, sym, dec, int(size), at or "", anchor, bps, info,
+                                                     expires_ts, private)
+        else:
+            prepared = await self._prepare_auto_buy(inter, w, addr, sym, dec, float(size), condition or "", value or "",
+                                                    bps, info, expires_ts, private)
+        if prepared is None:
+            return
+        order, prompt = prepared
+        await self._confirm_and_arm(inter, [order], prompt, info, PRIVATE or private)
+
+    async def _auto_limits(self, inter: discord.Interaction) -> bool:
+        """Reply and return True when another rule may not be added."""
+        from ..rhc import orders
+        if not orders.RHC_AUTO_ENABLE:
+            await self._send_private(inter, "🔒 Auto-orders are switched off (`RHC_AUTO_ENABLE=0`).")
+            return True
+        if len(storage.orders_for(inter.user.id)) >= RHC_AUTO_MAX_PER_USER:
+            await self._send_private(inter, f"You already have {plural(RHC_AUTO_MAX_PER_USER, 'auto-order')}, the most one "
+                                            f"wallet can hold.{SEP}`/rh auto cancel` frees a slot.")
+            return True
+        if len(storage.auto_orders) >= RHC_AUTO_MAX_TOTAL:
+            await self._send_private(inter, f"McCap is watching {plural(RHC_AUTO_MAX_TOTAL, 'auto-order')} already, the most "
+                                            f"it polls for at once. Try again when one fills or expires.")
+            return True
+        return False
+
+    async def _prepare_auto_sell(self, inter: discord.Interaction, w: wallets.Wallet, addr: str, sym: str, dec: int,
+                                 pct_sold: int, at: str, anchor: str, bps: int, info: dict, expires_ts: float,
+                                 private: bool) -> Optional[Tuple[AutoOrder, str]]:
+        """Validate a take-profit / stop-loss and build it with its prompt; replies and returns None on refusal."""
+        from ..rhc import orders
+        uid = inter.user.id
+        pct_sold = max(1, min(int(pct_sold), 100))
+        try:
+            have = await chain.erc20_balance(addr, w.address)
+        except chain.ChainError as e:
+            await inter.followup.send(f"❌ {e}", ephemeral=True)
+            return None
+        if have <= 0:
+            await inter.followup.send(f"You hold no {sym}.", ephemeral=True)
+            return None
+        mc_now = info.get("mc")
+        anchor_used, anchor_mc = anchor, None
+        if anchor == "entry":
+            entry = pnl.entry_for(uid, addr)
+            if entry is not None:
+                entry.price_now, entry.mc_now = info.get("price"), mc_now
+                anchor_mc = entry.entry_mc
+            if anchor_mc is None:
+                anchor_used = "now"        # McCap has no entry for this wallet; say so in the prompt
+        if anchor_used == "now":
+            anchor_mc = mc_now
+        try:
+            rule = orders.sell_rule(at, anchor_mc, mc_now, anchor_used)
+        except ValueError as e:
+            await inter.followup.send(f"❌ {e}", ephemeral=True)
+            return None
+        if orders.already_met(rule.direction, mc_now, rule.target):
+            await inter.followup.send(f"🚫 {sym} is already at {usd_str(mc_now)}, past your {usd_str(rule.target)}; "
+                                      f"use `/rh sell` instead.", ephemeral=True)
+            return None
+        o = AutoOrder(ca=addr, symbol=sym, decimals=dec, side="sell", metric="mc", direction=rule.direction,
+                      target=rule.target, size=float(pct_sold), slippage_bps=bps, user_id=uid, guild_id=inter.guild_id or 0,
+                      channel_id=inter.channel_id or 0, expires_ts=expires_ts, spec=rule.spec, anchor_mc=rule.anchor_mc,
+                      anchor=anchor_used, private=private)
+        arrow = "≥" if rule.direction == "above" else "≤"
+        if rule.spec and anchor_used == "entry":
+            basis = f"{rule.spec} from your {usd_str(anchor_mc)} entry"
+        elif rule.spec:
+            basis = f"{rule.spec} from {usd_str(anchor_mc)} now" + ("" if anchor == "now" else " (McCap has no entry for you)")
+        else:
+            basis = ""
+        prompt = (
+            f"Arm **sell {pct_sold}% of {sym}** when MC {arrow} **{usd_str(rule.target)}**?\n"
+            + footer(basis, f"now {usd_str(mc_now)}", f"slippage {pct(bps / 100, signed=False)}", "checked every 10–60s",
+                     f"expires {when(expires_ts)}")
+            + f"\n`{addr}`\n⚠️ Fires **without asking again**, once. Needs gas ETH in your wallet then. A sell that cannot "
+              f"meet its slippage is retried about every minute and dropped after {orders.MAX_ATTEMPTS} failures; it never "
+              f"widens. `/rh auto cancel` any time."
+        )
+        return o, prompt
+
+    async def _prepare_auto_buy(self, inter: discord.Interaction, w: wallets.Wallet, addr: str, sym: str, dec: int,
+                                size_usd: float, condition: str, value: str, bps: int, info: dict, expires_ts: float,
+                                private: bool) -> Optional[Tuple[AutoOrder, str]]:
+        """Validate a one-shot buy the way /rh buy would today, then build it with its prompt."""
+        from ..rhc import orders
+        uid = inter.user.id
+        if size_usd <= 0 or size_usd > RHC_MAX_TRADE_USD:
+            await inter.followup.send(f"🚫 Auto-buys are between $0 and {usd_str(RHC_MAX_TRADE_USD)} each.", ephemeral=True)
+            return None
+        ok, why = ledger.check(uid, size_usd)
+        if not ok:
+            await inter.followup.send(f"🚫 {why}", ephemeral=True)
+            return None
+        try:
+            rule = orders.buy_rule(condition, value)
+        except ValueError as e:
+            await inter.followup.send(f"❌ {e}", ephemeral=True)
+            return None
+        current = info.get("mc") if rule.metric == "mc" else info.get("vol1h")
+        metric_label = "MC" if rule.metric == "mc" else "1h volume"
+        if orders.already_met(rule.direction, current, rule.target):
+            await inter.followup.send(f"🚫 {sym}'s {metric_label} is already {usd_str(current)}, past your "
+                                      f"{usd_str(rule.target)}; use `/rh buy` instead.", ephemeral=True)
+            return None
+        eth_usd = await self._eth_usd()
+        if not eth_usd:
+            await inter.followup.send("❌ Could not get the ETH price to size the buy; try again shortly.", ephemeral=True)
+            return None
+        amount = int(size_usd / eth_usd * 1e18)
+        try:
+            rt = await kyber.route(chain.NATIVE, addr, amount)
+        except kyber.NoRoute as e:
+            await inter.followup.send(f"❌ {e}", ephemeral=True)
+            return None
+        except kyber.KyberError:
+            await inter.followup.send("❌ KyberSwap is not answering; try again shortly.", ephemeral=True)
+            return None
+        # The cap is checked against the larger of the typed size and Kyber's
+        # own valuation of the ETH leg, the way the fire will check it.
+        basis = max(size_usd, rt.amount_in_usd or 0.0)
+        ok, why = ledger.check(uid, basis)
+        if not ok:
+            await inter.followup.send(f"🚫 KyberSwap values that at {usd_str(basis)} right now: {why} Size it a little "
+                                      f"under the cap.", ephemeral=True)
+            return None
+        back, unavailable = await trade.round_trip(addr, rt.amount_out)
+        if unavailable:
+            await inter.followup.send("❌ KyberSwap is not answering; the sell-back check cannot run. Try again shortly.",
+                                      ephemeral=True)
+            return None
+        if back is None:
+            await inter.followup.send(f"🚫 **{sym}** cannot be sold back for ETH (honeypot). No rule armed.", ephemeral=True)
+            return None
+        liq = info.get("liq")
+        rt_pct = (back.amount_out / rt.amount_in - 1.0) * 100.0 if rt.amount_in else None
+        o = AutoOrder(ca=addr, symbol=sym, decimals=dec, side="buy", metric=rule.metric, direction=rule.direction,
+                      target=rule.target, size=float(size_usd), slippage_bps=bps, user_id=uid, guild_id=inter.guild_id or 0,
+                      channel_id=inter.channel_id or 0, expires_ts=expires_ts, private=private)
+        arrow = "≥" if rule.direction == "above" else "≤"
+        prompt = (
+            f"Arm **buy {usd_str(size_usd)} of {sym}** when {metric_label} {arrow} **{usd_str(rule.target)}**?\n"
+            + footer(f"now {usd_str(current)}",
+                     f"sells straight back for {_eth(back.amount_out)} ETH ({pct(rt_pct)} round trip)" if rt_pct is not None else "",
+                     f"liquidity {usd_str(liq)}" if liq is not None else "", f"slippage {pct(bps / 100, signed=False)}",
+                     f"expires {when(expires_ts)}")
+            + ("\n" + trade.thin_pool_line(bps) if (liq is not None and liq < THIN_POOL_USD and bps < trade.THIN_POOL_MIN_BPS) else "")
+            + f"\n`{addr}`\n⚠️ Fires **without asking again**, once; the daily cap and the sell-back check run again when it does."
+        )
+        return o, prompt
+
+    async def _confirm_and_arm(self, inter: discord.Interaction, new_orders: list, prompt: str, info: dict, priv: bool) -> None:
+        """One private Confirm for one or two rules, then persist and announce them."""
+        from ..rhc import orders
+        uid = inter.user.id
+        view = ConfirmOrder(uid, RHC_CONFIRM_TIMEOUT)
+        await inter.followup.send(prompt, view=view, ephemeral=True)
+        await view.wait()
+        if not view.value:
+            await inter.followup.send("⏲️ Expired, nothing was armed." if view.value is None else "Cancelled, nothing was armed.",
+                                      ephemeral=True)
+            return
+        # Limits again: another rule may have been armed while the prompt sat there.
+        if len(storage.orders_for(uid)) + len(new_orders) > RHC_AUTO_MAX_PER_USER or \
+                len(storage.auto_orders) + len(new_orders) > RHC_AUTO_MAX_TOTAL:
+            await inter.followup.send("🚫 The auto-order limit was reached while you were confirming; nothing was armed.",
+                                      ephemeral=True)
+            return
+        storage.auto_orders.extend(new_orders)
+        await storage.save_orders()
+        mc_now = (info or {}).get("mc")
+        for o in new_orders:
+            await self._reply(inter, f"🤖 Armed `{o.id}`{SEP}{orders.describe_rule(o)}{SEP}now {usd_str(mc_now)}{SEP}"
+                                     f"expires {when(o.expires_ts)}", priv)
+
+    async def modal_tpsl(self, inter: discord.Interaction, uid: int, token: str, tp_at: str, tp_pct: str,
+                         sl_at: str, sl_pct: str) -> None:
+        """The TP / SL modal under a receipt: up to two sell rules behind one Confirm. Runs after the modal's defer."""
+        if inter.user.id != uid:
+            await inter.followup.send("This isn't your position.", ephemeral=True)
+            return
+        if await self._deny_trade(inter):
+            return
+        w = wallets.get(uid)
+        if w is None:
+            await self._no_wallet(inter)
+            return
+        if await self._auto_limits(inter):
+            return
+        from ..rhc import orders
+        legs = [(tp_at, tp_pct), (sl_at, sl_pct)]
+        legs = [(a.strip(), p.strip()) for a, p in legs if (a or "").strip()]
+        if not legs:
+            await inter.followup.send("Nothing to arm: both levels were blank.", ephemeral=True)
+            return
+        try:
+            addr, sym, dec = await self._resolve_token(token)
+            expires_ts = orders.parse_expiry(None, RHC_AUTO_SELL_TTL, RHC_AUTO_MAX_TTL)
+            pcts = [max(1, min(int(float(p or "100")), 100)) for _a, p in legs]
+        except (ValueError, chain.ChainError) as e:
+            await inter.followup.send(f"❌ {e}", ephemeral=True)
+            return
+        info = await trade.summary(addr)
+        if info is None:
+            await inter.followup.send("❌ No DexScreener data for that token yet; try again in a few minutes.", ephemeral=True)
+            return
+        bps = clamp_slippage(None)
+        built, prompts = [], []
+        for (at, _p), pct_sold in zip(legs, pcts):
+            prepared = await self._prepare_auto_sell(inter, w, addr, sym, dec, pct_sold, at, "entry", bps, info,
+                                                     expires_ts, PRIVATE)
+            if prepared is None:
+                return
+            o, prompt = prepared
+            built.append(o)
+            prompts.append(prompt.split("\n⚠️")[0])
+        tail = ("\n⚠️ Fires **without asking again**, once each. Needs gas ETH in your wallet then. A sell that cannot meet "
+                f"its slippage is retried about every minute and dropped after {orders.MAX_ATTEMPTS} failures; it never "
+                "widens. `/rh auto cancel` any time.")
+        await self._confirm_and_arm(inter, built, "\n\n".join(prompts) + tail, info, PRIVATE)
+
+    async def modal_buy(self, inter: discord.Interaction, token: str, usd_text: str, eth_text: str) -> None:
+        """The Other amount modal: exactly one of USD / ETH, then the ordinary buy flow. Runs after the modal's defer."""
+        usd_text, eth_text = (usd_text or "").strip(), (eth_text or "").strip()
+        if bool(usd_text) == bool(eth_text):
+            await inter.followup.send("Give either USD or ETH, not both and not neither.", ephemeral=True)
+            return
+        if await self._deny_trade(inter):
+            return
+        w = wallets.get(inter.user.id)
+        if w is None:
+            await self._no_wallet(inter)
+            return
+        usd_val = None
+        if usd_text:
+            try:
+                usd_val = float(usd_text.replace("$", "").replace(",", ""))
+            except ValueError:
+                await inter.followup.send("❌ USD must be a number, e.g. 7.50", ephemeral=True)
+                return
+        await self._run_buy(inter, w, token, eth=eth_text or None, usd=usd_val, bps=clamp_slippage(None), priv=PRIVATE,
+                            source="button")
+
+    # ---------------- tutorial ----------------
+
+    @rhc.command(name="tutorial", description="How trading with McCap works, step by step")
+    @app_commands.describe(topic="Which part (default: getting started)", public="Show it to the channel instead of just you")
+    @app_commands.choices(topic=[app_commands.Choice(name=label, value=value) for value, label in TUTORIAL_TOPICS])
+    async def tutorial(self, inter: discord.Interaction, topic: Optional[app_commands.Choice[str]] = None,
+                       public: bool = False):
+        # Deferred first: the personal checklist reads a balance from the RPC.
+        await inter.response.defer(thinking=True, ephemeral=not public)
+        await self._send_tutorial(inter, topic.value if topic else "start", public)
+
+    async def button_tutorial(self, inter: discord.Interaction) -> None:
+        await inter.response.defer(thinking=True, ephemeral=True)
+        await self._send_tutorial(inter, "start", False)
+
+    async def _send_tutorial(self, inter: discord.Interaction, topic: str, public: bool) -> None:
+        uid = inter.user.id
+        w = wallets.get(uid)
+        balance = eth_usd = None
+        if w is not None and not public:
+            try:
+                balance = await asyncio.wait_for(chain.native_balance(w.address), 3)
+            except Exception:
+                balance = None
+            if balance:
+                eth_usd = await self._eth_usd()
+        state = tutorial.TutorialState(
+            display_name=inter.user.display_name, allowed=allowed(uid), has_wallet=w is not None,
+            address=w.address if w else "", balance_wei=balance, eth_usd=eth_usd, traded=bool(ledger.history(uid)),
+            gate_reason=_gate(), remaining_usd=ledger.remaining(uid), personal=not public,
+        )
+        embed = tutorial.build(topic, state)
+        view = self._view("tutorial_row", tutorial.row_state(state))
+        await inter.followup.send(embed=embed, ephemeral=not public, **self._view_kw(view))
+
     # ---------------- trending ----------------
 
     WINDOW_CHOICES = [
@@ -720,17 +1205,32 @@ class RhcCog(commands.Cog):
         w = window.value if window else "h24"
         mode = sort.value if sort else "volume"
         n = max(1, min(int(count or 10), 25))
-        label = rhchain.WINDOW_LABELS[w]
 
+        embed, top, problem = await self._board(w, mode, n, include_majors)
+        if embed is None:
+            await inter.followup.send(problem, ephemeral=priv)
+            return
+        await inter.followup.send(embed=embed, ephemeral=priv, **self._view_kw(self._view("board_view", "trending", top)))
+
+    async def button_trending(self, inter: discord.Interaction) -> None:
+        """The Trending now button: the default board, privately, with its picker."""
+        await inter.response.defer(thinking=True, ephemeral=True)
+        embed, top, problem = await self._board("h24", "volume", 10, False)
+        if embed is None:
+            await inter.followup.send(problem, ephemeral=True)
+            return
+        await inter.followup.send(embed=embed, ephemeral=True, **self._view_kw(self._view("board_view", "trending", top)))
+
+    async def _board(self, w: str, mode: str, n: int, include_majors: bool):
+        """(embed, top tokens, None) for the trending board, or (None, None, why)."""
+        label = rhchain.WINDOW_LABELS[w]
         pools = await rhchain.top_pools()
         if not pools:
-            await inter.followup.send("Couldn't reach GeckoTerminal for Robinhood Chain pools. Try again shortly.")
-            return
+            return None, None, "Couldn't reach GeckoTerminal for Robinhood Chain pools. Try again shortly."
         tokens = rhchain.aggregate(pools)
         top = rhchain.rank(tokens, w, mode, include_majors=include_majors, n=n)
         if not top:
-            await inter.followup.send("Nothing to show for that filter.")
-            return
+            return None, None, "Nothing to show for that filter."
 
         def mc(v: Optional[float]) -> str:
             return usd_str(v) if v else UNKNOWN
@@ -770,7 +1270,7 @@ class RhcCog(commands.Cog):
             "/rh new for brand-new pairs",
             f"{plural(total - shown, 'row')} not shown" if shown < total else "",
         ))
-        await inter.followup.send(embed=embed, ephemeral=priv)
+        return embed, top, None
 
     @rhc.command(name="new", description="Brand-new pairs on Robinhood Chain, newest first")
     @app_commands.describe(
@@ -821,7 +1321,7 @@ class RhcCog(commands.Cog):
             "GeckoTerminal new-pools feed", "majors hidden",
             f"{plural(total - shown, 'row')} not shown" if shown < total else "",
         ))
-        await inter.followup.send(embed=embed, ephemeral=priv)
+        await inter.followup.send(embed=embed, ephemeral=priv, **self._view_kw(self._view("board_view", "new", top)))
 
     # ---------------- autocomplete ----------------
 

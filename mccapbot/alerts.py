@@ -4,17 +4,18 @@ from typing import Dict, Optional
 
 import discord
 
-from . import gecko, history, jupiter
+from . import gecko, history, jupiter, views
 from .cache import TOKEN_CACHE_LOCK, token_cache
 from .config import (
     JUPITER_ENABLE,
     JUPITER_REFRESH_SECONDS,
     MAX_ALERT_EVENTS,
     POLL_TICK_SECONDS,
+    RHC_DEX_CHAIN_ID,
     TOP_HOLDER_WARN_PCT,
 )
 from .dex import build_token_url, choose_consensus_pair, fetch_dex_token, get_image_url, resolve_mc_value, volume_1h
-from .helpers import BAD, GOOD, SEP, footer, human_window, humanize, meets, pct, usd, username_from_id
+from .helpers import BAD, GOOD, SEP, footer, human_window, humanize, is_evm_address, meets, pct, usd, username_from_id
 from .logging_setup import log
 from .models import AlertEvent, TokenSnapshot
 from .scheduler import (
@@ -207,6 +208,33 @@ def _record_event(rem, current_mc, kind: str, direction: str, target: float) -> 
     del alert_events[MAX_ALERT_EVENTS:]
 
 
+def _trade_row(ca: str, snap) -> Optional[discord.ui.View]:
+    """Buy / Sell buttons for an alert on a Robinhood Chain token, else None.
+
+    Gated on the snapshot's chain (DexScreener's slug for chain 4663) and an
+    EVM-shaped address: a Solana alert must never grow trade buttons. A
+    snapshot filled from the Jupiter fallback carries no chain, so that alert
+    ships without buttons. Any error here returns None: a view bug must never
+    make ``_check_levels`` retry the alert every tick.
+    """
+    try:
+        if snap is None or getattr(snap, "chain", "") != RHC_DEX_CHAIN_ID or not is_evm_address(ca):
+            return None
+        maker = getattr(views, "alert_row", None)
+        return maker(ca) if maker else None
+    except Exception:
+        log.exception("Could not build the trade row for %s", ca)
+        return None
+
+
+async def _send_alert(ch, content: Optional[str], embed: discord.Embed, view: Optional[discord.ui.View]) -> None:
+    kw = {"content": content, "embed": embed,
+          "allowed_mentions": discord.AllowedMentions(users=True, roles=False, everyone=False, replied_user=False)}
+    if view is not None:
+        kw["view"] = view
+    await ch.send(**kw)
+
+
 def _mention(user_id: int) -> Optional[str]:
     """Ping the owner, or nobody.
 
@@ -240,11 +268,7 @@ async def _fire_level(client: discord.Client, rem, current_mc, snap) -> None:
         embed.set_thumbnail(url=snap.image_url)
     embed.set_footer(text=footer(user_name, rem.id))
 
-    await ch.send(
-        content=_mention(rem.creator_id),
-        embed=embed,
-        allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False, replied_user=False),
-    )
+    await _send_alert(ch, _mention(rem.creator_id), embed, _trade_row(rem.ca, snap))
     log.info(
         "Alert fired | %s (%s) | dir=%s target=%s curr=%s id=%s",
         rem.name, rem.symbol, rem.direction, humanize(rem.target_mc), humanize(current_mc), rem.id,
@@ -274,11 +298,7 @@ async def _fire_move(client: discord.Client, mv, change: float, current_mc, snap
         embed.set_thumbnail(url=snap.image_url)
     embed.set_footer(text=footer(user_name, mv.id, f"re-arms in {human_window(mv.cooldown_sec)}"))
 
-    await ch.send(
-        content=_mention(mv.creator_id),
-        embed=embed,
-        allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False, replied_user=False),
-    )
+    await _send_alert(ch, _mention(mv.creator_id), embed, _trade_row(mv.ca, snap))
     log.info(
         "Move fired | %s (%s) | %+.1f%% over %s id=%s",
         mv.name, mv.symbol, change, human_window(mv.window_sec), mv.id,

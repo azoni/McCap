@@ -249,3 +249,71 @@ def test_collect_drops_state_for_unwatched_tokens():
     assert "GONE" not in A._no_data and "KEEP" in A._no_data
     assert history.sample_count("GONE") == 0
     assert history.sample_count("KEEP") == 1
+
+
+# ---------------- 1h volume on the snapshot, buttons only on Robinhood Chain alerts ----------------
+
+
+def test_refresh_stores_the_hour_volume_and_tolerates_a_missing_one(monkeypatch):
+    async def with_h1(_ca):
+        return {"pairs": [{
+            "chainId": "robinhood", "dexId": "uniswap",
+            "baseToken": {"address": "0x" + "ab" * 20, "symbol": "TOK", "name": "Tok"},
+            "quoteToken": {"symbol": "WETH"}, "fdv": 5_000_000, "liquidity": {"usd": 1000},
+            "volume": {"h24": 10, "h1": 3.5}, "txns": {"h24": {"buys": 1, "sells": 1}},
+        }]}
+    monkeypatch.setattr(A, "fetch_dex_token", with_h1)
+    asyncio.run(A._refresh("0x" + "ab" * 20))
+    snap_ = token_cache["0x" + "ab" * 20]
+    assert snap_.vol1h == 3.5 and snap_.chain == "robinhood"
+
+    async def without_h1(_ca):
+        return {"pairs": [{
+            "chainId": "solana", "dexId": "raydium",
+            "baseToken": {"address": "CA1", "symbol": "TOK", "name": "Tok"},
+            "quoteToken": {"symbol": "SOL"}, "fdv": 5_000_000, "liquidity": {"usd": 1000},
+            "volume": {"h24": 10}, "txns": {"h24": {"buys": 1, "sells": 1}},
+        }]}
+    monkeypatch.setattr(A, "fetch_dex_token", without_h1)
+    asyncio.run(A._refresh("CA1"))
+    assert token_cache["CA1"].vol1h == 0.0
+
+
+class ChanKw(Chan):
+    def __init__(self):
+        super().__init__()
+        self.kw = []
+
+    async def send(self, *a, **k):
+        self.kw.append(k)
+        self.sent += 1
+
+
+def test_alert_buttons_only_for_robinhood_chain_tokens(monkeypatch):
+    calls = []
+    monkeypatch.setattr(A.views, "alert_row", lambda ca: calls.append(ca) or "ROW", raising=False)
+    evm = "0x" + "ab" * 20
+    rh_snap = TokenSnapshot(mc=2_000_000, url="u", updated_ts=0.0, chain="robinhood")
+    sol_snap = TokenSnapshot(mc=2_000_000, url="u", updated_ts=0.0, chain="solana")
+    jup_snap = TokenSnapshot(mc=2_000_000, url="u", updated_ts=0.0, chain="")
+    assert A._trade_row(evm, rh_snap) == "ROW" and calls == [evm]
+    assert A._trade_row("CA1", rh_snap) is None, "a Solana-shaped address never gets EVM trade buttons"
+    assert A._trade_row(evm, sol_snap) is None and A._trade_row(evm, jup_snap) is None and A._trade_row(evm, None) is None
+
+    def boom(ca):
+        raise RuntimeError("view bug")
+    monkeypatch.setattr(A.views, "alert_row", boom, raising=False)
+    assert A._trade_row(evm, rh_snap) is None, "a view bug must never break an alert"
+
+    # The fired alert carries the row only when one was built.
+    r = rem()
+    r.ca = evm
+    reminders.append(r)
+    ch = ChanKw()
+    monkeypatch.setattr(A.views, "alert_row", lambda ca: "ROW", raising=False)
+    assert asyncio.run(A._check_levels(Client(channel=ch), {evm: rh_snap})) is True
+    assert ch.kw[-1].get("view") == "ROW"
+    r2 = rem()
+    reminders.append(r2)
+    assert asyncio.run(A._check_levels(Client(channel=ch), {"CA1": snap()})) is True
+    assert "view" not in ch.kw[-1]

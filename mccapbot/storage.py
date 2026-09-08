@@ -288,6 +288,13 @@ async def load_orders() -> None:
     await _load_list(RHC_ORDERS_FILE, AutoOrder, auto_orders, "auto order(s)")
 
 
+def cache_snapshot(ca: str):
+    """The watcher's latest TokenSnapshot for an address, or None. Read without
+    the cache lock: a torn read here only affects a display line."""
+    from .cache import token_cache
+    return token_cache.get(ca)
+
+
 def live_orders() -> List[AutoOrder]:
     """Orders that still need a price feed: armed or mid-fire."""
     return [o for o in auto_orders if o.status in ("armed", "firing")]
