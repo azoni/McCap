@@ -25,7 +25,6 @@ def test_trading_is_off_by_default():
 def test_gate_checks_flag_then_allowlist_then_vault(monkeypatch):
     monkeypatch.setattr(cog, "RHC_TRADING_ENABLE", True)
     monkeypatch.setattr(cog, "RHC_TRADER_IDS", set())
-    monkeypatch.setattr(cog, "RH_OWNER_ID", 0)
     assert "allowlist" in cog._gate()
     monkeypatch.setattr(cog, "RHC_TRADER_IDS", {5})
     monkeypatch.setattr(wallets, "RHC_WALLET_SECRET", "")
@@ -38,10 +37,8 @@ def test_gate_checks_flag_then_allowlist_then_vault(monkeypatch):
 
 def test_allowlist_never_means_everyone(monkeypatch):
     monkeypatch.setattr(cog, "RHC_TRADER_IDS", {5, 6})
-    monkeypatch.setattr(cog, "RH_OWNER_ID", 9)
-    assert cog.allowed(5) and cog.allowed(9) and not cog.allowed(7)
+    assert cog.allowed(5) and not cog.allowed(7)
     monkeypatch.setattr(cog, "RHC_TRADER_IDS", set())
-    monkeypatch.setattr(cog, "RH_OWNER_ID", 0)
     assert not cog.allowed(0) and not cog.allowed(7)
 
 

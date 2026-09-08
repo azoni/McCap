@@ -180,6 +180,48 @@ def test_a_failed_refresh_keeps_the_previous_board(monkeypatch):
     assert len(asyncio.run(rhchain.top_pools(force=True))) == 6
 
 
+def test_short_windows_and_implied_market_cap_before():
+    p = gt_pool("0xm1", "MOVER", vol24=1_000_000, liq=50_000, mc=1_100_000, chg24=10.0)
+    p["attributes"]["volume_usd"]["m15"] = "250000"
+    p["attributes"]["price_change_percentage"]["m15"] = "37.5"       # $800K -> $1.1M inside 15 minutes
+    p["attributes"]["price_change_percentage"]["m5"] = "5"
+    pools = rhchain.parse_pools({"data": [p], "included": included("MOVER", "WETH")})
+    tok = rhchain.aggregate(pools)[0]
+    assert tok.volume("m15") == 250_000 and tok.change("m15") == pytest.approx(37.5)
+    assert tok.mc_before("m15") == pytest.approx(800_000)
+    assert tok.mc_before("m30") is None, "no change figure, no implied figure"
+    assert rhchain.WINDOW_LABELS["m15"] == "15m"
+    assert [t.symbol for t in rhchain.rank([tok], "m15", "gainers")] == ["MOVER"]
+
+
+def test_new_pools_feed_is_newest_first_and_cached(monkeypatch):
+    calls = []
+
+    async def fake(url, **kw):
+        calls.append(url)
+        return {"data": [
+            gt_pool("0xn1", "OLDER", vol24=10, liq=2_000, created="2026-09-08T13:00:00Z"),
+            gt_pool("0xn2", "NEWER", vol24=10, liq=3_000, created="2026-09-08T13:55:00Z"),
+        ], "included": included("OLDER", "NEWER", "WETH")}
+    monkeypatch.setattr(rhchain, "get_json", fake)
+    rhchain._new_cache.clear()
+    rhchain._new_cached_at = 0.0
+    pools = asyncio.run(rhchain.new_pools())
+    assert "networks/robinhood/new_pools" in calls[0]
+    assert [p.base_symbol for p in pools] == ["NEWER", "OLDER"]
+    asyncio.run(rhchain.new_pools())
+    assert len(calls) == 1
+    rhchain._new_cache.clear()
+
+
+def test_age_str():
+    now = 1_700_000_000.0
+    assert rhchain.age_str(now - 120, now) == "2m"
+    assert rhchain.age_str(now - 7_200, now) == "2h"
+    assert rhchain.age_str(now - 3 * 86_400, now) == "3d"
+    assert rhchain.age_str(0, now) == "?"
+
+
 def test_an_empty_first_page_stops_paging(monkeypatch):
     calls = []
 

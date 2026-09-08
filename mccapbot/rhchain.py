@@ -23,7 +23,10 @@ from .gecko import BASE, gecko_limiter
 from .http import get_json
 from .logging_setup import log
 
-WINDOWS = ("h1", "h6", "h24")
+# GeckoTerminal reports volume and price change over all of these. Price change
+# doubles as market-cap change: supply does not move inside a window.
+WINDOWS = ("m5", "m15", "m30", "h1", "h6", "h24")
+WINDOW_LABELS = {"m5": "5m", "m15": "15m", "m30": "30m", "h1": "1h", "h6": "6h", "h24": "24h"}
 SORTS = ("volume", "gainers", "losers", "new")
 
 # The chain's plumbing rather than something to trade: hidden by default so the
@@ -80,6 +83,16 @@ class TokenActivity:
     @property
     def mc_usd(self) -> Optional[float]:
         return self.deepest.mc_usd
+
+    def mc_before(self, window: str) -> Optional[float]:
+        """Market cap at the start of the window, implied by the price change.
+
+        "$800K to $1.1M in 15 minutes" is the number people actually want, and
+        with a fixed supply it is exactly mc / (1 + change)."""
+        mc, chg = self.mc_usd, self.change(window)
+        if mc is None or chg is None or chg <= -100:
+            return None
+        return mc / (1.0 + chg / 100.0)
 
     @property
     def buys_h24(self) -> int:
@@ -243,3 +256,39 @@ async def top_pools(force: bool = False) -> List[Pool]:
         _cache[:] = fresh
         _cached_at = now
     return _cache
+
+
+_new_cache: List[Pool] = []
+_new_cached_at = 0.0
+
+
+async def new_pools(force: bool = False) -> List[Pool]:
+    """The chain's most recently created pools, newest first.
+
+    A separate feed from the busiest pools: a pair minutes old has no volume
+    yet, so it would never appear in ``top_pools``. Most of these are dust;
+    the caller decides what to hide.
+    """
+    global _new_cached_at
+    now = time.time()
+    if _new_cache and not force and (now - _new_cached_at) < RHCHAIN_CACHE_SECONDS:
+        return _new_cache
+    url = f"{BASE}/networks/{RHCHAIN_NETWORK}/new_pools?page=1&include=base_token,quote_token,dex"
+    pools = parse_pools(await get_json(url, limiter=gecko_limiter))
+    if pools:
+        pools.sort(key=lambda p: -p.created_ts)
+        _new_cache[:] = pools
+        _new_cached_at = now
+    return _new_cache
+
+
+def age_str(created_ts: float, now: Optional[float] = None) -> str:
+    """'3m', '2h', '5d' since the pool was created; '?' when unknown."""
+    if not created_ts:
+        return "?"
+    secs = max(0.0, (now if now is not None else time.time()) - created_ts)
+    if secs < 3600:
+        return f"{int(secs // 60)}m"
+    if secs < 86400:
+        return f"{int(secs // 3600)}h"
+    return f"{int(secs // 86400)}d"

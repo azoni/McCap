@@ -24,6 +24,7 @@ from being sent at all. When the chain cannot be reached to run it, the answer
 is "refuse", never "assume fine".
 """
 
+import re
 from typing import Dict, Optional
 
 from ..config import RHC_KYBER_ROUTER
@@ -109,7 +110,7 @@ async def simulate(built: BuiltSwap, sender: str, fund_sender: bool = False) -> 
     try:
         out = await chain.call(tx, overrides)
     except chain.RevertError as e:
-        raise GuardError(f"The swap would revert: {_short(str(e))}") from e
+        raise GuardError(describe_revert(str(e))) from e
     except chain.RpcUnavailable as e:
         raise GuardError("Could not reach Robinhood Chain to simulate the swap. Refusing to sign blind; try again.") from e
     got = decode_swap_result(out)
@@ -119,6 +120,25 @@ async def simulate(built: BuiltSwap, sender: str, fund_sender: bool = False) -> 
             f"({built.slippage_bps / 100:.2f}%). The price moved; re-quote."
         )
     return got
+
+
+SLIPPAGE_TEXT = (
+    "The price moved past your slippage limit before the swap could be sent. Nothing was spent. "
+    "Run it again, or allow more slippage with slippage_bps (500 = 5%) for a thin or fast-moving token."
+)
+
+
+def is_slippage_revert(msg: str) -> bool:
+    low = (msg or "").lower()
+    return any(k in low for k in ("return amount is not enough", "slippage", "too little received", "insufficient output"))
+
+
+def describe_revert(msg: str) -> str:
+    """Turn a node's revert (often with a hex payload) into one sentence a trader can act on."""
+    if is_slippage_revert(msg):
+        return SLIPPAGE_TEXT
+    clean = re.sub(r"0x[0-9a-fA-F]{40,}", "0x…", msg or "").replace("\n", " ")
+    return f"The swap would revert: {_short(clean)}. Nothing was spent."
 
 
 def _short(msg: str, n: int = 160) -> str:

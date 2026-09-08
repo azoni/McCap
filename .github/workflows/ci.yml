@@ -39,10 +39,10 @@ jobs:
                   await bot.load_extension(ext)
               names = sorted(c.qualified_name for c in bot.tree.get_commands())
               print(f"{len(names)} commands:", ", ".join(names))
+              # Chat and scan watching are off in CI, so /memory and /scans are not registered.
               expected = sorted([
                   "mc", "mc_check", "mc_list", "mc_lp", "mc_move", "mc_recent", "mc_remove", "mc_status",
-                  "memory", "rh_balance", "rh_buy", "rh_orders", "rh_quote", "rh_sell", "rh_trending",
-                  "rhc", "scans", "watch",
+                  "help", "rhc", "watch",
               ])
               assert names == expected, f"slash commands differ from the expected set: {sorted(set(names) ^ set(expected))}"
               await bot.close()

@@ -66,66 +66,6 @@ button URLs) rather than one field, and **logs a warning when a scanner posts
 something it can't extract a mint from** — a format change shows up as a log
 line instead of silence.
 
-### Trading (Robinhood Crypto)
-
-**Off by default.** These place real orders against a real brokerage account.
-
-| Command | What it does |
-|---|---|
-| `/rh_balance` | Buying power, holdings, and today's spend against the cap. |
-| `/rh_quote <symbol>` | Best bid/ask for a pair like `BTC-USD`. |
-| `/rh_buy <symbol> <usd>` | Buy a dollar amount. Asks to confirm before executing. |
-| `/rh_sell <symbol> <qty>` | Sell a quantity. Asks to confirm before executing. |
-| `/rh_orders` | Recent orders and their state. |
-| `/rh_trending [window] [sort] [count] [include_majors]` | Busiest tokens on the **Robinhood chain**, by DEX volume over 1h / 6h / 24h. Sort by volume, gainers, losers or newest pools. |
-
-All except `/rh_trending` are ephemeral — balances and orders are never posted
-to a channel. `/rh_trending` is public market data and needs no credentials or
-owner check, so anyone can run it.
-
-`/rh_trending` is about the Robinhood *chain* (the L2 where PONS, RSTR and the
-new memecoin pairs trade), not the coins listed in the Robinhood app. Robinhood's
-own API has no chain data and DexScreener has no per-chain listing, so the board
-comes from GeckoTerminal: the chain's busiest pools by 24h volume, grouped by
-token, with volume summed across a token's pools and price change taken from its
-deepest one. WETH / USDG / stablecoin pools are hidden unless `include_majors` is
-set — they are plumbing, not something to watch. The top 15 rows' contract addresses are
-printed so they can go straight into `/mc` or `/mc_check`.
-
-**Setup.** Generate a keypair, register the public half, then set four variables:
-
-```bash
-python scripts/generate_rh_keypair.py     # run locally, not on Railway
-
-printf %s "$RH_KEY" | railway variable set RH_API_KEY --stdin -s mccap --skip-deploys
-printf %s "$RH_PRIV" | railway variable set RH_PRIVATE_KEY_B64 --stdin -s mccap --skip-deploys
-railway variable set RH_OWNER_ID=<your discord user id> RH_TRADING_ENABLE=1 -s mccap
-```
-
-Pipe the secrets through stdin so neither the API key nor the signing key lands
-in your shell history.
-
-US-only, and it needs an active Robinhood Crypto account.
-
-**The guards, and why each exists:**
-
-- **`RH_OWNER_ID` gates every command.** McCap runs in shared servers. Without an
-  owner check any member could spend the account holder's money — so an unset
-  owner blocks *everyone*, and is never read as "anyone".
-- **Confirmation button** on every buy and sell, bound to the owner's user id so
-  nobody else can press it. It expires after `RH_CONFIRM_TIMEOUT`.
-- **Per-trade and daily dollar caps**, checked before the order is built *and
-  re-checked after confirmation* — a button can sit unclicked while other orders
-  land.
-- **The daily ledger is on the volume**, not in memory. McCap redeploys several
-  times a day, and a cap that resets on restart is not a cap.
-- **Order sizing rounds down.** Rounding up would breach the very cap the amount
-  was just checked against.
-- Spend is recorded **only after** Robinhood accepts the order.
-
-Note Robinhood lists roughly 15–30 mainstream coins. None of the Solana
-memecoins McCap alerts on are tradeable there — those exist only on DEXes.
-
 ### Robinhood Chain wallets and trading (`/rhc`)
 
 **Off by default. Custodial. Real money.** McCap generates one Robinhood Chain
@@ -140,17 +80,19 @@ what you are actively trading here.
 | `/rhc wallet show` | Address, ETH balance, today's remaining buy budget. |
 | `/rhc wallet export` | Reveal your private key (ephemeral, confirm first, logged). |
 | `/rhc wallet withdraw <to> <eth>` | Send ETH out. Confirm first. |
-| `/rhc quote <token> <eth>` | Best route and expected output, gas, price impact, and whether it can be sold straight back. Needs only the allowlist; works while trading is disabled. |
 | `/rhc buy <token> <eth> [slippage_bps]` | Quote, honeypot check, confirm, swap, receipt. Counts against your daily cap. |
 | `/rhc sell <token> <percent> [slippage_bps]` | Sell part of a holding for ETH. Exits are never capped. |
 | `/rhc holdings` | ETH and every token you have traded here, with rough USD values. |
+| `/rhc trending [window] [sort] [count] [include_majors]` | Busiest and fastest-moving tokens on the chain: volume, market cap at the start of the window → now, liquidity. Windows 5m to 24h; sort by volume, gainers, losers or newest. |
+| `/rhc new [count] [min_liquidity]` | Brand-new pairs from GeckoTerminal's new-pools feed, newest first, with age, liquidity, 1h volume and change. |
+| `/help` | Every command with what it does. |
 
 The bot's status line and its About Me (click McCap) show the combined total
 across all wallets: ETH, tokens traded through McCap, and a rough dollar value,
 refreshed every `PRESENCE_REFRESH_SECONDS`. Per-person figures stay behind
 `/rhc holdings`. `RHC_ABOUT_ME_ENABLE=0` leaves the profile text alone.
 
-`<token>` is a contract address or a symbol from `/rh_trending`. Quotes, trade
+`<token>` is a contract address or a symbol from `/rhc trending`. Quotes, trade
 results, wallet addresses, balances and holdings post to the channel so the
 group can see them (`RHC_PUBLIC_REPLIES=0` makes everything private). Confirm
 prompts, refusals and the private-key export are only ever visible to the user.
@@ -181,7 +123,7 @@ printf %s "$SECRET" | railway variable set RHC_WALLET_SECRET --stdin -s mccap --
 railway variable set RHC_TRADER_IDS=<discord ids, comma separated> RHC_TRADING_ENABLE=1 -s mccap
 ```
 
-`RH_OWNER_ID`, if set, is always on the trader allowlist too. New slash commands
+New slash commands
 are synced globally at startup and can take up to an hour to show in Discord
 clients; DM the bot `!sync` (owner only) or restart the Discord client to hurry it.
 
@@ -252,7 +194,7 @@ commands work anywhere, including DMs and servers the bot isn't in.
 
 | Works anywhere | Server-only |
 |---|---|
-| `/mc_list`, `/mc_recent`, `/mc_status`, `/mc_lp`, all of `/watch` | `/mc`, `/mc_move`, `/mc_remove` |
+| `/help`, `/mc_list`, `/mc_recent`, `/mc_status`, `/mc_check`, `/mc_lp`, all of `/watch`, `/memory` | `/mc`, `/mc_move`, `/mc_remove`, `/scans`, all of `/rhc` (server-installed; also usable in a DM with the bot) |
 
 Alert *creation* stays server-only for a structural reason: an alert fires
 minutes or days later, and a bot can only post unprompted into a channel it is
@@ -350,7 +292,7 @@ the Dockerfile.
 **Keep one replica.** Two instances means every alert posts twice.
 
 State files on the volume: `reminders.json`, `moves.json`, `watchlists.json`,
-`alerts.json`, `scans.json`, `rh_spend.json`, `chat_memory.json`, `chat_history.json`,
+`alerts.json`, `scans.json`, `chat_memory.json`, `chat_history.json`,
 `rhc_wallets.json` (encrypted keys; back it up), `rhc_ledger.json`, `rhc_trades.json`.
 The volume must be mounted at `DATA_DIR` itself: the image sets
 `RHC_REQUIRE_MOUNTED_DATA_DIR=1`, and wallet creation refuses when `DATA_DIR` is
@@ -399,7 +341,7 @@ cap at all.
 | Source | Used for | Key | Limit |
 |---|---|---|---|
 | DexScreener | live MC, liquidity, 24h change, pairs | none | ~300 req/min |
-| GeckoTerminal | historical OHLCV to seed momentum alerts; Robinhood-chain pools for `/rh_trending` | none | ~30 req/min |
+| GeckoTerminal | historical OHLCV to seed momentum alerts; Robinhood-chain pools for `/rhc trending` and `/rhc new` | none | ~30 req/min |
 | Claude API | chat replies (`ANTHROPIC_API_KEY`) | yes | per account |
 | KyberSwap Aggregator API | routes and swap calldata on Robinhood Chain | none (`X-Client-Id`) | unpublished; kept under 30/min |
 | Robinhood Chain RPC | balances, simulation, broadcasting | none (public) or a paid provider | public endpoint is rate limited |

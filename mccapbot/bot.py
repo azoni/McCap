@@ -6,6 +6,7 @@ from discord.ext import commands
 
 from .alerts import watcher as alerts_watcher
 from .config import (
+    CHAT_ENABLE,
     DEX_BLACKLIST,
     LOG_LEVEL,
     PRESENCE_REFRESH_SECONDS,
@@ -28,17 +29,17 @@ from .storage import (
     load_watchlist,
 )
 
-# Cogs loaded at startup. Each module exposes `async def setup(bot)`.
+# Cogs loaded at startup. Each module exposes `async def setup(bot)`. Cogs whose
+# feature is switched off are not loaded at all, so their slash commands are
+# not registered: a command that can only say "this is disabled" is clutter.
 EXTENSIONS = (
     "mccapbot.cogs.alerts",
     "mccapbot.cogs.watch",
     "mccapbot.cogs.lp",
     "mccapbot.cogs.check",
-    "mccapbot.cogs.trade",
-    "mccapbot.cogs.scans",
-    "mccapbot.cogs.chat",
     "mccapbot.cogs.rhc",
-)
+    "mccapbot.cogs.help",
+) + (("mccapbot.cogs.chat",) if CHAT_ENABLE else ()) + (("mccapbot.cogs.scans",) if SCAN_WATCH_ENABLE else ())
 
 
 class Bot(commands.Bot):
@@ -140,6 +141,10 @@ class Bot(commands.Bot):
         await load_memory()
         await load_chat_history()
 
+        if not CHAT_ENABLE:
+            log.info("Chat is off (no ANTHROPIC_API_KEY); /memory not registered.")
+        if not SCAN_WATCH_ENABLE:
+            log.info("Scan watching is off (SCAN_WATCH_ENABLE=0); /scans not registered.")
         for ext in EXTENSIONS:
             try:
                 await self.load_extension(ext)

@@ -103,6 +103,8 @@ class World:
         self.executed = []                  # BuiltSwap objects handed to swap.execute
         self.token_balance = 36 * 10**18
         self.eth_balance = 10**18
+        self.liquidity = 500_000.0
+        self.results = []                   # optional sequence of results for successive executes
         self.route_calls = 0
 
     def install(self, monkeypatch):
@@ -127,7 +129,13 @@ class World:
 
         async def execute(user_id, built, token, symbol):
             w.executed.append(built)
+            if w.results:
+                return w.results.pop(0)
             return w.result
+
+        async def summary(addr):
+            return {"liq": w.liquidity, "price": 0.7}
+        monkeypatch.setattr(cog, "token_summary", summary)
 
         async def eth_usd(self_):
             return w.eth_usd
@@ -202,7 +210,7 @@ async def test_buy_reserves_the_cap_and_reports_success(world):
     assert len(world.executed) == 1
     built = world.executed[0]
     assert built.min_out >= kyber.min_out(world.buy_route.amount_out, 200)
-    assert "counts as $25.00" in inter.texts[0]
+    assert "daily cap: $175.00 of $200.00 left after this" in inter.texts[0]
 
 
 @pytest.mark.asyncio
@@ -382,33 +390,52 @@ async def test_withdraw_refuses_the_zero_address_and_warns_on_contracts(world, m
 
 
 @pytest.mark.asyncio
-async def test_public_mode_posts_results_but_keeps_prompts_and_refusals_private(world, monkeypatch):
+async def test_public_mode_posts_prompts_and_results_but_keeps_refusals_private(world, monkeypatch):
     monkeypatch.setattr(cog, "PRIVATE", False)
     inter = FakeInteraction()
     await run_buy(inter)
-    prompt_kw = inter.followup.sent[0][1]
-    assert prompt_kw.get("ephemeral") is True, "the confirm prompt stays private"
-    assert inter.response.deferred_ephemeral is True
+    assert inter.response.deferred_ephemeral is False, "the buy prompt is public"
+    prompt = inter.followup.sent[0]
+    assert prompt[1].get("ephemeral") is False and "is buying" in prompt[0] and "Only tester can confirm" in prompt[0]
     assert inter.last.startswith("**tester** · ✅") and inter.last_kw.get("ephemeral") is False
 
     # A stranger's refusal is private and sent before any defer.
     stranger = FakeInteraction(user_id=99)
     await run_buy(stranger)
-    assert stranger.last_kw.get("ephemeral") is True and stranger.last.startswith("🔒")
-
-    # Quotes go public; the allowlist refusal for quotes is private and pre-defer.
-    ok = FakeInteraction()
-    await cog.RhcCog.quote.callback(cog.RhcCog(bot=None), ok, PONS, "0.01")
-    assert ok.response.deferred_ephemeral is False and ok.last_kw.get("ephemeral") is False
-    nope = FakeInteraction(user_id=99)
-    await cog.RhcCog.quote.callback(cog.RhcCog(bot=None), nope, PONS, "0.01")
-    assert nope.last_kw.get("via") == "response" and nope.last_kw.get("ephemeral") is True
-    assert nope.response.deferred_ephemeral is None, "refused before deferring"
+    assert stranger.last_kw.get("via") == "response" and stranger.last_kw.get("ephemeral") is True
+    assert stranger.last.startswith("🔒") and stranger.response.deferred_ephemeral is None
 
     # Export is private no matter what.
     exp = FakeInteraction()
     await cog.RhcCog.wallet_export.callback(cog.RhcCog(bot=None), exp)
     assert all(kw.get("ephemeral") is True for _c, kw in exp.followup.sent)
+
+
+@pytest.mark.asyncio
+async def test_thin_pool_warning_and_one_retry_on_a_slippage_revert(world):
+    world.liquidity = 4_000.0
+    world.results = [
+        swap.SwapResult(ok=False, error=cog.guard.SLIPPAGE_TEXT),   # simulation said the floor would not be met
+        swap.SwapResult(ok=True, tx="0xretry", amount_out=36 * 10**18, gas_cost_wei=10**14),
+    ]
+    inter = FakeInteraction()
+    await run_buy(inter)
+    assert "thin pool" in inter.texts[0] and "slippage_bps:500" in inter.texts[0]
+    assert inter.last.startswith("✅") and "0xretry" in inter.last
+    assert len(world.executed) == 2, "one fresh quote and retry, then success"
+    assert ledger.spent_today(USER) == pytest.approx(25.0), "the reservation stands after a successful retry"
+
+
+@pytest.mark.asyncio
+async def test_slippage_revert_twice_is_reported_plainly_and_refunded(world):
+    world.results = [
+        swap.SwapResult(ok=False, error=cog.guard.SLIPPAGE_TEXT),
+        swap.SwapResult(ok=False, error=cog.guard.SLIPPAGE_TEXT),
+    ]
+    inter = FakeInteraction()
+    await run_buy(inter)
+    assert inter.last.startswith("❌") and "Nothing was spent" in inter.last and "0x" not in inter.last
+    assert len(world.executed) == 2 and ledger.spent_today(USER) == 0.0
 
 
 @pytest.mark.asyncio

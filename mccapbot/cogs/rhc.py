@@ -1,10 +1,12 @@
-"""/rhc: Robinhood Chain wallets and DEX trading, per Discord user.
+"""/rhc: Robinhood Chain wallets, DEX trading, and the chain's trending board.
 
-Everything here is ephemeral. Balances, addresses and keys are the caller's
-business and nobody else's. Money moves only after a confirm button bound to
-the caller. Trading (buy/sell/quote) needs the trading flag and the allowlist;
-getting your own funds OUT (export, withdraw) needs only your wallet, so a
-kill switch never strands anyone. See ``mccapbot/rhc`` for the execution path.
+Trading (buy/sell) needs the trading flag and the allowlist; getting your own
+funds OUT (export, withdraw) needs only your wallet, so a kill switch never
+strands anyone. Money moves only after a confirm button bound to the caller.
+With ``RHC_PUBLIC_REPLIES`` on (the default) quotes, prompts, results, balances
+and the trending board post to the channel; refusals, the withdraw prompt and
+the private-key export are always visible only to the user. See
+``mccapbot/rhc`` for the execution path and its guards.
 """
 
 import os
@@ -16,7 +18,6 @@ from discord.ext import commands
 
 from .. import rhchain
 from ..config import (
-    RH_OWNER_ID,
     RHC_CONFIRM_TIMEOUT,
     RHC_DEFAULT_SLIPPAGE_BPS,
     RHC_GUILD_IDS,
@@ -28,9 +29,12 @@ from ..config import (
     RHC_TRADING_ENABLE,
 )
 from ..dex import token_summary
+from ..helpers import humanize
 from ..logging_setup import log
-from ..rhc import chain, kyber, ledger, swap, wallets
-from .trade import ConfirmOrder
+from ..rhc import chain, guard, kyber, ledger, swap, wallets
+from ..tables import add_table_fields
+
+THIN_POOL_USD = 25_000   # below this, warn that 2% slippage will often not survive the send
 
 CUSTODY_WARNING = (
     "**Read this once.** McCap holds this wallet's key, encrypted, on its server. Whoever runs the "
@@ -38,16 +42,56 @@ CUSTODY_WARNING = (
     "treat it like cash in a friend's drawer, not a bank."
 )
 
-# Visibility of results (quotes, trades, addresses, balances). Confirm prompts,
-# refusals and the key export never use this: they are always private.
+# Visibility of quotes, prompts, results and balances. Refusals, the withdraw
+# prompt and the key export never use this: they are always private.
 PRIVATE = not RHC_PUBLIC_REPLIES
+
+
+class ConfirmOrder(discord.ui.View):
+    """A single-use confirm/cancel prompt, bound to one user."""
+
+    def __init__(self, owner_id: int, timeout: int):
+        super().__init__(timeout=timeout)
+        self.owner_id = owner_id
+        self.value: Optional[bool] = None
+
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        # Buttons are visible to whoever can see the message; bind them to the
+        # owner so nobody else can press Confirm.
+        if inter.user.id != self.owner_id:
+            await inter.response.send_message("This isn't your order.", ephemeral=True)
+            return False
+        return True
+
+    # stop() runs in a finally: if editing the message fails, the waiter must
+    # still wake up now. Otherwise it wakes at the timeout with value already
+    # set and the order executes a minute after the click.
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
+    async def confirm(self, inter: discord.Interaction, _b: discord.ui.Button):
+        self.value = True
+        try:
+            for child in self.children:
+                child.disabled = True
+            await inter.response.edit_message(view=self)
+        finally:
+            self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, inter: discord.Interaction, _b: discord.ui.Button):
+        self.value = False
+        try:
+            for child in self.children:
+                child.disabled = True
+            await inter.response.edit_message(view=self)
+        finally:
+            self.stop()
 
 
 def _gate() -> Optional[str]:
     """Why trading is unavailable, or None if it is armed."""
     if not RHC_TRADING_ENABLE:
         return "Robinhood Chain trading is disabled (`RHC_TRADING_ENABLE=0`)."
-    if not RHC_TRADER_IDS and not RH_OWNER_ID:
+    if not RHC_TRADER_IDS:
         return "Nobody is on the trader allowlist (`RHC_TRADER_IDS`). An unset list never means everyone."
     vault = _vault_problem()
     if vault:
@@ -66,7 +110,7 @@ def _vault_problem() -> Optional[str]:
 
 
 def allowed(user_id: int) -> bool:
-    return user_id in RHC_TRADER_IDS or (bool(RH_OWNER_ID) and user_id == RH_OWNER_ID)
+    return user_id in RHC_TRADER_IDS
 
 
 def guild_ok(guild_id: Optional[int]) -> bool:
@@ -106,8 +150,7 @@ class RhcCog(commands.Cog):
             if reason:
                 log.warning("Robinhood Chain trading flag is on but blocked: %s", reason)
             else:
-                log.info("Robinhood Chain trading armed for %d allowlisted user(s)",
-                         len(RHC_TRADER_IDS) + (1 if RH_OWNER_ID and RH_OWNER_ID not in RHC_TRADER_IDS else 0))
+                log.info("Robinhood Chain trading armed for %d allowlisted user(s)", len(RHC_TRADER_IDS))
 
     # ---------------- gates ----------------
 
@@ -163,7 +206,7 @@ class RhcCog(commands.Cog):
             return chain.to_checksum(addr), sym or matches[0].symbol, dec
         if len(matches) > 1:
             raise ValueError(f"Several tokens use the symbol {q}; pass the contract address instead.")
-        raise ValueError(f"Unknown token {q!r}. Pass a contract address (see /rh_trending for the busy ones).")
+        raise ValueError(f"Unknown token {q!r}. Pass a contract address (see /rhc trending for the busy ones).")
 
     async def _eth_usd(self) -> Optional[float]:
         try:
@@ -177,7 +220,7 @@ class RhcCog(commands.Cog):
     # Guild-installed only (the bot posts results into channels), usable from a
     # server or a DM with the bot. Declared here so tree defaults cannot change it.
     rhc = app_commands.Group(
-        name="rhc", description="Robinhood Chain: your wallet and DEX trades",
+        name="rhc", description="Robinhood Chain: your wallet, DEX trades, and what's trending",
         allowed_installs=app_commands.AppInstallationType(guild=True, user=False),
         allowed_contexts=app_commands.AppCommandContext(guild=True, dm_channel=True, private_channel=False),
     )
@@ -225,8 +268,8 @@ class RhcCog(commands.Cog):
         usd = f" (≈ ${bal / 1e18 * eth_usd:,.2f})" if (bal is not None and eth_usd) else ""
         await inter.followup.send(
             f"**{inter.user.display_name}** · `{w.address}`\n**{eth} ETH**{usd}\n"
-            f"Today's buy budget left: ${ledger.remaining(inter.user.id):,.2f} of ${RHC_MAX_DAILY_USD:,.2f} "
-            f"(${RHC_MAX_TRADE_USD:,.2f} per trade)\n[Explorer]({chain.explorer_address(w.address)})",
+            f"Daily cap: ${ledger.remaining(inter.user.id):,.2f} of ${RHC_MAX_DAILY_USD:,.2f} left today "
+            f"(${RHC_MAX_TRADE_USD:,.2f} per buy)\n[Explorer]({chain.explorer_address(w.address)})",
             ephemeral=PRIVATE, suppress_embeds=True,
         )
 
@@ -315,15 +358,22 @@ class RhcCog(commands.Cog):
             return
         await self._reply(inter, self._describe(res, f"Sent {chain.fmt_units(amount, 18)} ETH"))
 
-    # ---------------- quotes and trades ----------------
+    # ---------------- trades ----------------
 
-    @rhc.command(name="quote", description="What an ETH amount buys of a token right now")
-    @app_commands.describe(token="Contract address or a symbol from /rh_trending", eth="ETH to spend, e.g. 0.01")
-    async def quote(self, inter: discord.Interaction, token: str, eth: str):
-        if not allowed(inter.user.id):
-            await self._send_private(inter, "🔒 You are not on the trader allowlist.")
+    @rhc.command(name="buy", description="Buy a token with ETH from your wallet (shows the quote, asks to confirm)")
+    @app_commands.describe(
+        token="Contract address or a symbol from /rhc trending", eth="ETH to spend, e.g. 0.01",
+        slippage_bps="Max slippage in basis points (default 200 = 2%)",
+    )
+    async def buy(self, inter: discord.Interaction, token: str, eth: str, slippage_bps: Optional[int] = None):
+        if await self._deny_trade(inter):
+            return
+        w = wallets.get(inter.user.id)
+        if w is None:
+            await self._send_private(inter, "You have no wallet yet. `/rhc wallet create` makes one.")
             return
         await inter.response.defer(thinking=True, ephemeral=PRIVATE)
+        bps = clamp_slippage(slippage_bps)
         try:
             addr, sym, dec = await self._resolve_token(token)
             amount = chain.to_units(eth, 18)
@@ -331,39 +381,15 @@ class RhcCog(commands.Cog):
         except (ValueError, kyber.KyberError, chain.ChainError) as e:
             await inter.followup.send(f"❌ {e}", ephemeral=PRIVATE)
             return
-        back, unavailable = await self._round_trip(addr, rt.amount_out)
-        await inter.followup.send(self._quote_text(rt, addr, sym, dec, back, unavailable), ephemeral=PRIVATE)
-
-    @rhc.command(name="buy", description="Buy a token with ETH from your wallet (asks to confirm)")
-    @app_commands.describe(
-        token="Contract address or a symbol from /rh_trending", eth="ETH to spend, e.g. 0.01",
-        slippage_bps="Max slippage in basis points (default 200 = 2%)",
-    )
-    async def buy(self, inter: discord.Interaction, token: str, eth: str, slippage_bps: Optional[int] = None):
-        await inter.response.defer(thinking=True, ephemeral=True)
-        if await self._deny_trade(inter):
-            return
-        w = wallets.get(inter.user.id)
-        if w is None:
-            await inter.followup.send("You have no wallet yet. `/rhc wallet create` makes one.", ephemeral=True)
-            return
-        bps = clamp_slippage(slippage_bps)
-        try:
-            addr, sym, dec = await self._resolve_token(token)
-            amount = chain.to_units(eth, 18)
-            rt = await kyber.route(chain.NATIVE, addr, amount)
-        except (ValueError, kyber.KyberError, chain.ChainError) as e:
-            await inter.followup.send(f"❌ {e}", ephemeral=True)
-            return
 
         eth_usd = await self._eth_usd()
         usd, why = await self._usd_basis(rt, amount, eth_usd)
         if usd is None:
-            await inter.followup.send(f"🚫 {why}", ephemeral=True)
+            await inter.followup.send(f"🚫 {why}", ephemeral=PRIVATE)
             return
         ok, why = ledger.check(inter.user.id, usd)
         if not ok:
-            await inter.followup.send(f"🚫 {why}", ephemeral=True)
+            await inter.followup.send(f"🚫 {why}", ephemeral=PRIVATE)
             return
         # Enough ETH for the trade AND its gas, said with numbers, before the
         # confirm prompt rather than after a reservation.
@@ -371,36 +397,52 @@ class RhcCog(commands.Cog):
             bal = await chain.native_balance(w.address)
             gas_price = await chain.gas_price()
         except chain.ChainError:
-            await inter.followup.send("❌ Could not read your balance on Robinhood Chain. Try again.", ephemeral=True)
+            await inter.followup.send("❌ Could not read your balance on Robinhood Chain. Try again.", ephemeral=PRIVATE)
             return
         need = amount + (rt.gas * (100 + swap.GAS_BUFFER_PCT) // 100) * gas_price * swap.FEE_MULTIPLIER
         if bal < need:
             await inter.followup.send(
                 f"🚫 Not enough ETH: you have {chain.fmt_units(bal, 18)} ETH and this needs about "
-                f"{chain.fmt_units(need, 18)} ETH including gas. Fund the wallet or size down.", ephemeral=True,
+                f"{chain.fmt_units(need, 18)} ETH including gas. Fund the wallet or size down.", ephemeral=PRIVATE,
             )
             return
         back, unavailable = await self._round_trip(addr, rt.amount_out)
         if unavailable:
             await inter.followup.send("❌ KyberSwap is not answering right now, so the sell-back check cannot run. "
-                                      "Try again in a minute.", ephemeral=True)
+                                      "Try again in a minute.", ephemeral=PRIVATE)
             return
         if back is None:
             await inter.followup.send(
                 f"🚫 **{sym}** cannot be sold back for ETH right now (no route). That is what a honeypot looks "
-                f"like; refusing to buy.", ephemeral=True,
+                f"like; refusing to buy.", ephemeral=PRIVATE,
             )
             return
 
+        # Liquidity tells the user whether the default slippage will survive
+        # the few seconds between quote and send.
+        liq_line = ""
+        try:
+            info = await token_summary(addr)
+            liq = (info or {}).get("liq")
+            if liq is not None:
+                liq_line = f"\nLiquidity ${humanize(liq)}"
+                if liq < THIN_POOL_USD and bps < 500:
+                    liq_line += (f" · **thin pool**: {bps / 100:.0f}% slippage often fails on these; "
+                                 f"re-run with `slippage_bps:500` if it does")
+        except Exception:
+            pass
+
         view = ConfirmOrder(inter.user.id, RHC_CONFIRM_TIMEOUT)
-        text = self._quote_text(rt, addr, sym, dec, back, False)
-        text += (f"\nSlippage **{bps / 100:.2f}%** · counts as ${usd:,.2f} against your caps · budget left after this: "
-                 f"${max(0.0, ledger.remaining(inter.user.id) - usd):,.2f}\n"
-                 f"This is a real swap from `{_short_addr(w.address)}`. Expires in {RHC_CONFIRM_TIMEOUT}s.")
-        await inter.followup.send(text, view=view, ephemeral=True)
+        text = f"**{inter.user.display_name}** is buying\n" + self._quote_text(rt, addr, sym, dec, back, False) + liq_line
+        text += (f"\nSlippage **{bps / 100:.2f}%** · daily cap: ${max(0.0, ledger.remaining(inter.user.id) - usd):,.2f} "
+                 f"of ${RHC_MAX_DAILY_USD:,.2f} left after this\n"
+                 f"Real swap from `{_short_addr(w.address)}`. Only {inter.user.display_name} can confirm; "
+                 f"expires in {RHC_CONFIRM_TIMEOUT}s.")
+        await inter.followup.send(text, view=view, ephemeral=PRIVATE)
         await view.wait()
         if not view.value:
-            await inter.followup.send("⏲️ Expired" if view.value is None else "Cancelled", ephemeral=True)
+            await inter.followup.send("⏲️ Expired, nothing was bought. Run it again and press Confirm."
+                                      if view.value is None else "Cancelled, nothing was bought.", ephemeral=True)
             return
 
         # The confirmed numbers are the deal. Always re-quote after the click (a
@@ -440,6 +482,17 @@ class RhcCog(commands.Cog):
             built = await kyber.build(rt, w.address, bps)
             built.min_out = max(built.min_out, confirmed_floor)
             res = await swap.execute(inter.user.id, built, addr, sym)
+            # A thin pool moves in the seconds between quote and send. When the
+            # pre-flight simulation says the slippage floor would not be met,
+            # nothing was sent, so one fresh quote and retry is free. The
+            # confirmed floor still applies: the user never gets less than they
+            # agreed to.
+            if not res.ok and not res.pending and guard.is_slippage_revert(res.error):
+                rt2 = await kyber.route(chain.NATIVE, addr, amount)
+                if rt2.amount_out >= confirmed_floor:
+                    built = await kyber.build(rt2, w.address, bps)
+                    built.min_out = max(built.min_out, confirmed_floor)
+                    res = await swap.execute(inter.user.id, built, addr, sym)
         except Exception as e:  # noqa: BLE001
             log.exception("Buy failed for user %s", inter.user.id)
             self._refund(inter.user.id, usd)
@@ -454,42 +507,44 @@ class RhcCog(commands.Cog):
 
     @rhc.command(name="sell", description="Sell a percentage of a token you hold for ETH (asks to confirm)")
     @app_commands.describe(
-        token="Contract address or a symbol from /rh_trending", percent="1 to 100",
+        token="Contract address or a symbol from /rhc trending", percent="1 to 100",
         slippage_bps="Max slippage in basis points (default 200 = 2%)",
     )
     async def sell(self, inter: discord.Interaction, token: str, percent: int, slippage_bps: Optional[int] = None):
-        await inter.response.defer(thinking=True, ephemeral=True)
         if await self._deny_trade(inter):
             return
         w = wallets.get(inter.user.id)
         if w is None:
-            await inter.followup.send("You have no wallet yet.", ephemeral=True)
+            await self._send_private(inter, "You have no wallet yet.")
             return
+        await inter.response.defer(thinking=True, ephemeral=PRIVATE)
         pct = max(1, min(int(percent), 100))
         bps = clamp_slippage(slippage_bps)
         try:
             addr, sym, dec = await self._resolve_token(token)
             have = await chain.erc20_balance(addr, w.address)
             if have <= 0:
-                await inter.followup.send(f"You hold no {sym}.", ephemeral=True)
+                await inter.followup.send(f"You hold no {sym}.", ephemeral=PRIVATE)
                 return
             amount = have * pct // 100
             rt = await kyber.route(addr, chain.NATIVE, amount)
         except (ValueError, kyber.KyberError, chain.ChainError) as e:
-            await inter.followup.send(f"❌ {e}", ephemeral=True)
+            await inter.followup.send(f"❌ {e}", ephemeral=PRIVATE)
             return
 
         view = ConfirmOrder(inter.user.id, RHC_CONFIRM_TIMEOUT)
         await inter.followup.send(
-            f"Sell **{chain.fmt_units(amount, dec)} {sym}** ({pct}% of your {chain.fmt_units(have, dec)}) for "
-            f"**≈ {chain.fmt_units(rt.amount_out, 18)} ETH** ({_fmt_usd(rt.amount_out_usd)})\n"
-            f"Token `{addr}`\n"
+            f"**{inter.user.display_name}** is selling **{chain.fmt_units(amount, dec)} {sym}** "
+            f"({pct}% of {chain.fmt_units(have, dec)}) for **≈ {chain.fmt_units(rt.amount_out, 18)} ETH** "
+            f"({_fmt_usd(rt.amount_out_usd)})\nToken `{addr}`\n"
             f"Route: {', '.join(rt.hops) or '?'} · gas ≈ {_fmt_usd(rt.gas_usd)} · slippage {bps / 100:.2f}%\n"
-            f"This is a real swap. Expires in {RHC_CONFIRM_TIMEOUT}s.", view=view, ephemeral=True,
+            f"Real swap. Only {inter.user.display_name} can confirm; expires in {RHC_CONFIRM_TIMEOUT}s.",
+            view=view, ephemeral=PRIVATE,
         )
         await view.wait()
         if not view.value:
-            await inter.followup.send("⏲️ Expired" if view.value is None else "Cancelled", ephemeral=True)
+            await inter.followup.send("⏲️ Expired, nothing was sold. Run it again and press Confirm."
+                                      if view.value is None else "Cancelled, nothing was sold.", ephemeral=True)
             return
         confirmed_floor = kyber.min_out(rt.amount_out, bps)
         try:
@@ -544,6 +599,165 @@ class RhcCog(commands.Cog):
             except Exception:
                 lines.append(f"`{_short_addr(addr)}`: balance unavailable")
         await inter.followup.send("\n".join(lines), ephemeral=PRIVATE)
+
+    # ---------------- trending ----------------
+
+    WINDOW_CHOICES = [
+        app_commands.Choice(name="5 minutes", value="m5"),
+        app_commands.Choice(name="15 minutes", value="m15"),
+        app_commands.Choice(name="30 minutes", value="m30"),
+        app_commands.Choice(name="1 hour", value="h1"),
+        app_commands.Choice(name="6 hours", value="h6"),
+        app_commands.Choice(name="24 hours", value="h24"),
+    ]
+
+    @staticmethod
+    def _addresses_field(embed: discord.Embed, tokens) -> None:
+        """Addresses are what /rhc buy needs, and a table cell is not copyable."""
+        lines = [f"{t.symbol[:10]:<10} {t.address}" for t in tokens[:15]]
+        if lines:
+            embed.add_field(name="Addresses (for /rhc buy and /mc)", value="```\n" + "\n".join(lines) + "\n```", inline=False)
+        links = " · ".join(f"[{t.symbol[:10]}]({t.deepest.url()})" for t in tokens[:10])
+        if links:
+            embed.add_field(name="Charts", value=links[:1024], inline=False)
+
+    @rhc.command(name="trending", description="Busiest and fastest-moving tokens on the Robinhood chain")
+    @app_commands.describe(
+        window="Volume and market-cap change over 5m to 24h (default 24h)",
+        sort="volume (default), gainers, losers, or newest pools",
+        count="How many to show (default 10, max 25)",
+        include_majors="Also show WETH / USDG / stablecoin pools (hidden by default)",
+    )
+    @app_commands.choices(
+        window=WINDOW_CHOICES,
+        sort=[
+            app_commands.Choice(name="volume", value="volume"),
+            app_commands.Choice(name="gainers", value="gainers"),
+            app_commands.Choice(name="losers", value="losers"),
+            app_commands.Choice(name="new", value="new"),
+        ],
+    )
+    async def trending(
+        self,
+        inter: discord.Interaction,
+        window: Optional[app_commands.Choice[str]] = None,
+        sort: Optional[app_commands.Choice[str]] = None,
+        count: Optional[int] = 10,
+        include_majors: bool = False,
+    ):
+        # Public market data: no allowlist, no gate.
+        await inter.response.defer(thinking=True)
+        w = window.value if window else "h24"
+        mode = sort.value if sort else "volume"
+        n = max(1, min(int(count or 10), 25))
+        label = rhchain.WINDOW_LABELS[w]
+
+        pools = await rhchain.top_pools()
+        if not pools:
+            await inter.followup.send("Couldn't reach GeckoTerminal for Robinhood chain pools. Try again shortly.")
+            return
+        tokens = rhchain.aggregate(pools)
+        top = rhchain.rank(tokens, w, mode, include_majors=include_majors, n=n)
+        if not top:
+            await inter.followup.send("Nothing to show for that filter.")
+            return
+
+        def pct(v: Optional[float]) -> str:
+            return f"{v:+.1f}%" if v is not None else "—"
+
+        def mc(v: Optional[float]) -> str:
+            return f"${humanize(v)}" if v else "—"
+
+        # "MC then → now" is the number people want for a mover: $800K to $1.1M
+        # inside the window, not just a percentage.
+        rows = [[
+            t.symbol[:10],
+            f"${humanize(t.volume(w))}",
+            pct(t.change(w)),
+            mc(t.mc_before(w)),
+            mc(t.mc_usd),
+            f"${humanize(t.liq_usd)}",
+        ] for t in top]
+
+        shown_tokens = [t for t in tokens if include_majors or t.symbol.upper() not in rhchain.CHAIN_MAJORS]
+        total_vol = sum(t.volume(w) for t in shown_tokens)
+        venues = sorted({p.dex for t in shown_tokens for p in t.pools})
+        titles = {"volume": f"top by {label} volume", "gainers": f"{label} gainers",
+                  "losers": f"{label} losers", "new": "newest of the busy pools"}
+        embed = discord.Embed(
+            title=f"Robinhood chain · {titles[mode]}",
+            colour=0x2ECC71 if mode != "losers" else 0xE74C3C,
+            description=(
+                f"{len(shown_tokens)} token(s) in the {len(pools)} busiest pools · "
+                f"**${humanize(total_vol)}** traded in {label} · "
+                f"{', '.join(venues) if venues else 'no venues'}"
+            ),
+        )
+        shown, total = add_table_fields(
+            embed, f"Volume, market cap {label} ago → now, liquidity",
+            ["Token", f"Vol {label}", f"Δ {label}", f"MC {label} ago", "MC now", "Liq"], rows,
+            ["l", "r", "r", "r", "r", "r"], max_fields=3,
+        )
+        self._addresses_field(embed, top)
+        foot = "GeckoTerminal · Robinhood chain DEX pools · /rhc new for brand-new pairs"
+        foot += "" if include_majors else " · WETH/USDG/stables hidden (include_majors to show)"
+        if shown < total:
+            foot += f" · {total - shown} row(s) not shown"
+        embed.set_footer(text=foot)
+        await inter.followup.send(embed=embed)
+
+    @rhc.command(name="new", description="Brand-new pairs on the Robinhood chain, newest first")
+    @app_commands.describe(
+        count="How many to show (default 10, max 25)",
+        min_liquidity="Hide pools with less than this many dollars of liquidity (default 1000)",
+    )
+    async def new(self, inter: discord.Interaction, count: Optional[int] = 10, min_liquidity: Optional[int] = 1000):
+        await inter.response.defer(thinking=True)
+        n = max(1, min(int(count or 10), 25))
+        floor = max(0, int(min_liquidity if min_liquidity is not None else 1000))
+        pools = await rhchain.new_pools()
+        if not pools:
+            await inter.followup.send("Couldn't reach GeckoTerminal for new Robinhood chain pools. Try again shortly.")
+            return
+        tokens = rhchain.aggregate(pools)
+        tokens = [t for t in tokens if t.symbol.upper() not in rhchain.CHAIN_MAJORS]
+        kept = [t for t in tokens if t.liq_usd >= floor]
+        kept.sort(key=lambda t: -t.created_ts)
+        top = kept[:n]
+        if not top:
+            await inter.followup.send(f"No new pairs with at least ${floor:,} of liquidity right now "
+                                      f"({len(tokens)} seen). Lower min_liquidity to see the dust.")
+            return
+
+        def pct(v: Optional[float]) -> str:
+            return f"{v:+.1f}%" if v is not None else "—"
+
+        rows = [[
+            t.symbol[:10],
+            rhchain.age_str(t.created_ts),
+            f"${humanize(t.liq_usd)}",
+            f"${humanize(t.volume('h1'))}",
+            pct(t.change("h1")),
+            f"${humanize(t.mc_usd)}" if t.mc_usd else "—",
+        ] for t in top]
+        embed = discord.Embed(
+            title="Robinhood chain · newest pairs",
+            colour=0x3498DB,
+            description=(f"{len(kept)} of the {len(tokens)} newest pools have ≥ ${floor:,} liquidity · "
+                         f"oldest shown {rhchain.age_str(top[-1].created_ts)} · most are dust: check the sell-back "
+                         f"line in /rhc buy before touching one"),
+        )
+        shown, total = add_table_fields(
+            embed, "Age, liquidity, 1h volume, 1h change, market cap",
+            ["Token", "Age", "Liq", "Vol 1h", "Δ 1h", "MC"], rows,
+            ["l", "r", "r", "r", "r", "r"], max_fields=3,
+        )
+        self._addresses_field(embed, top)
+        foot = "GeckoTerminal new-pools feed · WETH/USDG/stables hidden"
+        if shown < total:
+            foot += f" · {total - shown} row(s) not shown"
+        embed.set_footer(text=foot)
+        await inter.followup.send(embed=embed)
 
     # ---------------- helpers ----------------
 

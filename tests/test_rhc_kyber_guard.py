@@ -281,8 +281,15 @@ async def test_simulate_refuses_below_floor_empty_result_reverts_and_blindness(m
     async def revert(tx, overrides=None):
         raise chain.RevertError("execution reverted: Return amount is not enough")
     monkeypatch.setattr(chain, "call", revert)
-    with pytest.raises(guard.GuardError, match="would revert"):
+    with pytest.raises(guard.GuardError, match="slippage limit"):
         await guard.simulate(make_built(), PHANTOM)
+
+    async def other_revert(tx, overrides=None):
+        raise chain.RevertError("execution reverted: 0x08c379a" + "0" * 120)
+    monkeypatch.setattr(chain, "call", other_revert)
+    with pytest.raises(guard.GuardError, match="would revert") as exc:
+        await guard.simulate(make_built(), PHANTOM)
+    assert "0x…" in str(exc.value) and "Nothing was spent" in str(exc.value)
 
     async def blind(tx, overrides=None):
         raise chain.RpcUnavailable("all RPCs failed")

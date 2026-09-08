@@ -163,30 +163,7 @@ JUPITER_MAX_REQUESTS_PER_MIN = _env_int("JUPITER_MAX_REQUESTS_PER_MIN", 30)
 # Flag a token in alert embeds when the top 10 wallets hold more than this.
 TOP_HOLDER_WARN_PCT = float(os.getenv("TOP_HOLDER_WARN_PCT", "50"))
 
-# ---- Robinhood Crypto trading ----
-# Real orders against a real brokerage account. Every default here is the safe
-# one: trading is OFF, and it stays off until an owner id is set.
-RH_TRADING_ENABLE = _env_flag("RH_TRADING_ENABLE", False)
-RH_BASE_URL = os.getenv("RH_BASE_URL", "https://trading.robinhood.com")
-RH_API_KEY = (os.getenv("RH_API_KEY") or "").strip()
-# Base64 Ed25519 private key seed. Never logged, never echoed to Discord.
-RH_PRIVATE_KEY_B64 = (os.getenv("RH_PRIVATE_KEY_B64") or "").strip()
-
-# The ONLY Discord user allowed to trade. McCap runs in shared servers, so
-# without this any member could spend the account owner's money. Trading refuses
-# to arm at all when this is unset — an empty owner must never mean "everyone".
-RH_OWNER_ID = _env_int("RH_OWNER_ID", 0)
-
-# Hard ceilings enforced in our code before anything is sent upstream.
-RH_MAX_TRADE_USD = float(os.getenv("RH_MAX_TRADE_USD", "25"))
-RH_MAX_DAILY_USD = float(os.getenv("RH_MAX_DAILY_USD", "100"))
-# Seconds a confirmation button stays live before it expires unclicked.
-RH_CONFIRM_TIMEOUT = _env_int("RH_CONFIRM_TIMEOUT", 60)
-RH_TIMEOUT = _env_int("RH_TIMEOUT", 15)
-# Spend ledger lives on the volume so a redeploy cannot reset the daily cap.
-RH_SPEND_FILE = str(DATA_DIR / "rh_spend.json")
-
-# ---- Robinhood chain (DEX activity for /rh_trending) ----
+# ---- Robinhood chain (DEX activity for /rhc trending and /rhc new) ----
 # Robinhood's own API is execution-only and has no chain data at all, and
 # DexScreener has no per-chain listing. GeckoTerminal lists a network's pools
 # sorted by 24h volume, 20 per page, keyless.
@@ -252,7 +229,7 @@ RHC_MAX_TRADE_USD = float(os.getenv("RHC_MAX_TRADE_USD", "50"))
 RHC_MAX_DAILY_USD = float(os.getenv("RHC_MAX_DAILY_USD", "200"))
 RHC_DEFAULT_SLIPPAGE_BPS = _env_int("RHC_DEFAULT_SLIPPAGE_BPS", 200)
 RHC_MAX_SLIPPAGE_BPS = _env_int("RHC_MAX_SLIPPAGE_BPS", 1000)
-RHC_CONFIRM_TIMEOUT = _env_int("RHC_CONFIRM_TIMEOUT", 60)
+RHC_CONFIRM_TIMEOUT = _env_int("RHC_CONFIRM_TIMEOUT", 120)
 # Post quotes, trade results, addresses and balances to the channel. Confirm
 # prompts, refusals and the private-key export are always visible only to the
 # user. Set to 0 to keep everything private.
