@@ -381,11 +381,21 @@ async def test_sell_autocomplete_lists_holdings_with_amounts(world, monkeypatch)
         return 36 * 10**18 if token.lower() == PONS else 0     # GONE was fully sold
     monkeypatch.setattr(chain, "erc20_balance", erc20_balance)
     cog.RhcCog._bal_cache.clear()
+    cog.RhcCog._price_cache.clear()
 
     c = cog.RhcCog(bot=None)
     choices = await c._holding_choices(USER, "")
     assert [ch.value.lower() for ch in choices] == [PONS], "only tokens with a balance are offered"
-    assert choices[0].name == "PONS · 36 · cost $20.00"
+    # 36 PONS bought for $20 ($0.556 each), priced at $0.70 now: worth $25.20, 1.26x.
+    assert choices[0].name == "PONS · 36 · cost $20.00 · now $25.20 · 1.26x"
+
+    async def no_price(addr):
+        return None
+    monkeypatch.setattr(cog.trade, "summary", no_price)
+    cog.RhcCog._price_cache.clear()
+    assert (await c._holding_choices(USER, ""))[0].name == "PONS · 36 · cost $20.00", "no price, no 'now' part"
+    assert cog.RhcCog.auto_sell._params["token"].autocomplete is cog.RhcCog.sell._params["token"].autocomplete, \
+        "/rh auto sell offers the same picker of what you hold"
     assert await c._holding_choices(USER, "po") and not await c._holding_choices(USER, "zzz")
     assert await c._holding_choices(999, "") == [], "no wallet, no choices"
 

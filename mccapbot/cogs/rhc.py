@@ -1325,14 +1325,19 @@ class RhcCog(commands.Cog):
 
     # ---------------- autocomplete ----------------
 
-    _bal_cache: dict = {}   # (user_id, token) -> (ts, raw balance)
+    _bal_cache: dict = {}     # (user_id, token) -> (ts, raw balance)
+    _price_cache: dict = {}   # token -> (ts, price or None)
+    CHOICE_CACHE_SECONDS = 60
+    CHOICE_READ_TIMEOUT = 2.5   # Discord allows 3s for the whole answer; both reads run in parallel
 
     async def _holding_choices(self, user_id: int, current: str) -> list:
-        """What the caller holds, as pick-one choices for the sell command.
+        """What the caller holds, as pick-one choices for the sell commands:
+        ``PONS · 36 · cost $20.00 · now $25.20 · 1.26x``.
 
-        Autocomplete has about three seconds to answer, so balances come from a
-        short cache and a bounded RPC read; a token whose balance cannot be read
-        in time is simply left out this keystroke.
+        Autocomplete has about three seconds to answer, so balances and prices
+        come from short caches and bounded reads, all in parallel; a token whose
+        balance cannot be read in time is left out this keystroke, and one
+        whose price cannot be read shows without its "now" part.
         """
         w = wallets.get(user_id)
         if w is None:
@@ -1343,16 +1348,28 @@ class RhcCog(commands.Cog):
 
         async def balance(addr: str) -> int:
             hit = self._bal_cache.get((user_id, addr))
-            if hit and now - hit[0] < 60:
+            if hit and now - hit[0] < self.CHOICE_CACHE_SECONDS:
                 return hit[1]
-            raw = await asyncio.wait_for(chain.erc20_balance(addr, w.address), 1.5)
+            raw = await asyncio.wait_for(chain.erc20_balance(addr, w.address), self.CHOICE_READ_TIMEOUT)
             self._bal_cache[(user_id, addr)] = (now, raw)
             return raw
 
-        results = await asyncio.gather(*(balance(a) for a in addrs), return_exceptions=True)
+        async def price(addr: str) -> Optional[float]:
+            hit = self._price_cache.get(addr)
+            if hit and now - hit[0] < self.CHOICE_CACHE_SECONDS:
+                return hit[1]
+            info = await asyncio.wait_for(trade.summary(addr), self.CHOICE_READ_TIMEOUT)
+            value = (info or {}).get("price")
+            self._price_cache[addr] = (now, value)
+            return value
+
+        balances, prices = await asyncio.gather(
+            asyncio.gather(*(balance(a) for a in addrs), return_exceptions=True),
+            asyncio.gather(*(price(a) for a in addrs), return_exceptions=True),
+        )
         q = (current or "").strip().lower()
         choices = []
-        for addr, raw in zip(addrs, results):
+        for addr, raw, px in zip(addrs, balances, prices):
             if isinstance(raw, BaseException) or raw <= 0:
                 continue
             p = positions.get(addr)
@@ -1360,13 +1377,19 @@ class RhcCog(commands.Cog):
             if q and q not in sym.lower() and q not in addr.lower():
                 continue
             amount = raw / 10 ** dec
-            label = f"{sym}{SEP}{qty(amount)}"
-            if p and p.avg_cost:
-                label += f"{SEP}cost {usd_str(amount * p.avg_cost)}"
+            px = None if isinstance(px, BaseException) else px
+            avg_cost = p.avg_cost if p else None
+            label = footer(
+                f"{sym}", qty(amount),
+                f"cost {usd_str(amount * avg_cost)}" if avg_cost else "",
+                f"now {usd_str(amount * px)}" if px else "",
+                mult(px / avg_cost) if (px and avg_cost) else "",
+            )
             choices.append(app_commands.Choice(name=label[:100], value=chain.to_checksum(addr)))
         return choices[:25]
 
     @sell.autocomplete("token")
+    @auto_sell.autocomplete("token")
     async def sell_token_autocomplete(self, inter: discord.Interaction, current: str):
         try:
             return await self._holding_choices(inter.user.id, current)
