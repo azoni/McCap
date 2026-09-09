@@ -27,6 +27,7 @@ from .logging_setup import log
 # doubles as market-cap change: supply does not move inside a window.
 WINDOWS = ("m5", "m15", "m30", "h1", "h6", "h24")
 WINDOW_LABELS = {"m5": "5m", "m15": "15m", "m30": "30m", "h1": "1h", "h6": "6h", "h24": "24h"}
+WINDOW_SECONDS = {"m5": 300, "m15": 900, "m30": 1800, "h1": 3600, "h6": 21600, "h24": 86400}
 SORTS = ("volume", "gainers", "losers", "new")
 
 # The chain's plumbing rather than something to trade: hidden by default so the
@@ -51,9 +52,16 @@ class Pool:
     buys_h24: int
     sells_h24: int
     created_ts: float
+    # window -> {"buys", "sells", "buyers", "sellers"}: how many trades and how
+    # many distinct wallets, per window. Unique buyers in the last 5 minutes is
+    # the cleanest "is anyone actually here" signal GeckoTerminal offers.
+    tx: Dict[str, Dict[str, int]] = field(default_factory=dict)
 
     def url(self) -> str:
         return f"https://www.geckoterminal.com/{RHCHAIN_NETWORK}/pools/{self.address}"
+
+    def count(self, window: str, what: str) -> int:
+        return int((self.tx.get(window) or {}).get(what) or 0)
 
 
 @dataclass
@@ -101,6 +109,30 @@ class TokenActivity:
     @property
     def sells_h24(self) -> int:
         return sum(p.sells_h24 for p in self.pools)
+
+    def buys(self, window: str) -> int:
+        return sum(p.count(window, "buys") for p in self.pools)
+
+    def sells(self, window: str) -> int:
+        return sum(p.count(window, "sells") for p in self.pools)
+
+    def buyers(self, window: str) -> int:
+        """Distinct buying wallets across the token's pools (a wallet active in
+        two pools counts twice; close enough for a signal)."""
+        return sum(p.count(window, "buyers") for p in self.pools)
+
+    def sellers(self, window: str) -> int:
+        return sum(p.count(window, "sellers") for p in self.pools)
+
+    def volume_pace(self, short: str = "m5", long: str = "h1") -> Optional[float]:
+        """How much faster money is moving now than over the longer window:
+        the short window's volume scaled to the long window's length, divided
+        by the long window's volume. 3.0 means the last five minutes ran at
+        three times the hour's pace. None when the long window is empty."""
+        long_vol = self.volume(long)
+        if long_vol <= 0:
+            return None
+        return (self.volume(short) * WINDOW_SECONDS[long] / WINDOW_SECONDS[short]) / long_vol
 
     @property
     def venues(self) -> List[str]:
@@ -160,7 +192,12 @@ def parse_pools(payload: Optional[Dict]) -> List[Pool]:
             continue
         vol = a.get("volume_usd") or {}
         chg = a.get("price_change_percentage") or {}
-        tx = (a.get("transactions") or {}).get("h24") or {}
+        all_tx = a.get("transactions") or {}
+        tx = all_tx.get("h24") or {}
+        per_window = {
+            w: {k: int(_f((all_tx.get(w) or {}).get(k)) or 0) for k in ("buys", "sells", "buyers", "sellers")}
+            for w in WINDOWS if isinstance(all_tx.get(w), dict)
+        }
         out.append(Pool(
             address=address,
             name=a.get("name") or "",
@@ -177,6 +214,7 @@ def parse_pools(payload: Optional[Dict]) -> List[Pool]:
             buys_h24=int(_f(tx.get("buys")) or 0),
             sells_h24=int(_f(tx.get("sells")) or 0),
             created_ts=_ts(a.get("pool_created_at")),
+            tx=per_window,
         ))
     return out
 

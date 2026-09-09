@@ -22,7 +22,9 @@ def gt_pool(addr, base, quote="WETH", dex="uniswap-v3-robinhood", vol24=1_000.0,
             "fdv_usd": None if fdv is None else str(fdv),
             "volume_usd": {"m5": "0", "h1": str(vol1), "h6": str(vol1 * 3), "h24": str(vol24)},
             "price_change_percentage": {"h1": str(chg1), "h6": "0", "h24": None if chg24 is None else str(chg24)},
-            "transactions": {"h24": {"buys": 5, "sells": 3}},
+            "transactions": {"m5": {"buys": 2, "sells": 1, "buyers": 2, "sellers": 1},
+                             "h1": {"buys": 4, "sells": 2, "buyers": 3, "sellers": 2},
+                             "h24": {"buys": 5, "sells": 3, "buyers": 4, "sellers": 3}},
             "pool_created_at": created,
         },
         "relationships": {
@@ -233,3 +235,28 @@ def test_an_empty_first_page_stops_paging(monkeypatch):
     monkeypatch.setattr(rhchain, "RHCHAIN_PAGES", 3)
     assert asyncio.run(rhchain.top_pools()) == []
     assert len(calls) == 1
+
+
+# ---------------- per-window trades and unique wallets ----------------
+
+
+def test_parse_keeps_per_window_trade_counts_and_unique_wallets():
+    pools = rhchain.parse_pools(PAYLOAD)
+    p = pools[0]
+    assert p.count("m5", "buyers") == 2 and p.count("h1", "sells") == 2 and p.count("h24", "sellers") == 3
+    assert p.count("m30", "buys") == 0, "a window the payload did not carry reads as zero, never as an error"
+    assert p.buys_h24 == 5 and p.sells_h24 == 3, "the old fields still say what they said"
+
+
+def test_token_activity_sums_windows_and_measures_volume_pace():
+    tokens = {t.symbol: t for t in rhchain.aggregate(rhchain.parse_pools(PAYLOAD))}
+    pons = tokens["PONS"]
+    assert pons.buyers("m5") == 4 and pons.sells("h1") == 4 and pons.buys("h24") == pons.buys_h24
+    # The fixture has no 5m volume, so the pace over the hour is zero, and a
+    # token with no hourly volume has no pace at all rather than a division error.
+    assert pons.volume_pace("m5", "h1") == 0.0
+    quiet = rhchain.TokenActivity(symbol="Q", name="Q", address="0xq")
+    assert quiet.volume_pace() is None
+    pons.pools[0].volume["m5"] = pons.volume("h1") / 12 * 3     # five minutes at three times the hour's pace
+    assert pons.volume_pace("m5", "h1") == pytest.approx(3.0)
+
