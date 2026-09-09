@@ -88,3 +88,47 @@ def test_seed_respects_the_sample_cap():
 def test_empty_seed_is_harmless():
     assert history.seed("A", []) == 0
     assert history.pct_change("A", 3600, now=1000) is None
+
+
+# ---------------- which network a token lives on ----------------
+
+
+@pytest.mark.asyncio
+async def test_backfill_asks_geckoterminal_about_the_right_network(monkeypatch):
+    """Every Robinhood momentum alert used to be blind for half its window after a
+    restart: backfill was hard-wired to Solana, so a 0x token found no pool."""
+    from mccapbot import gecko
+    urls = []
+
+    async def fake_get_json(url, limiter=None):
+        urls.append(url)
+        if "/tokens/" in url:
+            return {"data": [{"attributes": {"address": "pool1", "name": "TOK / USDG", "reserve_in_usd": "1000"}}]}
+        return {"data": {"attributes": {"ohlcv_list": [[2000, 1, 1, 1, 2.0, 5], [1000, 1, 1, 1, 1.0, 5]]}}}
+    monkeypatch.setattr(gecko, "get_json", fake_get_json)
+
+    evm = "0x" + "ab" * 20
+    assert gecko.network_for(evm) == "robinhood" and gecko.network_for("So11111111111111111111111111111111111111112") == "solana"
+    assert await gecko.backfill(evm, 3600, 100.0) == 2
+    assert all("/networks/robinhood/" in u for u in urls), urls
+    urls.clear()
+    await gecko.backfill("So11111111111111111111111111111111111111112", 3600, 100.0)
+    assert all("/networks/solana/" in u for u in urls), urls
+    urls.clear()
+    await gecko.backfill(evm, 3600, 100.0, network="base")
+    assert all("/networks/base/" in u for u in urls), "an explicit network wins"
+
+
+@pytest.mark.asyncio
+async def test_top_pool_treats_usdg_as_a_major_quote(monkeypatch):
+    from mccapbot import gecko
+
+    async def fake_get_json(url, limiter=None):
+        return {"data": [
+            {"attributes": {"address": "weth", "name": "TOK / WETH", "reserve_in_usd": "20000"}},
+            {"attributes": {"address": "usdg", "name": "TOK / USDG", "reserve_in_usd": "500000"}},
+            {"attributes": {"address": "junk", "name": "TOK / NVDA", "reserve_in_usd": "900000"}},
+        ]}
+    monkeypatch.setattr(gecko, "get_json", fake_get_json)
+    pool = await gecko.top_pool("0x" + "ab" * 20, "robinhood")
+    assert pool["attributes"]["address"] == "usdg", "the deepest MAJOR-quoted pool, not the deepest pool"

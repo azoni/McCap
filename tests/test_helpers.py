@@ -182,3 +182,8 @@ def test_parse_window_rejects_out_of_range(raw):
 def test_human_window_roundtrip():
     for raw in ("15m", "1h", "4h", "1d"):
         assert human_window(parse_window(raw)) == raw
+
+
+def test_age_reads_like_a_board():
+    from mccapbot.helpers import age
+    assert age(240) == "4m" and age(7200) == "2h" and age(3 * 86400 + 5) == "3d" and age(-5) == "0m"

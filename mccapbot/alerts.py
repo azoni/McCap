@@ -14,7 +14,16 @@ from .config import (
     RHC_DEX_CHAIN_ID,
     TOP_HOLDER_WARN_PCT,
 )
-from .dex import build_token_url, choose_consensus_pair, fetch_dex_token, get_image_url, resolve_mc_value, volume_1h
+from .dex import (
+    build_token_url,
+    choose_consensus_pair,
+    fetch_dex_token,
+    get_image_url,
+    liquidity_total,
+    pair_stats,
+    resolve_mc_value,
+    volume_1h,
+)
 from .helpers import BAD, GOOD, SEP, footer, human_window, humanize, is_evm_address, meets, pct, usd, username_from_id
 from .logging_setup import log
 from .models import AlertEvent, TokenSnapshot
@@ -147,12 +156,16 @@ async def _refresh(ca: str) -> bool:
 
     mc_val: Optional[float] = None
     vol1h: Optional[float] = None
+    liq: Optional[float] = None
+    stats: Dict[str, Any] = {}
     src, link, dex, chain, quote, consensus, img = "none", None, "", "", "", 0.0, ""
 
     if isinstance(data, dict) and data.get("pairs"):
         vol1h = volume_1h(data["pairs"], ca)
+        liq = liquidity_total(data["pairs"], ca)
         best, consensus, _ = choose_consensus_pair(data["pairs"], ca)
         if best:
+            stats = pair_stats(best)
             mc_val, src = resolve_mc_value(best, ca)
             link = build_token_url(ca, best)
             dex = best.get("dexId", "")
@@ -183,9 +196,25 @@ async def _refresh(ca: str) -> bool:
             delta=(abs((mc_val or 0) - consensus) if mc_val and consensus else None),
             image_url=img,
             vol1h=vol1h,
+            liq_usd=liq,
+            **stats,
         )
     history.record(ca, mc_val, now)
     return True
+
+
+def context_line(snap: Optional[TokenSnapshot]) -> str:
+    """One line of what the pair looks like right now: liquidity, 5m trades,
+    1h change. Parts the snapshot does not know are left out, never shown as
+    zero, so a token with no 5m trades reads as quiet rather than broken."""
+    if snap is None:
+        return ""
+    trades = f"5m {snap.buys_m5} buys / {snap.sells_m5} sells" if (snap.buys_m5 or snap.sells_m5) else ""
+    return footer(
+        f"liq {usd(snap.liq_usd)}" if snap.liq_usd is not None else "",
+        trades,
+        f"1h {pct(snap.change_h1)}" if snap.change_h1 is not None else "",
+    )
 
 
 def _record_event(rem, current_mc, kind: str, direction: str, target: float) -> None:
@@ -250,6 +279,9 @@ async def _fire_level(client: discord.Client, rem, current_mc, snap) -> None:
     desc = f"{'📈 Rose above' if up else '📉 Fell below'} **{usd(rem.target_mc)} MC**{SEP}now **{usd(current_mc)}**"
     if rem.spec:
         desc += f"\n{rem.spec} from {usd(rem.anchor_mc)} when set"
+    context = context_line(snap)
+    if context:
+        desc += f"\n{context}"
     if rem.note:
         desc += f"\n📝 {rem.note}"
 
@@ -280,6 +312,9 @@ async def _fire_move(client: discord.Client, mv, change: float, current_mc, snap
     up = change >= 0
     arrow = "📈" if up else "📉"
     desc = f"{arrow} **{pct(change)}** in {human_window(mv.window_sec)}{SEP}now **{usd(current_mc)}**"
+    context = context_line(snap)
+    if context:
+        desc += f"\n{context}"
     if mv.note:
         desc += f"\n📝 {mv.note}"
 

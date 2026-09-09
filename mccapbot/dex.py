@@ -50,6 +50,47 @@ def _liq_vol_tx(p: Dict) -> Tuple[float,float,int]:
     txc=int(tx.get("buys") or 0)+int(tx.get("sells") or 0)
     return liq,vol,txc
 
+def _num(d: Optional[Dict], *keys) -> Optional[float]:
+    """A nested numeric field, or None when any step is missing or junk."""
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(k)
+    try:
+        return float(cur) if cur not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def pair_stats(pair: Optional[Dict]) -> Dict:
+    """The context a DexScreener pair carries beyond its price: 5m/1h price
+    change, 5m/1h buys and sells, 5m volume, when the pair was created and its
+    address. Every field tolerates a missing or malformed key on its own, so a
+    pair with no ``priceChange`` block still yields its trade counts."""
+    p = pair if isinstance(pair, dict) else {}
+    created = _num(p, "pairCreatedAt")
+    return {
+        "change_m5": _num(p, "priceChange", "m5"),
+        "change_h1": _num(p, "priceChange", "h1"),
+        "buys_m5": int(_num(p, "txns", "m5", "buys") or 0),
+        "sells_m5": int(_num(p, "txns", "m5", "sells") or 0),
+        "buys_h1": int(_num(p, "txns", "h1", "buys") or 0),
+        "sells_h1": int(_num(p, "txns", "h1", "sells") or 0),
+        "vol_m5": _num(p, "volume", "m5"),
+        "pair_created_ts": (created / 1000.0) if created else 0.0,     # DexScreener stamps milliseconds
+        "pair_address": str(p.get("pairAddress") or ""),
+    }
+
+
+def liquidity_total(pairs: List[Dict], ca: str) -> float:
+    """Dollar liquidity across every pool where this token is the base asset."""
+    total = 0.0
+    for p in _own_pairs(pairs, ca):
+        total += _num(p, "liquidity", "usd") or 0.0
+    return total
+
+
 def volume_1h(pairs: List[Dict], ca: str) -> float:
     """Dollar volume in the last hour across every pool where this token is the
     base asset. A pair without an ``h1`` figure counts as zero, so a token
@@ -239,6 +280,7 @@ async def token_summary(ca: str) -> Optional[Dict]:
         "vol1h": volume_1h(data["pairs"], ca),
         "chain": best.get("chainId", "") or "",
         "change24": change24,
+        **pair_stats(best),
         "pools": len(own),
         "url": build_token_url(ca, best),
         "image_url": get_image_url(best, ca),

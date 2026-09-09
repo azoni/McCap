@@ -28,7 +28,7 @@ os.environ["RHC_REQUIRE_MOUNTED_DATA_DIR"] = "0"
 # session, so no individual test has to remember to.
 _REDIRECTED = (
     "REM_FILE", "MOVES_FILE", "WATCH_FILE", "ALERTS_FILE", "SCANS_FILE",
-    "CHAT_MEMORY_FILE", "CHAT_HISTORY_FILE", "RHC_ORDERS_FILE",
+    "CHAT_MEMORY_FILE", "CHAT_HISTORY_FILE", "RHC_ORDERS_FILE", "FEED_FILE",
 )
 # The rhc package reads its paths from config at import time; redirect those too.
 _RHC_REDIRECTED = ("RHC_WALLETS_FILE", "RHC_LEDGER_FILE", "RHC_JOURNAL_FILE")
@@ -68,7 +68,7 @@ def _guard_repo_data_files():
     watched = [
         "reminders.json", "moves.json", "watchlists.json", "alerts.json", "scans.json",
         "chat_memory.json", "chat_history.json",
-        "rhc_wallets.json", "rhc_ledger.json", "rhc_trades.json", "rhc_orders.json",
+        "rhc_wallets.json", "rhc_ledger.json", "rhc_trades.json", "rhc_orders.json", "feed.json",
     ]
     before = {n: (repo / n).stat().st_mtime_ns for n in watched if (repo / n).exists()}
     yield

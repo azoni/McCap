@@ -234,3 +234,44 @@ async def test_token_summary_returns_vol1h_and_chain(monkeypatch):
     monkeypatch.setattr(dex, "fetch_dex_token", fake_fetch)
     s = await dex.token_summary(evm)
     assert s["vol1h"] == 40.0 and s["chain"] == "robinhood" and s["price"] == 0.5 and s["vol24"] == 1_000
+
+
+# ---------------- the rest of the pair payload ----------------
+
+
+def test_pair_stats_tolerates_missing_and_junk_fields():
+    from mccapbot.dex import liquidity_total, pair_stats
+    full = pair(fdv=1_000, liq=10)
+    full["priceChange"] = {"m5": "12.5", "h1": "-3"}
+    full["txns"] = {"m5": {"buys": 41, "sells": 6}, "h1": {"buys": 300, "sells": "x"}, "h24": {"buys": 1, "sells": 1}}
+    full["volume"] = {"h24": 10, "m5": "1800.5"}
+    full["pairCreatedAt"] = 1_700_000_000_000
+    full["pairAddress"] = "0xpool"
+    s = pair_stats(full)
+    assert s["change_m5"] == 12.5 and s["change_h1"] == -3.0 and s["buys_m5"] == 41 and s["sells_m5"] == 6
+    assert s["buys_h1"] == 300 and s["sells_h1"] == 0 and s["vol_m5"] == 1800.5
+    assert s["pair_created_ts"] == 1_700_000_000.0 and s["pair_address"] == "0xpool"
+    bare = pair_stats(pair(fdv=1_000, liq=10))
+    assert bare["change_m5"] is None and bare["buys_m5"] == 0 and bare["vol_m5"] is None and bare["pair_created_ts"] == 0.0
+    assert pair_stats(None)["pair_address"] == ""
+    assert liquidity_total([pair(fdv=1, liq=10), pair(fdv=1, liq=15), pair(fdv=1, liq=99, ca="Other111111111111111111111111111111111111111")], SOL_CA) == 25.0
+
+
+@pytest.mark.asyncio
+async def test_token_summary_carries_the_pair_stats(monkeypatch):
+    from mccapbot import dex
+    p = pair(fdv=2_000_000, liq=50_000, vol=1_000)
+    p["txns"] = {"m5": {"buys": 3, "sells": 1}, "h24": {"buys": 10, "sells": 5}}
+    p["priceChange"] = {"m5": "9", "h24": "20"}
+
+    async def fake_fetch(ca):
+        return {"pairs": [p]}
+    monkeypatch.setattr(dex, "fetch_dex_token", fake_fetch)
+    s = await dex.token_summary(SOL_CA)
+    assert s["buys_m5"] == 3 and s["change_m5"] == 9.0 and s["change_h1"] is None and s["liq"] == 50_000
+
+
+def test_usdg_quoted_pairs_count_toward_the_change_consensus():
+    pairs = [pair(fdv=1_000, liq=500_000, quote="USDG", change24=10.0),
+             pair(fdv=1_000, liq=1, quote="JUNK", change24=9999.0)]
+    assert _consensus_change_24h(pairs, 500_001) == 10.0

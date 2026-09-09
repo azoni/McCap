@@ -20,6 +20,7 @@ from typing import Dict, Iterable, List, Optional
 
 from .config import RHCHAIN_CACHE_SECONDS, RHCHAIN_NETWORK, RHCHAIN_PAGES
 from .gecko import BASE, gecko_limiter
+from .helpers import UNKNOWN, age
 from .http import get_json
 from .logging_setup import log
 
@@ -77,12 +78,25 @@ class TokenActivity:
     def deepest(self) -> Pool:
         return max(self.pools, key=lambda p: p.liq_usd)
 
+    @property
+    def reference(self) -> Pool:
+        """The pool whose price is worth reading: the deepest one quoted in a
+        major (WETH, USDG, ...). A token's deepest pool can be quoted in another
+        memecoin or a tokenised stock, and its price change then says as much
+        about the quote as about the token. Falls back to the deepest pool."""
+        majors = [p for p in self.pools if p.quote_symbol.upper() in CHAIN_MAJORS]
+        return max(majors, key=lambda p: p.liq_usd) if majors else self.deepest
+
+    @property
+    def quote_is_major(self) -> bool:
+        return self.reference.quote_symbol.upper() in CHAIN_MAJORS
+
     def volume(self, window: str) -> float:
         return sum(p.volume.get(window, 0.0) for p in self.pools)
 
     def change(self, window: str) -> Optional[float]:
-        """Price change from the deepest pool; thin pools print junk swings."""
-        return self.deepest.change.get(window)
+        """Price change from the reference pool; thin pools print junk swings."""
+        return self.reference.change.get(window)
 
     @property
     def liq_usd(self) -> float:
@@ -90,7 +104,7 @@ class TokenActivity:
 
     @property
     def mc_usd(self) -> Optional[float]:
-        return self.deepest.mc_usd
+        return self.reference.mc_usd
 
     def mc_before(self, window: str) -> Optional[float]:
         """Market cap at the start of the window, implied by the price change.
@@ -321,12 +335,7 @@ async def new_pools(force: bool = False) -> List[Pool]:
 
 
 def age_str(created_ts: float, now: Optional[float] = None) -> str:
-    """'3m', '2h', '5d' since the pool was created; '?' when unknown."""
+    """'3m', '2h', '5d' since the pool was created; the unknown mark when unknown."""
     if not created_ts:
-        return "?"
-    secs = max(0.0, (now if now is not None else time.time()) - created_ts)
-    if secs < 3600:
-        return f"{int(secs // 60)}m"
-    if secs < 86400:
-        return f"{int(secs // 3600)}h"
-    return f"{int(secs // 86400)}d"
+        return UNKNOWN
+    return age((now if now is not None else time.time()) - created_ts)

@@ -13,7 +13,9 @@ the live market cap we already trust from DexScreener's consensus.
 
 from typing import Dict, List, Optional, Tuple
 
+from .config import RHCHAIN_NETWORK
 from .constants import MAJOR_QUOTES
+from .helpers import is_evm_address, short_ca
 from .http import RateLimiter, get_json
 from .logging_setup import log
 
@@ -137,13 +139,22 @@ async def history_points(
     return points
 
 
-async def backfill(ca: str, window_sec: int, current_mc: float) -> int:
+def network_for(ca: str) -> str:
+    """Which GeckoTerminal network an address lives on: a 0x address is Robinhood
+    Chain here, anything else is Solana. Momentum backfill used to assume Solana
+    for every token, so every Robinhood momentum alert stayed blind for half its
+    window after each restart."""
+    return RHCHAIN_NETWORK if is_evm_address(ca) else "solana"
+
+
+async def backfill(ca: str, window_sec: int, current_mc: float, network: Optional[str] = None) -> int:
     """Seed a token's history from GeckoTerminal. Returns samples added."""
     from . import history
 
-    points = await history_points(ca, window_sec, current_mc)
+    network = network or network_for(ca)
+    points = await history_points(ca, window_sec, current_mc, network)
     if not points:
-        log.debug("No GeckoTerminal history for %s", ca)
+        log.info("No GeckoTerminal history for %s on %s; the momentum window fills live", short_ca(ca), network)
         return 0
     added = history.seed(ca, points)
     log.info(

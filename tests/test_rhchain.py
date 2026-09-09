@@ -221,7 +221,7 @@ def test_age_str():
     assert rhchain.age_str(now - 120, now) == "2m"
     assert rhchain.age_str(now - 7_200, now) == "2h"
     assert rhchain.age_str(now - 3 * 86_400, now) == "3d"
-    assert rhchain.age_str(0, now) == "?"
+    assert rhchain.age_str(0, now) == "—"
 
 
 def test_an_empty_first_page_stops_paging(monkeypatch):
@@ -260,3 +260,19 @@ def test_token_activity_sums_windows_and_measures_volume_pace():
     pons.pools[0].volume["m5"] = pons.volume("h1") / 12 * 3     # five minutes at three times the hour's pace
     assert pons.volume_pace("m5", "h1") == pytest.approx(3.0)
 
+
+# ---------------- the reference pool is the deepest major-quoted one ----------------
+
+
+def test_change_and_mc_come_from_the_deepest_major_quoted_pool():
+    def pool(addr, quote, liq, chg, mc):
+        return rhchain.Pool(address=addr, name=f"TOK / {quote}", dex="Uniswap V3", base_symbol="TOK", base_name="Tok",
+                            base_address="0xtok", quote_symbol=quote, price_usd=1.0, liq_usd=liq, mc_usd=mc,
+                            volume={"m5": 0.0}, change={"m5": chg}, buys_h24=0, sells_h24=0, created_ts=1.0)
+    t = rhchain.TokenActivity(symbol="TOK", name="Tok", address="0xtok",
+                              pools=[pool("a", "NVDA", 900_000.0, 80.0, 5e6), pool("b", "USDG", 300_000.0, 4.0, 2e6)])
+    assert t.deepest.address == "a" and t.reference.address == "b" and t.quote_is_major
+    assert t.change("m5") == 4.0 and t.mc_usd == 2e6, "a stock-quoted pool's swing says as much about the stock as the token"
+    only_junk = rhchain.TokenActivity(symbol="TOK", name="Tok", address="0xtok", pools=[pool("a", "NVDA", 900_000.0, 80.0, 5e6)])
+    assert only_junk.reference.address == "a" and not only_junk.quote_is_major, "falls back to the deepest pool"
+    assert rhchain.age_str(0) == "—"

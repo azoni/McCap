@@ -271,3 +271,18 @@ RHC_BUTTON_USD_SIZES = [
 # DexScreener's chainId slug for chain 4663 (verified live 2026-09-08). Trade
 # buttons ride on an alert only when its token reports this chain.
 RHC_DEX_CHAIN_ID = os.getenv("RHC_DEX_CHAIN_ID", "robinhood")
+
+# Discovery feed: the bot posts new pairs, volume spikes and movers on Robinhood
+# Chain to one channel per server (/rh feed on). Its GeckoTerminal cost is
+# 3-6 requests a minute; RHCHAIN_NEW_PAGES=1 halves the new-pair part.
+FEED_ENABLE = _env_flag("FEED_ENABLE", True)
+RHCHAIN_NEW_PAGES = _env_int("RHCHAIN_NEW_PAGES", 2)
+FEED_MAX_PENDING = _env_int("FEED_MAX_PENDING", 10)          # new-pair candidates awaiting a second look
+FEED_TRACK_MAX_TOKENS = _env_int("FEED_TRACK_MAX_TOKENS", 40)  # posts graded by the tracker per 5 minutes
+FEED_FILE = str(DATA_DIR / "feed.json")
+# GeckoTerminal token info (holders, top-10 %, honeypot flag) is cached this long.
+RHC_RISK_CACHE_SECONDS = _env_int("RHC_RISK_CACHE_SECONDS", 600)
+# Every automated buy arms these sells when it fills unless the user opts out.
+RHC_AUTO_PROTECT_DEFAULT = os.getenv("RHC_AUTO_PROTECT_DEFAULT", "tp=2x:50,sl=-30%:100")
+# Momentum-triggered buy rules with a window under 15 minutes poll fast; cap how many.
+RHC_AUTO_MAX_FAST = _env_int("RHC_AUTO_MAX_FAST", 5)

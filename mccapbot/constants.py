@@ -15,4 +15,5 @@ LP_VENUES = ["meteora", "raydium", "pumpswap"]
 MAJOR_QUOTES = {
     "SOL", "WSOL", "USDC", "USDT", "USDC.E", "DAI",
     "ETH", "WETH", "BTC", "WBTC", "BNB", "WBNB",
+    "USDG",   # Robinhood Chain's main stablecoin quote
 }

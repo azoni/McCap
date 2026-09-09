@@ -317,3 +317,39 @@ def test_alert_buttons_only_for_robinhood_chain_tokens(monkeypatch):
     reminders.append(r2)
     assert asyncio.run(A._check_levels(Client(channel=ch), {"CA1": snap()})) is True
     assert "view" not in ch.kw[-1]
+
+
+# ---------------- the snapshot carries the pair's context ----------------
+
+
+def test_refresh_stores_pair_context_and_survives_a_missing_price_change_block(monkeypatch):
+    evm = "0x" + "cd" * 20
+
+    async def rich(_ca):
+        return {"pairs": [{
+            "chainId": "robinhood", "dexId": "uniswap", "pairAddress": "0xpool", "pairCreatedAt": 1_700_000_000_000,
+            "baseToken": {"address": evm, "symbol": "TOK", "name": "Tok"}, "quoteToken": {"symbol": "USDG"},
+            "fdv": 5_000_000, "liquidity": {"usd": 28_000}, "volume": {"h24": 10, "h1": 3.5, "m5": 900},
+            "txns": {"m5": {"buys": 41, "sells": 6}, "h1": {"buys": 200, "sells": 80}, "h24": {"buys": 1, "sells": 1}},
+            "priceChange": {"m5": "31", "h1": "12"},
+        }]}
+    monkeypatch.setattr(A, "fetch_dex_token", rich)
+    asyncio.run(A._refresh(evm))
+    s = token_cache[evm]
+    assert s.liq_usd == 28_000 and s.buys_m5 == 41 and s.sells_m5 == 6 and s.change_h1 == 12.0 and s.vol_m5 == 900
+    assert s.pair_created_ts == 1_700_000_000.0 and s.pair_address == "0xpool"
+    assert A.context_line(s) == "liq $28K · 5m 41 buys / 6 sells · 1h +12%"
+
+    async def no_change_block(_ca):
+        return {"pairs": [{
+            "chainId": "robinhood", "dexId": "uniswap",
+            "baseToken": {"address": evm, "symbol": "TOK", "name": "Tok"}, "quoteToken": {"symbol": "USDG"},
+            "fdv": 6_000_000, "liquidity": {"usd": 1000}, "volume": {"h24": 10}, "priceChange": "broken",
+            "txns": {"h24": {"buys": 1, "sells": 1}},
+        }]}
+    monkeypatch.setattr(A, "fetch_dex_token", no_change_block)
+    assert asyncio.run(A._refresh(evm)) is True
+    s = token_cache[evm]
+    assert s.mc == 6_000_000 and s.change_m5 is None and s.buys_m5 == 0, "a broken block never stops the market cap"
+    assert A.context_line(s) == "liq $1K", "unknown parts are left out, never printed as zero"
+    assert A.context_line(None) == ""

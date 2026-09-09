@@ -88,6 +88,19 @@ class TokenSnapshot:
     # Dollar volume over the last hour, from the same DexScreener payload. None
     # when the fetch had no pairs; auto-buy rules on volume never treat None as 0.
     vol1h: Optional[float] = None
+    # The rest of what the same payload carries, so alerts, the discovery feed
+    # and rule floors can read context without another request. None / 0 when
+    # the pair did not report it; nothing here is ever a reason to fire.
+    liq_usd: Optional[float] = None
+    change_m5: Optional[float] = None
+    change_h1: Optional[float] = None
+    buys_m5: int = 0
+    sells_m5: int = 0
+    buys_h1: int = 0
+    sells_h1: int = 0
+    vol_m5: Optional[float] = None
+    pair_created_ts: float = 0.0
+    pair_address: str = ""
 
 
 @dataclass
@@ -122,6 +135,20 @@ class AutoOrder:
     attempts: int = 0
     last_attempt_ts: float = 0.0
     last_error: str = ""
+    # Trailing stop: the target ratchets up as the market cap makes new highs
+    # (only after two agreeing fresh samples), never down.
+    trail_pct: float = 0.0
+    high_mc: float = 0.0
+    # Protection on fill: sell rules to arm when this buy lands ("tp=2x:50,sl=-30%:100"),
+    # and where a rule came from (manual | tpsl | button | feed | strategy).
+    then: str = ""
+    parent_id: str = ""
+    origin: str = ""
+    # Floors re-checked at fire time for buys: liquidity and 5-minute buys.
+    min_liq: float = 0.0
+    min_buyers: int = 0
+    # Momentum-triggered buys watch a window; 0 for every other metric.
+    window_sec: int = 0
 
     @property
     def target_mc(self) -> Optional[float]:
@@ -169,6 +196,10 @@ class ScanEvent:
     peak_ts: float = 0.0
     last_mc: Optional[float] = None
     last_checked_ts: float = 0.0
+    # Who called it: "" for a scanner bot's post, "feed" for McCap's own
+    # discovery feed; and for the feed, which rule fired (new_pair | spike | mover).
+    source: str = ""
+    kind: str = ""
 
     def multiple(self) -> Optional[float]:
         """Peak gain as a multiple of the scan price (2.0 == a 2x)."""

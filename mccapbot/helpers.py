@@ -260,6 +260,16 @@ def human_window(seconds: int) -> str:
     return f"{seconds}s"
 
 
+def age(seconds: float) -> str:
+    """Elapsed time the way a board shows it: 4m, 2h, 3d (never negative)."""
+    secs = max(0.0, float(seconds))
+    if secs < 3600:
+        return f"{int(secs // 60)}m"
+    if secs < 86400:
+        return f"{int(secs // 3600)}h"
+    return f"{int(secs // 86400)}d"
+
+
 def meets(dir_: str, current: Optional[float], target: float) -> bool:
     if current is None: return False
     return (current >= target) if dir_=="above" else (current <= target)
