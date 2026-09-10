@@ -190,9 +190,10 @@ async def test_a_token_geckoterminal_cannot_answer_for_has_no_highs_and_is_not_c
 
 
 @pytest.mark.asyncio
-async def test_a_card_read_is_worth_one_more_try_when_geckoterminal_is_busy(monkeypatch):
-    """Every other GeckoTerminal caller here has a next tick to fall back on.
-    A card was opened for this figure, so it asks twice before giving up."""
+async def test_only_a_read_someone_is_waiting_on_asks_twice(monkeypatch):
+    """A card was opened for this figure, so it is worth a second attempt. A
+    feed post has another post coming, and a retry in the middle of its burst
+    is what pushes the whole minute over the provider's line."""
     seen = {}
 
     async def top_pool(ca, network="robinhood", *, retry_429=0):
@@ -206,6 +207,9 @@ async def test_a_card_read_is_worth_one_more_try_when_geckoterminal_is_busy(monk
     monkeypatch.setattr(gecko, "top_pool", top_pool)
     monkeypatch.setattr(gecko, "ohlcv", ohlcv)
     await rhchain.price_highs("0xtok", now=NOW)
+    assert seen == {"pool": 0, "ohlcv": 0}, "the feed's read takes what it gets"
+    rhchain.clear_highs_cache()
+    await rhchain.price_highs("0xtok", now=NOW, patient=True)
     assert seen == {"pool": 1, "ohlcv": 1}
 
 

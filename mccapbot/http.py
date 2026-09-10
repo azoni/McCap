@@ -57,7 +57,33 @@ class RateLimiter:
         self.capacity = max(1, burst if burst is not None else min(self.rate_per_minute, 50))
         self.tokens = float(self.capacity)
         self.updated = time.monotonic()
+        self.strikes = 0                    # consecutive refusals from the provider
+        self.hold_until = 0.0               # monotonic time this bucket may fire again
         self._lock = asyncio.Lock()
+
+    def penalise(self) -> float:
+        """The provider refused a request as too many. Our own bucket is under
+        its per-minute ceiling, so the disagreement is theirs to settle: a
+        shared egress IP, a shorter window than the documented one, a bad
+        minute. Either way, asking again at the same rate spends the budget on
+        answers we will not get, so the bucket empties and holds — longer each
+        time, until something gets through. Returns the hold in seconds."""
+        self.strikes += 1
+        hold = min(PENALTY_MAX, PENALTY_BASE * (2 ** (self.strikes - 1)))
+        self.tokens = 0.0
+        self.updated = time.monotonic()
+        self.hold_until = max(self.hold_until, self.updated + hold)
+        return hold
+
+    def forgive(self) -> None:
+        """Something came back. Whatever the provider was unhappy about has
+        passed, so the next refusal starts the backoff over rather than
+        resuming where a burst an hour ago left off."""
+        self.strikes = 0
+
+    def held_for(self) -> float:
+        """Seconds until this bucket may fire again; 0 when it is free."""
+        return max(0.0, self.hold_until - time.monotonic())
 
     def available(self) -> float:
         """Tokens a caller could take right now, refill applied, nothing consumed.
@@ -68,8 +94,12 @@ class RateLimiter:
         bucket is under half, and needs the refilled figure to decide that.
         Pure: the bucket itself is not written, so a concurrent ``acquire``
         (which may be sleeping while holding the lock) sees exactly the state
-        it left.
+        it left. A bucket the provider has refused reads as empty for as long
+        as it is held, which is how the feed and the holder lookups stand down
+        of their own accord instead of each having to know about 429s.
         """
+        if time.monotonic() < self.hold_until:
+            return 0.0
         elapsed = max(0.0, time.monotonic() - self.updated)
         return min(float(self.capacity), self.tokens + elapsed * self.refill_per_sec)
 
@@ -77,6 +107,9 @@ class RateLimiter:
         async with self._lock:
             while True:
                 now = time.monotonic()
+                if now < self.hold_until:
+                    await asyncio.sleep(self.hold_until - now)
+                    continue
                 elapsed = now - self.updated
                 self.updated = now
                 self.tokens = min(self.capacity, self.tokens + elapsed * self.refill_per_sec)
@@ -90,6 +123,8 @@ class RateLimiter:
 dex_limiter = RateLimiter(DEX_MAX_REQUESTS_PER_MIN, burst=DEX_BURST)
 
 RETRY_429_DELAY = 2.5           # seconds before an opt-in second attempt
+PENALTY_BASE = 20.0             # first hold after a refusal, doubling per consecutive strike
+PENALTY_MAX = 300.0
 
 
 async def get_json(
@@ -131,6 +166,14 @@ async def _get_json_once(
     """The document, and whether the provider refused it as too many requests
     (the one failure worth trying again)."""
     if limiter is not None:
+        # A held bucket means the last request was refused. Waiting it out here
+        # would hang whatever asked — a slash command has seconds, not minutes —
+        # and the callers all have a cached answer or a next tick. So say no
+        # now, and let the board render its previous list with a stale note.
+        held = limiter.held_for()
+        if held > 0:
+            log.debug("Skipping %s: bucket held for another %.0fs", url.split("?")[0], held)
+            return None, True
         await limiter.acquire()
     session = await get_session()
     kwargs: Dict[str, Any] = {}
@@ -143,8 +186,14 @@ async def _get_json_once(
     try:
         async with session.get(url, **kwargs) as r:
             if r.status == 429:
-                log.warning("Rate limited (429) on %s", url.split("?")[0])
+                if limiter is not None:
+                    log.warning("Rate limited (429) on %s — holding this bucket %.0fs",
+                                url.split("?")[0], limiter.penalise())
+                else:
+                    log.warning("Rate limited (429) on %s", url.split("?")[0])
                 return None, True
+            if limiter is not None:
+                limiter.forgive()
             if r.status != 200:
                 log.debug("HTTP %s on %s", r.status, url.split("?")[0])
                 return None, False

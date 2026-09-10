@@ -163,3 +163,61 @@ async def test_a_plain_failure_is_never_retried_however_many_were_offered(monkey
     _patch(monkeypatch, session)
     assert await http.get_json("https://example/x", retry_429=3) is None
     assert session.calls == 1
+
+
+# ---------------- standing down when the provider says no ----------------
+
+
+def test_a_refusal_empties_the_bucket_and_holds_it():
+    """Our own bucket is under the documented ceiling, so a 429 is a
+    disagreement we lose: asking again at the same rate spends the budget on
+    answers that will not come."""
+    lim = RateLimiter(60, burst=10)
+    assert lim.available() == pytest.approx(10.0)
+    hold = lim.penalise()
+    assert hold == pytest.approx(http.PENALTY_BASE)
+    assert lim.available() == 0.0, "a held bucket reads empty, so callers stand down"
+    assert lim.held_for() > 0
+
+
+def test_consecutive_refusals_back_off_further_each_time_up_to_a_ceiling():
+    lim = RateLimiter(60)
+    holds = [lim.penalise() for _ in range(10)]
+    assert holds[0] < holds[1] < holds[2], "doubling while it keeps failing"
+    assert max(holds) == pytest.approx(http.PENALTY_MAX)
+    assert holds[-1] == pytest.approx(http.PENALTY_MAX), "and never past it"
+
+
+def test_one_good_answer_resets_the_backoff():
+    lim = RateLimiter(60)
+    lim.penalise()
+    lim.penalise()
+    lim.forgive()
+    assert lim.strikes == 0
+    lim.hold_until = 0.0
+    assert lim.penalise() == pytest.approx(http.PENALTY_BASE), "the next bad minute starts over"
+
+
+@pytest.mark.asyncio
+async def test_a_held_bucket_refuses_the_request_instead_of_making_the_caller_wait(monkeypatch):
+    """A slash command has seconds, not minutes. Every caller here has a cached
+    answer or a next tick, so a held bucket answers 'no' immediately."""
+    session = _Session(200)
+    _patch(monkeypatch, session)
+    lim = RateLimiter(60, burst=10)
+    lim.penalise()
+    assert await http.get_json("https://example/x", limiter=lim) is None
+    assert session.calls == 0, "no request was made at all"
+    lim.hold_until = 0.0
+    assert await http.get_json("https://example/x", limiter=lim) == {"ok": True}
+    assert session.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_the_bucket_that_was_refused_is_the_one_that_is_held(monkeypatch):
+    """GeckoTerminal having a bad minute must not stop DexScreener reads."""
+    session = _Session(429)
+    _patch(monkeypatch, session)
+    gecko_ish, dex_ish = RateLimiter(20, burst=8), RateLimiter(240, burst=20)
+    await http.get_json("https://example/gt", limiter=gecko_ish)
+    assert gecko_ish.held_for() > 0 and dex_ish.held_for() == 0

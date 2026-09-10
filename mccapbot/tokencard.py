@@ -174,6 +174,6 @@ async def build(ca: str, token: Optional[rhchain.TokenActivity] = None, *, deep:
             created = summary.get("created_ts") or summary.get("pair_created_ts")
             card.age_sec = (time.time() - created) if created else None
     if deep:
-        card.highs = await rhchain.price_highs(ca)
+        card.highs = await rhchain.price_highs(ca, patient=True)
         card.info = await risk.token_info(ca)
     return card

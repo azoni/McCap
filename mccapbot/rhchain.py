@@ -560,23 +560,28 @@ def clear_highs_cache() -> None:
     _highs_cache.clear()
 
 
-async def price_highs(ca: str, network: str = RHCHAIN_NETWORK, now: Optional[float] = None) -> Optional[Highs]:
+async def price_highs(ca: str, network: str = RHCHAIN_NETWORK, now: Optional[float] = None,
+                      *, patient: bool = False) -> Optional[Highs]:
     """The token's real 24h and 7d highs against its price now, or None when
     GeckoTerminal cannot say. Never raises: a board or a card renders without
-    the figure rather than failing."""
+    the figure rather than failing.
+
+    ``patient`` asks twice when the provider is busy. Only a card should: a
+    person is sitting there waiting for exactly this figure. A feed post has
+    another post coming, and a second attempt in the middle of its burst is
+    what pushes the whole minute over the line."""
     now = time.time() if now is None else now
     key = f"{network}:{(ca or '').lower()}"
     hit = _highs_cache.get(key)
     if hit and now - hit[0] < HIGHS_CACHE_SECONDS:
         return hit[1]
     try:
-        # A card is opened for this figure, so a throttled read is worth one
-        # more try; every other GeckoTerminal caller here has a next tick.
-        pool = await gecko.top_pool(ca, network, retry_429=1)
+        retries = 1 if patient else 0
+        pool = await gecko.top_pool(ca, network, retry_429=retries)
         addr = ((pool or {}).get("attributes") or {}).get("address")
         if not addr:
             return None
-        candles = await gecko.ohlcv(addr, "hour", 1, HIGHS_HOURS, network, retry_429=1)
+        candles = await gecko.ohlcv(addr, "hour", 1, HIGHS_HOURS, network, retry_429=retries)
     except Exception:
         log.debug("Could not read highs for %s", ca, exc_info=True)
         return None
