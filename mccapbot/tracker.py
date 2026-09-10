@@ -67,9 +67,19 @@ async def tick(now: Optional[float] = None) -> int:
     return checked
 
 
-async def run(interval: int = SCAN_TRACK_INTERVAL, *, bot=None) -> None:
+async def run(bot=None, interval: int = SCAN_TRACK_INTERVAL) -> None:
     """The loop. With a bot it waits for the gateway and stops when the bot
-    closes; without one it runs until cancelled."""
+    closes; without one it runs until cancelled.
+
+    The bot comes first because that is what every caller has: when the delay
+    was the first parameter, ``tracker.run(bot)`` put a Bot where the seconds
+    go, ``asyncio.sleep`` raised, and because the sleep itself was what failed
+    the loop spun at full speed logging the same error. The delay is also
+    checked once here rather than trusted every iteration.
+    """
+    if not isinstance(interval, (int, float)) or isinstance(interval, bool) or interval < 0:
+        log.error("Scan tracker started with a bad interval %r; using %ss instead.", interval, SCAN_TRACK_INTERVAL)
+        interval = SCAN_TRACK_INTERVAL
     if bot is not None:
         await bot.wait_until_ready()
     while bot is None or not bot.is_closed():
@@ -80,3 +90,4 @@ async def run(interval: int = SCAN_TRACK_INTERVAL, *, bot=None) -> None:
             raise
         except Exception:
             log.exception("scan tracker loop error")
+            await asyncio.sleep(min(interval, 60) or 1)   # never spin on a failure

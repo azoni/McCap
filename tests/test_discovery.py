@@ -679,7 +679,7 @@ async def test_tracker_loop_stops_with_the_bot_and_survives_a_bad_tick(scans, mo
         return 0
     monkeypatch.setattr(tracker, "tick", tick)
     bot = FakeBot(None, Chan())
-    await asyncio.wait_for(tracker.run(interval=0, bot=bot), timeout=2)
+    await asyncio.wait_for(tracker.run(bot, interval=0), timeout=2)
     assert len(ticks) == 2
 
 
@@ -694,3 +694,35 @@ async def test_feed_loop_is_off_under_the_master_switch(world, monkeypatch):
     monkeypatch.setattr(discovery, "FEED_ENABLE", False)
     await asyncio.wait_for(world.feed.run(), timeout=1)
     assert "off (FEED_ENABLE=0)" in world.feed.status(1, NOW)["text"]
+
+
+def test_the_tracker_takes_the_bot_first_so_it_cannot_sleep_on_it():
+    """The bot was once passed where the delay goes: asyncio.sleep raised, and
+    because the sleep was what failed the loop ran flat out. The bot is the
+    first parameter now, and a nonsense delay falls back instead of spinning."""
+    import inspect
+    from mccapbot import bot as bot_module
+    from mccapbot.config import SCAN_TRACK_INTERVAL
+
+    params = list(inspect.signature(tracker.run).parameters)
+    assert params[0] == "bot", "a caller with a bot in hand must not be able to pass it as the delay"
+    assert "tracker.run(self)" in inspect.getsource(bot_module.Bot.setup_hook)
+
+    async def one_pass(interval):
+        seen = []
+
+        async def fake_sleep(d):
+            seen.append(d)
+            raise asyncio.CancelledError                    # stop after the first sleep
+        real_sleep = asyncio.sleep
+        asyncio.sleep = fake_sleep
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await tracker.run(None, interval=interval)
+        finally:
+            asyncio.sleep = real_sleep
+        return seen
+
+    assert asyncio.run(one_pass(12)) == [12]
+    assert asyncio.run(one_pass(object())) == [SCAN_TRACK_INTERVAL], "a nonsense delay falls back, never spins"
+
