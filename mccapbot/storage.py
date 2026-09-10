@@ -15,6 +15,7 @@ from .config import (
     CHAT_HISTORY_FILE,
     CHAT_MEMORY_FILE,
     DATA_DIR,
+    FEED_FILE,
     MAX_ALERT_EVENTS,
     MAX_SCAN_EVENTS,
     MOVES_FILE,
@@ -324,6 +325,53 @@ def order_watchers():
         if o.metric == "mc":
             levels.append(SimpleNamespace(ca=o.ca, direction=o.direction, target_mc=o.target))
     return levels, moves
+
+
+# ---- Discovery feed (configs, seen-set, pending new pairs, recent posts) ----
+# The typed state lives in mccapbot/discovery.py; this is only the document
+# on disk, so the feed's persistence goes through the same atomic write and
+# the same test redirection (conftest swaps FEED_FILE here) as every other store.
+FEED_LOCK = asyncio.Lock()
+FEED_KEYS = ("configs", "seen", "pending", "posted")
+
+
+def empty_feed() -> Dict[str, Any]:
+    return {"configs": [], "seen": {}, "pending": {}, "posted": []}
+
+
+async def save_feed(payload: Dict[str, Any]) -> None:
+    async with FEED_LOCK:
+        _atomic_write(FEED_FILE, payload)
+
+
+async def load_feed() -> Optional[Dict[str, Any]]:
+    """The raw feed document: the empty shape when there is no file, ``None``
+    when the file exists but cannot be read (kept aside as ``.corrupt`` so the
+    next save does not make the loss permanent). Missing keys are filled in;
+    a key of the wrong type is replaced by its empty value, never trusted."""
+    try:
+        with open(FEED_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        log.info("No feed file at %s; starting fresh.", FEED_FILE)
+        return empty_feed()
+    except Exception:
+        log.exception("Failed to load %s; leaving the feed state untouched", FEED_FILE)
+        _backup_corrupt(FEED_FILE)
+        return None
+    if not isinstance(data, dict):
+        log.error("%s is not a JSON object; refusing to load it.", FEED_FILE)
+        _backup_corrupt(FEED_FILE)
+        return None
+    out = empty_feed()
+    for key, blank in out.items():
+        value = data.get(key)
+        out[key] = value if isinstance(value, type(blank)) else blank
+    log.info(
+        "Loaded feed state: %d config(s), %d seen, %d pending, %d posted",
+        len(out["configs"]), len(out["seen"]), len(out["pending"]), len(out["posted"]),
+    )
+    return out
 
 
 # ---- Chat memory (long-term notes) and rolling conversation ----

@@ -355,7 +355,7 @@ async def test_tpsl_button_gates_then_opens_the_modal_without_deferring(have_wal
     assert labels == [
         ("Take-profit at", "2x, +50%, 900k; blank to skip", "2x"),
         ("Sell this % at take-profit", None, "50"),
-        ("Stop-loss at", "-30%, 300k; blank to skip", "-30%"),
+        ("Stop-loss at", "-30%, 300k, or trail 25%; blank to skip", "-30%"),
         ("Sell this % at stop-loss", None, "100"),
     ]
     for c in modal.children:

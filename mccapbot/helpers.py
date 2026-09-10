@@ -287,6 +287,14 @@ def _median(vals: List[float]) -> float:
     return s[n//2] if n%2 else 0.5*(s[n//2-1] + s[n//2])
 
 
+def is_manager(user) -> bool:
+    """Whether a Discord member may change server-wide settings (Manage Server
+    or Administrator). A user object from a DM has no guild permissions and
+    is never a manager."""
+    perms = getattr(user, "guild_permissions", None)
+    return bool(perms) and bool(getattr(perms, "manage_guild", False) or getattr(perms, "administrator", False))
+
+
 async def username_from_id(client: discord.Client, user_id: int) -> str:
     # 0 means "no human owner" — an alert armed automatically from a detected
     # scan. Looking that up would fail and render the literal "user:0".

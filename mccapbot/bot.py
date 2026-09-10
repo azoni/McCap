@@ -8,6 +8,7 @@ from .alerts import watcher as alerts_watcher
 from .config import (
     CHAT_ENABLE,
     DEX_BLACKLIST,
+    FEED_ENABLE,
     LOG_LEVEL,
     PRESENCE_REFRESH_SECONDS,
     RHC_ABOUT_ME_ENABLE,
@@ -55,6 +56,7 @@ class Bot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
         self._bg_tasks: list[asyncio.Task] = []
         self.auto_orders = None      # rhc.orders.Engine, started in setup_hook
+        self.feed = None             # discovery.Feed, started in setup_hook
         self.tree.on_error = self._on_app_command_error
 
     async def _on_app_command_error(self, inter: discord.Interaction, error: Exception) -> None:
@@ -167,6 +169,14 @@ class Bot(commands.Bot):
         from .rhc import orders
         self.auto_orders = orders.Engine(self)
         self._bg_tasks.append(asyncio.create_task(self.auto_orders.run(), name="auto-orders"))
+        # The discovery feed and the tracker that grades its posts (and the
+        # scanner's) live here for the same reasons.
+        from . import discovery, tracker
+        await discovery.load_feed()
+        self.feed = discovery.Feed(self)
+        if FEED_ENABLE:
+            self._bg_tasks.append(asyncio.create_task(self.feed.run(), name="discovery-feed"))
+        self._bg_tasks.append(asyncio.create_task(tracker.run(self), name="scan-tracker"))
 
         synced = await self.tree.sync()
         log.info("Synced %d global slash command(s)", len(synced))

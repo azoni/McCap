@@ -7,8 +7,11 @@ at fire time, before it trades through ``trade.plan_* / settle_*`` exactly as
 a slash command would after its Confirm click.
 
 What this module owns: parsing a rule (``parse_expiry``, ``sell_rule``,
-``buy_rule``), the one way a rule is written out (``describe_rule``), and the
-``Engine`` that ticks, debounces, fires each rule in its own task and reports.
+``buy_rule``, ``parse_then``), reading a rule's metric off a snapshot or a
+DexScreener payload (``rule_value``, ``floors_ok``), the slot arithmetic
+(``room_for``), the one way a rule is written out (``describe_rule``), and the
+``Engine`` that ticks, debounces, ratchets trailing stops, fires each rule in
+its own task and reports.
 
 What it must never do:
 - move money itself: ``swap.execute`` is called only inside ``trade.settle_*``;
@@ -18,23 +21,32 @@ What it must never do:
 - fire a rule twice: ``status="firing"`` is on disk before the money step, and
   a ``firing`` record found after a restart is retired and reported, never run;
 - leave a rule in ``firing``: every exit from a fire is filled, pending, armed
-  again (hold / retry) or retired.
+  again (hold / retry) or retired;
+- treat an unknown value as a number: a missing market cap, volume, liquidity
+  or buyer count never meets a level and never passes a floor;
+- tighten a trailing stop on one print: the high (and so the stop) moves only
+  after two distinct fresh samples agree, and it never moves down;
+- fire against a level it did not see: the target a fire was spawned with is
+  the target the fresh read is compared with; a target that moved under a
+  fire in flight is a hold.
 """
 
 import asyncio
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import discord
 
-from .. import storage
+from .. import history, storage
 from ..cache import TOKEN_CACHE_LOCK, token_cache
 from ..config import (
     POLL_TICK_SECONDS,
     RHC_AUTO_BUY_TTL,
     RHC_AUTO_ENABLE,
+    RHC_AUTO_MAX_PER_USER,
+    RHC_AUTO_MAX_TOTAL,
     RHC_AUTO_MAX_TTL,
     RHC_AUTO_SELL_TTL,
     RHC_MAX_TRADE_USD,
@@ -48,9 +60,12 @@ from . import chain, guard, kyber, ledger, swap, trade, wallets
 
 __all__ = [
     "CONFIRM_SAMPLES", "STALE_SECONDS", "RETRY_SECONDS", "MAX_ATTEMPTS", "PRICE_DISAGREE_PCT",
-    "PENDING_POLL_SECONDS", "RHC_AUTO_ENABLE", "RHC_AUTO_SELL_TTL", "RHC_AUTO_BUY_TTL", "RHC_AUTO_MAX_TTL",
+    "PENDING_POLL_SECONDS", "TRAIL_MIN_PCT", "TRAIL_MAX_PCT", "TRAIL_SAVE_SECONDS", "TRAIL_SAVE_RISE_PCT",
+    "RHC_AUTO_ENABLE", "RHC_AUTO_SELL_TTL", "RHC_AUTO_BUY_TTL", "RHC_AUTO_MAX_TTL",
+    "RHC_AUTO_MAX_PER_USER", "RHC_AUTO_MAX_TOTAL",
     "POLL_TICK_SECONDS", "RHC_PENDING_BLOCK_SECONDS", "RHC_TX_TIMEOUT",
-    "parse_expiry", "Rule", "sell_rule", "buy_rule", "already_met", "describe_rule", "classify", "Engine",
+    "min_expiry_for", "parse_expiry", "Rule", "sell_rule", "buy_rule", "parse_then", "already_met",
+    "rule_value", "floors_ok", "room_for", "describe_rule", "classify", "Engine",
 ]
 
 # Tuning knobs. Module constants, not env: nine env keys are enough surface.
@@ -60,6 +75,10 @@ RETRY_SECONDS = 60           # wall-clock backoff after a transient failure or a
 MAX_ATTEMPTS = 5             # transient failures before a rule gives up
 PRICE_DISAGREE_PCT = 25.0    # Kyber implied price vs DexScreener, auto-buys only
 PENDING_POLL_SECONDS = 30    # how often a pending fill is checked on chain
+TRAIL_MIN_PCT = 5.0          # a trailing stop tighter than this is noise on a memecoin
+TRAIL_MAX_PCT = 60.0         # looser than this is not a stop
+TRAIL_SAVE_SECONDS = 30      # ratcheted targets reach disk at most this often
+TRAIL_SAVE_RISE_PCT = 1.0    # ...and only once a target rose this much since it was last written
 
 BUY_CONDITIONS = {
     "mc_below": ("mc", "below"),
@@ -70,6 +89,11 @@ BUY_CONDITIONS = {
 _DURATION = re.compile(r"(\d*\.?\d+)\s*([mhd])")
 _UNIT_SECONDS = {"m": 60, "h": 3600, "d": 86400}
 MIN_EXPIRY_SECONDS = 3600
+NOW_MIN_EXPIRY_SECONDS = 300     # a "buy now" rule is meant to fill within minutes, not wait an hour
+
+# "trail 20%", "trail 20", "trailing 20%", "20% trailing", "20% trail"
+_TRAIL = re.compile(r"trail(?:ing)?(\d*\.?\d+)%?|(\d*\.?\d+)%trail(?:ing)?")
+_THEN_KEYS = {"tp": "above", "sl": "below"}
 
 
 def _now() -> float:
@@ -87,14 +111,24 @@ def _duration_seconds(raw: str) -> int:
     return int(float(m.group(1)) * _UNIT_SECONDS[m.group(2)])
 
 
-def parse_expiry(raw: Optional[str], default: str, maximum: str) -> float:
+def min_expiry_for(metric: str) -> int:
+    """The shortest expiry a rule on this metric may have, in seconds: a "now"
+    rule (a discovery buy) may live five minutes; everything else needs an hour
+    to collect two fresh reads."""
+    return NOW_MIN_EXPIRY_SECONDS if metric == "now" else MIN_EXPIRY_SECONDS
+
+
+def parse_expiry(raw: Optional[str], default: str, maximum: str, minimum: Optional[int] = None) -> float:
     """Absolute expiry timestamp for a rule. ``raw`` like 1h / 12h / 3d / 30d;
-    None or "" takes ``default``. Under one hour or over ``maximum`` is refused
-    with text the user can act on. Not ``helpers.parse_window``: that caps at 7d."""
+    None or "" takes ``default``. Under ``minimum`` seconds (``MIN_EXPIRY_SECONDS``
+    when None; callers pass ``min_expiry_for(metric)``) or over ``maximum`` is
+    refused with text the user can act on. Not ``helpers.parse_window``: that caps at 7d."""
     secs = _duration_seconds(raw if (raw or "").strip() else default)
     cap = _duration_seconds(maximum)
-    if secs < MIN_EXPIRY_SECONDS:
-        raise ValueError("Expiry must be at least 1h; the rule needs two fresh price reads before it can fire.")
+    floor = MIN_EXPIRY_SECONDS if minimum is None else int(minimum)
+    if secs < floor:
+        raise ValueError(f"Expiry must be at least {human_window(floor)}; the rule needs two fresh price reads "
+                         f"before it can fire.")
     if secs > cap:
         raise ValueError(f"Expiry must be at most {maximum}.")
     return _now() + secs
@@ -103,18 +137,41 @@ def parse_expiry(raw: Optional[str], default: str, maximum: str) -> float:
 @dataclass
 class Rule:
     """The trigger half of an AutoOrder, before it is combined with size, wallet and channel."""
-    metric: str                        # "mc" | "vol1h"
+    metric: str                        # "mc" | "vol1h" | "move" | "now" | "fill"
     direction: str                     # "above" | "below"
     target: float
-    spec: str = ""                     # "2x", "-30%"; "" for an absolute target
+    spec: str = ""                     # "2x", "-30%", "trail 20%"; "" for an absolute target
     anchor_mc: Optional[float] = None
     anchor: str = ""                   # "entry" | "now" | ""
+    trail_pct: float = 0.0             # > 0 for a trailing stop: the target follows the high
+
+
+def _trail_rule(at: str, mc_now: Optional[float]) -> Optional[Rule]:
+    """The trailing-stop shape of ``at`` ("trail 20%", "20% trailing"), or None when
+    it is not one. Anchored at the market cap now: the stop starts N% below it and
+    ratchets up with the high, so ``already_met`` is false by construction."""
+    s = (at or "").strip().lower().replace(" ", "")
+    m = _TRAIL.fullmatch(s)
+    if not m:
+        return None
+    n = float(m.group(1) or m.group(2))
+    if not (TRAIL_MIN_PCT <= n <= TRAIL_MAX_PCT):
+        raise ValueError(f"A trailing stop must sit between {pct(TRAIL_MIN_PCT, signed=False)} and "
+                         f"{pct(TRAIL_MAX_PCT, signed=False)} below the high; `{at}` does not.")
+    if not mc_now or mc_now <= 0:
+        raise ValueError(f"McCap has no market cap to start `{at}` from; try again in a few minutes.")
+    return Rule(metric="mc", direction="below", target=mc_now * (1 - n / 100), spec=f"trail {n:g}%",
+                anchor="now", anchor_mc=mc_now, trail_pct=n)
 
 
 def sell_rule(at: str, anchor_mc: Optional[float], mc_now: Optional[float], anchor: str) -> Rule:
     """A sell trigger from what the user typed. Direction comes from the spec,
     never from where the price sits: a 2x is always "above" even if the token
-    already trades there (the caller refuses that case with ``already_met``)."""
+    already trades there (the caller refuses that case with ``already_met``).
+    ``trail N%`` / ``N% trailing`` (5..60) is a trailing stop anchored at ``mc_now``."""
+    trail = _trail_rule(at, mc_now)
+    if trail is not None:
+        return trail
     try:
         target, spec = parse_target(at, anchor_mc)
     except RelativeTargetError:
@@ -155,6 +212,131 @@ def already_met(direction: str, current: Optional[float], target: float) -> bool
     return meets(direction, current, target)
 
 
+def _then_parts(spec: str) -> List[Tuple[str, str, int]]:
+    """``"tp=2x:50,sl=-30%:100"`` -> ``[("tp", "2x", 50), ("sl", "-30%", 100)]``, validated.
+    Each leg must parse as a sell rule from an entry, a TP must sit above it and an
+    SL below, and each key appears once. ``""`` and ``"none"`` are no legs."""
+    s = (spec or "").strip()
+    if not s or s.lower() == "none":
+        return []
+    out: List[Tuple[str, str, int]] = []
+    seen: Set[str] = set()
+    for raw in s.split(","):
+        leg = raw.strip()
+        if not leg:
+            continue
+        key, eq, rest = leg.partition("=")
+        key = key.strip().lower()
+        if not eq or key not in _THEN_KEYS:
+            raise ValueError(f"Could not read `{leg}` as protection; use tp=2x:50 or sl=-30%:100.")
+        at, colon, pct_raw = rest.partition(":")
+        at = at.strip()
+        try:
+            pct_sold = int(float(pct_raw.strip())) if colon else 100
+        except ValueError:
+            raise ValueError(f"Could not read `{pct_raw.strip()}` as a percent to sell in `{leg}`; use 1..100.")
+        if not 1 <= pct_sold <= 100:
+            raise ValueError(f"The percent to sell in `{leg}` must be between 1 and 100.")
+        rule = sell_rule(at, 100.0, 100.0, "entry")
+        if not rule.spec:
+            raise ValueError(f"`{leg}` needs a level relative to the fill (2x, +50%, -30%, trail 25%), not a dollar figure.")
+        if rule.direction != _THEN_KEYS[key]:
+            want = "above" if key == "tp" else "below"
+            raise ValueError(f"`{leg}` points the wrong way: a {key.upper()} must sit {want} the entry.")
+        if key in seen:
+            raise ValueError(f"`{key.upper()}` is given twice in `{spec}`.")
+        seen.add(key)
+        out.append((key, rule.spec or at, pct_sold))
+    return out
+
+
+def parse_then(spec: str) -> List[Tuple[str, int]]:
+    """The sell legs to arm after a buy fills: ``"tp=2x:50,sl=-30%:100"`` ->
+    ``[("2x", 50), ("-30%", 100)]``. Every leg is validated with ``sell_rule`` from
+    an entry, so nothing that cannot become a rule gets written onto an order.
+    Raises ``ValueError`` with user-facing text. Empty / ``none`` -> ``[]``."""
+    return [(at, pct_sold) for _key, at, pct_sold in _then_parts(spec)]
+
+
+# ---------------- reading a rule's metric ----------------
+
+def _read(snap, info: Optional[Dict[str, Any]], snap_field: str, info_key: str):
+    """One value from the snapshot when there is one, else from the DexScreener payload."""
+    if snap is not None:
+        return getattr(snap, snap_field, None)
+    if info:
+        return info.get(info_key)
+    return None
+
+
+def floors_ok(o: AutoOrder, snap=None, info: Optional[Dict[str, Any]] = None) -> bool:
+    """Whether the rule's liquidity and 5-minute-buyer floors hold. A floor of 0 is
+    no floor; a set floor with an unknown value never passes (unknown is not enough)."""
+    if o.min_liq and o.min_liq > 0:
+        liq = _read(snap, info, "liq_usd", "liq")
+        if liq is None or float(liq) < float(o.min_liq):
+            return False
+    if o.min_buyers and o.min_buyers > 0:
+        buyers = _read(snap, info, "buys_m5", "buys_m5")
+        if buyers is None or int(buyers) < int(o.min_buyers):
+            return False
+    return True
+
+
+def rule_value(o: AutoOrder, snap=None, info: Optional[Dict[str, Any]] = None, now: Optional[float] = None) -> Optional[float]:
+    """The number the rule is compared with, or None when there is nothing to
+    compare (None never meets anything). ``mc`` / ``vol1h`` read the snapshot when
+    given, else the DexScreener payload; ``move`` is the percent change over the
+    rule's window from the history series; ``now`` is 1.0 only while a market cap
+    is known and the floors pass; ``fill`` (a pending manual buy waiting on its
+    protection) has no value and can never fire."""
+    metric = o.metric
+    if metric == "mc":
+        return _read(snap, info, "mc", "mc")
+    if metric == "vol1h":
+        return _read(snap, info, "vol1h", "vol1h")
+    if metric == "move":
+        if not o.window_sec or o.window_sec <= 0:
+            return None
+        return history.pct_change(o.ca, int(o.window_sec), _now() if now is None else now)
+    if metric == "now":
+        if _read(snap, info, "mc", "mc") is None or not floors_ok(o, snap, info):
+            return None
+        return 1.0
+    return None
+
+
+def _value_text(o: AutoOrder, value: Optional[float]) -> str:
+    return pct(value) if o.metric == "move" else usd(value)
+
+
+def room_for(uid: int, n: int = 1) -> Tuple[bool, str]:
+    """Whether ``n`` more rules fit for this user: ``(True, "")`` or ``(False, why)``
+    with the same refusal texts as the cog's ``_auto_limits``. The env keys keep
+    their meaning: ``RHC_AUTO_MAX_PER_USER`` rules per wallet, ``RHC_AUTO_MAX_TOTAL``
+    rules McCap polls for at once; auto-orders switched off is a refusal too."""
+    if not RHC_AUTO_ENABLE:
+        return False, "🔒 Auto-orders are switched off (`RHC_AUTO_ENABLE=0`)."
+    n = max(0, int(n))
+    have = len(storage.orders_for(uid))
+    if have + n > RHC_AUTO_MAX_PER_USER:
+        if have >= RHC_AUTO_MAX_PER_USER:
+            return False, (f"You already have {plural(RHC_AUTO_MAX_PER_USER, 'auto-order')}, the most one wallet "
+                           f"can hold.{SEP}`/rh auto cancel` frees a slot.")
+        return False, (f"Only {plural(RHC_AUTO_MAX_PER_USER - have, 'slot')} left of the "
+                       f"{plural(RHC_AUTO_MAX_PER_USER, 'auto-order')} one wallet can hold; this needs {n}."
+                       f"{SEP}`/rh auto cancel` frees a slot.")
+    total = len(storage.auto_orders)
+    if total + n > RHC_AUTO_MAX_TOTAL:
+        if total >= RHC_AUTO_MAX_TOTAL:
+            return False, (f"McCap is watching {plural(RHC_AUTO_MAX_TOTAL, 'auto-order')} already, the most it polls "
+                           f"for at once. Try again when one fills or expires.")
+        return False, (f"McCap has {plural(RHC_AUTO_MAX_TOTAL - total, 'slot')} left of the "
+                       f"{plural(RHC_AUTO_MAX_TOTAL, 'auto-order')} it polls for at once; this needs {n}. "
+                       f"Try again when one fills or expires.")
+    return True, ""
+
+
 # ---------------- the one way a rule is written ----------------
 
 def _size(o: AutoOrder) -> str:
@@ -165,16 +347,44 @@ def _metric(o: AutoOrder) -> str:
     return "1h volume" if o.metric == "vol1h" else "MC"
 
 
+def _then_text(spec: str) -> str:
+    """' · then TP 2x / SL -30%' for a buy that arms protection on fill; a spec that
+    no longer parses is shown raw rather than hidden."""
+    try:
+        parts = _then_parts(spec)
+    except ValueError:
+        return f"{SEP}then {spec}"
+    if not parts:
+        return ""
+    return f"{SEP}then " + " / ".join(f"{key.upper()} {at}" for key, at, _p in parts)
+
+
 def describe_rule(o: AutoOrder) -> str:
     """'sell 50% PONS when MC ≥ $500K (2x from your $250K entry)' — used by the
-    confirm prompt, the armed notice, /rh auto list and every report."""
+    confirm prompt, the armed notice, /rh auto list and every report. Trailing:
+    'sell 100% PONS when MC ≤ $400K (trail 20% below its $500K high)'; a buy with
+    protection ends ' · then TP 2x / SL -30%'."""
     sign = "≥" if o.direction == "above" else "≤"
-    text = f"{o.side} {_size(o)} {o.symbol} when {_metric(o)} {sign} {usd(o.target)}"
-    if o.spec:
-        if o.anchor == "entry" and o.anchor_mc:
-            text += f" ({o.spec} from your {usd(o.anchor_mc)} entry)"
-        else:
-            text += f" ({o.spec} from now)"
+    head = f"{o.side} {_size(o)} {o.symbol}"
+    if o.metric == "now":
+        text = f"{head} now"
+    elif o.metric == "fill":
+        text = f"{head} (waiting for the fill)"
+    elif o.metric == "move":
+        text = f"{head} when it moves {sign} {pct(o.target)}"
+        if o.window_sec:
+            text += f" in {human_window(int(o.window_sec))}"
+    else:
+        text = f"{head} when {_metric(o)} {sign} {usd(o.target)}"
+        if o.trail_pct and o.trail_pct > 0:
+            text += f" (trail {o.trail_pct:g}% below its {usd(o.high_mc or o.anchor_mc)} high)"
+        elif o.spec:
+            if o.anchor == "entry" and o.anchor_mc:
+                text += f" ({o.spec} from your {usd(o.anchor_mc)} entry)"
+            else:
+                text += f" ({o.spec} from now)"
+    if o.side == "buy" and o.then:
+        text += _then_text(o.then)
     return text
 
 
@@ -237,6 +447,13 @@ class Engine:
         self._tasks: Set[asyncio.Task] = set()
         self._hold_notified: Set[Tuple[str, int]] = set()   # ("ch", channel) / ("dm", user) already told
         self._loop_task: Optional[asyncio.Task] = None
+        # Trailing stops: the previous fresh sample above the high (a candidate
+        # new high that one more agreeing sample confirms), the target each rule
+        # had when it last reached disk, and when the ratchet last saved.
+        self._trail_cand: Dict[str, float] = {}
+        self._trail_saved: Dict[str, float] = {}
+        self._trail_dirty = False
+        self._trail_saved_ts = 0.0
 
     def held_for(self, order_id: str) -> Optional[Tuple[str, float]]:
         """(reason, when) if this rule's last attempt was a hold, else None."""
@@ -339,25 +556,65 @@ class Engine:
         async with TOKEN_CACHE_LOCK:
             snaps = {o.ca: token_cache.get(o.ca) for o in armed}
 
-        # 6. Debounce, then 7. spawn.
+        # 6. Debounce, then 7. spawn. A trailing stop ratchets first, on the
+        # same distinct-and-fresh sample rule, so the level it is judged
+        # against is the one its high implies.
         for o in armed:
             snap = snaps.get(o.ca)
             count, last_ts = self._hits.get(o.id, (0, 0.0))
             if snap is None or snap.updated_ts == last_ts or now - snap.updated_ts > STALE_SECONDS:
                 continue
-            value = snap.mc if o.metric == "mc" else snap.vol1h
+            if o.trail_pct and o.trail_pct > 0 and snap.mc is not None:
+                self._ratchet(o, float(snap.mc))
+            value = rule_value(o, snap=snap, now=now)
             if value is None:
                 continue
-            count = count + 1 if meets(o.direction, value, o.target) else 0
+            met = meets(o.direction, value, o.target) and (o.side != "buy" or floors_ok(o, snap=snap))
+            count = count + 1 if met else 0
             self._hits[o.id] = (count, snap.updated_ts)
             if (count >= CONFIRM_SAMPLES and o.id not in self._firing and o.user_id not in self._firing_users
                     and not swap.has_inflight(o.user_id) and now >= self._retry_after.get(o.id, 0.0)):
-                self._spawn(o)
+                self._spawn(o, target_seen=o.target)
 
-    def _spawn(self, o: AutoOrder) -> None:
+        # 8. Ratcheted targets reach disk once per tick, throttled: a restart
+        # would otherwise resume from a stop that is a little too low, never
+        # too high, so this is bookkeeping rather than safety.
+        if self._trail_dirty and now - self._trail_saved_ts >= TRAIL_SAVE_SECONDS:
+            self._trail_dirty = False
+            self._trail_saved_ts = now
+            for o in armed:
+                if o.trail_pct and o.trail_pct > 0:
+                    self._trail_saved[o.id] = o.target
+            await storage.save_orders()
+
+    def _ratchet(self, o: AutoOrder, mc: float) -> None:
+        """Raise a trailing stop's high (and so its target) only when the previous
+        distinct fresh sample and this one both sit above the high; the high becomes
+        the lower of the two. One spike never counts; a sample at or under the high
+        clears the candidate; nothing here ever lowers the high or the target."""
+        if mc <= o.high_mc:
+            self._trail_cand.pop(o.id, None)
+            return
+        prev = self._trail_cand.get(o.id)
+        self._trail_cand[o.id] = mc
+        if prev is None or prev <= o.high_mc:
+            return
+        o.high_mc = min(prev, mc)
+        target = o.high_mc * (1 - o.trail_pct / 100.0)
+        if target <= o.target:
+            return
+        # The target on disk is the one the rule was armed with until the
+        # ratchet first writes; a rise of TRAIL_SAVE_RISE_PCT over it is worth a save.
+        base = self._trail_saved.setdefault(o.id, o.target)
+        o.target = target
+        if base <= 0 or target >= base * (1 + TRAIL_SAVE_RISE_PCT / 100.0):
+            self._trail_dirty = True
+
+    def _spawn(self, o: AutoOrder, target_seen: Optional[float] = None) -> None:
         self._firing.add(o.id)
         self._firing_users.add(o.user_id)
-        t = asyncio.create_task(self._fire(o), name=f"auto-order-{o.id}")
+        seen = o.target if target_seen is None else target_seen
+        t = asyncio.create_task(self._fire(o, seen), name=f"auto-order-{o.id}")
         self._tasks.add(t)
 
         def _done(task: asyncio.Task, oid=o.id, uid=o.user_id) -> None:
@@ -418,12 +675,12 @@ class Engine:
 
     # ----- firing -----
 
-    async def _fire(self, o: AutoOrder) -> None:
+    async def _fire(self, o: AutoOrder, target_seen: Optional[float] = None) -> None:
         try:
             if o.side == "sell":
-                await self._fire_sell(o)
+                await self._fire_sell(o, target_seen)
             else:
-                await self._fire_buy(o)
+                await self._fire_buy(o, target_seen)
         except asyncio.CancelledError:
             raise
         except _Hold as h:
@@ -471,14 +728,26 @@ class Engine:
             raise _Retire("your wallet is gone from the vault")
         return w
 
-    async def _fresh(self, o: AutoOrder) -> Dict[str, Any]:
-        """Step 3: DexScreener now, not the cache. A wick that is over by the time we look is a hold."""
+    async def _fresh(self, o: AutoOrder, target_seen: Optional[float] = None) -> Dict[str, Any]:
+        """Step 3: DexScreener now, not the cache. A wick that is over by the time we
+        look is a hold. The read is judged against ``target_seen``, the level the tick
+        spawned this fire with; a target that moved underneath (a trailing stop
+        ratcheting while we quoted) is a hold too, so the rule is re-debounced
+        against its new level rather than fired against a stale one. Buy floors are
+        re-checked here on the fresh payload."""
+        target = o.target if target_seen is None else target_seen
+        if o.target != target:
+            raise _Hold(f"the level moved to {usd(o.target)} while this fire was in flight")
         info = await trade.summary(o.ca)
         if info is None:
             raise _Retry(f"No DexScreener data for {o.symbol} right now")
-        value = info.get("mc") if o.metric == "mc" else info.get("vol1h")
-        if not meets(o.direction, value, o.target):
-            raise _Hold(f"the fresh read ({usd(value)}) no longer met the level")
+        value = rule_value(o, info=info)
+        if not meets(o.direction, value, target):
+            what = "the move" if o.metric == "move" else "the level"
+            raise _Hold(f"the fresh read ({_value_text(o, value)}) no longer met {what}")
+        if o.side == "buy" and not floors_ok(o, info=info):
+            raise _Hold(f"the fresh read (liq {usd(info.get('liq'))}, {plural(int(info.get('buys_m5') or 0), 'buy')}"
+                        f"/5m) fell under the rule's floor")
         return info
 
     async def _mark_firing(self, o: AutoOrder) -> None:
@@ -494,9 +763,9 @@ class Engine:
     def _tags(self, o: AutoOrder) -> Dict[str, Any]:
         return {"source": "auto", "order_id": o.id, "rule": describe_rule(o)}
 
-    async def _fire_sell(self, o: AutoOrder) -> None:
+    async def _fire_sell(self, o: AutoOrder, target_seen: Optional[float] = None) -> None:
         w = self._preflight(o)
-        info = await self._fresh(o)
+        info = await self._fresh(o, target_seen)
         try:
             plan = await trade.plan_sell(o.user_id, w.address, o.ca, o.symbol, o.decimals, int(o.size), o.slippage_bps)
         except trade.Refusal as e:
@@ -514,9 +783,9 @@ class Engine:
         view = self._panel("partial_sell_row", o) if plan.pct < 100 else None
         await self._conclude(o, res, success, view)
 
-    async def _fire_buy(self, o: AutoOrder) -> None:
+    async def _fire_buy(self, o: AutoOrder, target_seen: Optional[float] = None) -> None:
         w = self._preflight(o)
-        info = await self._fresh(o)
+        info = await self._fresh(o, target_seen)
         eth_price = await trade.eth_usd()
         if not eth_price:
             raise _Retry("No ETH price from DexScreener right now")
@@ -629,6 +898,8 @@ class Engine:
         self._retry_after.pop(o.id, None)
         self._pending_polled.pop(o.id, None)
         self._held.pop(o.id, None)
+        self._trail_cand.pop(o.id, None)
+        self._trail_saved.pop(o.id, None)
         try:
             await storage.save_orders()
         except Exception:

@@ -460,7 +460,7 @@ class TpSlModal(discord.ui.Modal, title="Take-profit and stop-loss"):
         component=discord.ui.TextInput(default="50", required=True, max_length=3),
     )
     sl_at = discord.ui.Label(
-        text="Stop-loss at", description="-30%, 300k; blank to skip",
+        text="Stop-loss at", description="-30%, 300k, or trail 25%; blank to skip",
         component=discord.ui.TextInput(default="-30%", required=False, max_length=16),
     )
     sl_pct = discord.ui.Label(
@@ -570,7 +570,10 @@ def board_view(kind: str, tokens) -> discord.ui.View:
             continue
         seen.add(addr.lower())
         label = (str(getattr(t, "symbol", "") or "") or addr[:8])[:100]
-        desc = footer(f"{usd(getattr(t, 'mc_usd', None))} MC", f"{usd(getattr(t, 'liq_usd', None))} liq")[:100]
+        buyers = getattr(t, "buyers", None)
+        active = buyers("m5") if callable(buyers) else 0
+        desc = footer(f"{usd(getattr(t, 'mc_usd', None))} MC", f"{usd(getattr(t, 'liq_usd', None))} liq",
+                      f"{active} buyers" if active else "")[:100]
         options.append(discord.SelectOption(label=label, value=addr, description=desc or None))
     if not options:
         raise ValueError("no tokens to pick from")

@@ -142,7 +142,7 @@ async def test_auto_gates_and_limits_answer_before_the_defer(world, monkeypatch)
     assert "RHC_AUTO_ENABLE" in off.last and off.response.deferred_ephemeral is None
     monkeypatch.setattr(orders, "RHC_AUTO_ENABLE", True)
 
-    monkeypatch.setattr(cog, "RHC_AUTO_MAX_PER_USER", 1)
+    monkeypatch.setattr(orders, "RHC_AUTO_MAX_PER_USER", 1)   # the slot arithmetic lives in orders.room_for
     first = FakeInteraction()
     await arm_sell(first)
     assert len(storage.auto_orders) == 1

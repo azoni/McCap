@@ -59,6 +59,20 @@ class RateLimiter:
         self.updated = time.monotonic()
         self._lock = asyncio.Lock()
 
+    def available(self) -> float:
+        """Tokens a caller could take right now, refill applied, nothing consumed.
+
+        ``tokens`` alone goes stale between acquires: it only moves when
+        someone acquires, so a bucket that emptied a minute ago still reads
+        as empty. The discovery feed yields to interactive callers when the
+        bucket is under half, and needs the refilled figure to decide that.
+        Pure: the bucket itself is not written, so a concurrent ``acquire``
+        (which may be sleeping while holding the lock) sees exactly the state
+        it left.
+        """
+        elapsed = max(0.0, time.monotonic() - self.updated)
+        return min(float(self.capacity), self.tokens + elapsed * self.refill_per_sec)
+
     async def acquire(self) -> None:
         async with self._lock:
             while True:

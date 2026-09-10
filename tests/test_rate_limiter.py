@@ -71,3 +71,17 @@ def test_tiny_rate_still_usable():
     lim = RateLimiter(1)
     assert lim.capacity >= 1
     assert lim.tokens >= 1
+
+
+def test_available_applies_the_refill_without_consuming():
+    """``tokens`` only moves on acquire, so a bucket drained a while ago still
+    reads as empty; the feed's yield check needs the refilled figure."""
+    lim = RateLimiter(60, burst=4)           # 1 token/sec
+    lim.tokens = 0.0
+    lim.updated = time.monotonic() - 2.0
+    got = lim.available()
+    assert 1.9 <= got <= 2.3
+    assert lim.tokens == 0.0, "reading must not take a token"
+    assert lim.available() <= lim.capacity
+    lim.updated = time.monotonic() - 60.0
+    assert lim.available() == pytest.approx(lim.capacity), "capped at the burst"

@@ -153,3 +153,40 @@ def test_separating_auto_from_user_alerts(data_dir):
     storage.move_alerts.extend([mv(expires=0.0), mv(ca="A" * 40, expires=999.0)])
     auto = [m for m in storage.move_alerts if m.auto_expires_ts]
     assert len(auto) == 1
+
+
+# ---------------- the discovery feed's document ----------------
+
+
+@pytest.fixture
+def feed_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(storage, "FEED_FILE", str(tmp_path / "feed.json"))
+    monkeypatch.setattr(storage, "DATA_DIR", tmp_path)
+    return tmp_path / "feed.json"
+
+
+def test_feed_document_round_trips(feed_file):
+    payload = {"configs": [{"guild_id": 1, "channel_id": 2}], "seen": {"spike:0xabc": 1.5},
+               "pending": {"0xabc": {"ca": "0xabc", "tries": 2}}, "posted": [{"ca": "0xabc", "ts": 3.0}]}
+    asyncio.run(storage.save_feed(payload))
+    assert feed_file.exists()
+    assert asyncio.run(storage.load_feed()) == payload
+
+
+def test_feed_document_missing_file_is_the_empty_shape(feed_file):
+    got = asyncio.run(storage.load_feed())
+    assert got == storage.empty_feed() and set(got) == set(storage.FEED_KEYS)
+
+
+def test_feed_document_junk_is_kept_aside_not_replaced(feed_file):
+    feed_file.write_text("{not json", encoding="utf-8")
+    assert asyncio.run(storage.load_feed()) is None, "unreadable: leave the in-memory state alone"
+    assert feed_file.with_suffix(".json.corrupt").exists()
+    feed_file.write_text(json.dumps([1, 2, 3]), encoding="utf-8")
+    assert asyncio.run(storage.load_feed()) is None
+
+
+def test_feed_document_fills_missing_and_mistyped_keys(feed_file):
+    feed_file.write_text(json.dumps({"configs": "nope", "seen": {"a": 1.0}}), encoding="utf-8")
+    got = asyncio.run(storage.load_feed())
+    assert got["configs"] == [] and got["seen"] == {"a": 1.0} and got["pending"] == {} and got["posted"] == []

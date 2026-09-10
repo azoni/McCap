@@ -120,6 +120,37 @@ async def test_backfill_asks_geckoterminal_about_the_right_network(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_tokens_multi_batches_addresses_into_one_request(monkeypatch):
+    from mccapbot import gecko
+    urls = []
+
+    async def fake_get_json(url, limiter=None):
+        urls.append(url)
+        return {"data": [
+            {"id": "robinhood_0xa", "type": "token",
+             "attributes": {"address": "0xA", "symbol": "A", "total_reserve_in_usd": "12000.5", "decimals": 18}},
+            "junk",
+            {"attributes": {"symbol": "no-address"}},
+        ]}
+    monkeypatch.setattr(gecko, "get_json", fake_get_json)
+
+    got = await gecko.tokens_multi(["0xA", "0xb", "0xa", ""])
+    assert len(urls) == 1 and urls[0].endswith("/networks/robinhood/tokens/multi/0xa,0xb"), "deduped, lowercased, one call"
+    assert got == {"0xa": {"address": "0xA", "symbol": "A", "total_reserve_in_usd": "12000.5", "decimals": 18}}
+    assert "0xb" not in got, "a token GeckoTerminal does not know is simply absent"
+
+    await gecko.tokens_multi([f"0x{i:040x}" for i in range(45)], network="base")
+    assert "/networks/base/" in urls[1] and urls[1].rsplit("/", 1)[1].count(",") == gecko.TOKENS_MULTI_MAX - 1
+
+    assert await gecko.tokens_multi([]) == {} and len(urls) == 2, "nothing to ask, no request"
+
+    async def down(url, limiter=None):
+        return None
+    monkeypatch.setattr(gecko, "get_json", down)
+    assert await gecko.tokens_multi(["0xa"]) is None, "a failed request is None, not an empty answer"
+
+
+@pytest.mark.asyncio
 async def test_top_pool_treats_usdg_as_a_major_quote(monkeypatch):
     from mccapbot import gecko
 

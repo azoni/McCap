@@ -11,7 +11,7 @@ alert window, so historical market cap is derived by scaling each close against
 the live market cap we already trust from DexScreener's consensus.
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from .config import RHCHAIN_NETWORK
 from .constants import MAJOR_QUOTES
@@ -137,6 +137,46 @@ async def history_points(
 
     points.sort(key=lambda p: p[0])
     return points
+
+
+# GeckoTerminal's multi-token endpoint takes at most this many addresses.
+TOKENS_MULTI_MAX = 30
+
+
+async def tokens_multi(addrs: Iterable[str], network: str = RHCHAIN_NETWORK) -> Optional[Dict[str, Dict]]:
+    """Current attributes for up to 30 tokens in one request.
+
+    ``GET /networks/{network}/tokens/multi/{a,b,...}``: one limiter token for
+    the whole batch, which is what makes the discovery feed's second look on
+    pending new pairs affordable. Each token's attributes carry
+    ``total_reserve_in_usd``, ``price_usd``, ``fdv_usd``, ``volume_usd`` and
+    ``decimals`` — reserve, price and volume only, no per-window trade counts.
+
+    Returns ``{address_lower: attributes}`` (a token GeckoTerminal does not
+    know is simply absent), ``{}`` for an empty request, and ``None`` when the
+    request itself failed so the caller can tell a blip from a delisting.
+    Never raises.
+    """
+    wanted: List[str] = []
+    for a in addrs:
+        a = (a or "").strip().lower()
+        if a and a not in wanted:
+            wanted.append(a)
+    wanted = wanted[:TOKENS_MULTI_MAX]
+    if not wanted:
+        return {}
+    data = await get_json(f"{BASE}/networks/{network}/tokens/multi/{','.join(wanted)}", limiter=gecko_limiter)
+    if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+        return None
+    out: Dict[str, Dict] = {}
+    for item in data["data"]:
+        if not isinstance(item, dict):
+            continue
+        attrs = item.get("attributes") or {}
+        addr = (attrs.get("address") or "").strip().lower()
+        if addr:
+            out[addr] = attrs
+    return out
 
 
 def network_for(ca: str) -> str:

@@ -187,6 +187,28 @@ def test_describe_rule_covers_every_shape():
     o = make_order(side="buy", metric="vol1h", direction="above", target=50_000.0, size=10.0)
     assert orders.describe_rule(o) == "buy $10.00 PONS when 1h volume ≥ $50K"
     assert orders.describe_rule(make_order(size=100.0)).startswith("sell 100% PONS")
+    # Trailing: the high it trails, not the anchor it started from.
+    o = make_order(size=100.0, direction="below", target=400_000.0, spec="trail 20%", anchor="now",
+                   anchor_mc=450_000.0, trail_pct=20.0, high_mc=500_000.0)
+    assert orders.describe_rule(o) == "sell 100% PONS when MC ≤ $400K (trail 20% below its $500K high)"
+    o = make_order(size=100.0, direction="below", target=400_000.0, spec="trail 20%", anchor="now",
+                   anchor_mc=500_000.0, trail_pct=20.0)                     # never ratcheted: the anchor is the high
+    assert orders.describe_rule(o) == "sell 100% PONS when MC ≤ $400K (trail 20% below its $500K high)"
+    # A buy that arms protection on fill says so; a sell with a stray `then` does not.
+    o = make_order(side="buy", direction="below", target=200_000.0, size=10.0, then="tp=2x:50,sl=-30%:100")
+    assert orders.describe_rule(o) == "buy $10.00 PONS when MC ≤ $200K · then TP 2x / SL -30%"
+    o = make_order(side="buy", direction="below", target=200_000.0, size=10.0, then="sl=-30%:100")
+    assert orders.describe_rule(o) == "buy $10.00 PONS when MC ≤ $200K · then SL -30%"
+    o = make_order(side="buy", direction="below", target=200_000.0, size=10.0, then="junk")
+    assert orders.describe_rule(o) == "buy $10.00 PONS when MC ≤ $200K · then junk"
+    assert orders.describe_rule(make_order(then="tp=2x:50")) == "sell 50% PONS when MC ≥ $500K"
+    # The metrics later items add never render as a dollar level.
+    o = make_order(side="buy", metric="move", direction="above", target=25.0, size=10.0, window_sec=900)
+    assert orders.describe_rule(o) == "buy $10.00 PONS when it moves ≥ +25% in 15m"
+    o = make_order(side="buy", metric="now", direction="above", target=0.0, size=5.0, then="tp=2x:50,sl=-30%:100")
+    assert orders.describe_rule(o) == "buy $5.00 PONS now · then TP 2x / SL -30%"
+    o = make_order(side="buy", metric="fill", direction="above", target=0.0, size=5.0)
+    assert orders.describe_rule(o) == "buy $5.00 PONS (waiting for the fill)"
 
 
 def test_classify_tells_a_busy_wallet_from_a_failure():
@@ -914,3 +936,402 @@ async def test_stop_cancels_fires_that_outlive_the_grace(world, clock, monkeypat
     await asyncio.wait_for(eng.stop(grace=0.05), 2)
     assert eng._tasks == set()
     assert disk_status(o.id) == "firing"              # the restart path retires it next boot
+
+
+# ---------------- item 7: min_expiry_for, trailing stops, rule_value, floors, target snapshot ----------------
+
+def snap_full(mc, ts, **fields):
+    token_cache[CA] = TokenSnapshot(mc=mc, url="", updated_ts=ts, **fields)
+
+
+def trailing(**overrides):
+    base = dict(size=100.0, direction="below", target=400_000.0, spec="trail 20%", anchor="now",
+                anchor_mc=500_000.0, trail_pct=20.0, high_mc=500_000.0)
+    base.update(overrides)
+    return base
+
+
+async def sample(eng, clock, mc, **fields):
+    """One distinct fresh cache sample, then a tick."""
+    clock.advance(10)
+    snap_full(mc, clock.t - 1, **fields)
+    await eng.tick()
+
+
+def test_min_expiry_for_and_parse_expiry_minimum(clock):
+    assert orders.min_expiry_for("now") == 300
+    assert orders.min_expiry_for("mc") == orders.min_expiry_for("vol1h") == orders.min_expiry_for("move") == 3600
+    assert orders.parse_expiry("10m", "7d", "30d", minimum=orders.min_expiry_for("now")) == T0 + 600
+    assert orders.parse_expiry("5m", "7d", "30d", minimum=300) == T0 + 300
+    with pytest.raises(ValueError, match="at least 5m"):
+        orders.parse_expiry("4m", "7d", "30d", minimum=300)
+    with pytest.raises(ValueError, match="at least 1h"):
+        orders.parse_expiry("10m", "7d", "30d", minimum=None)
+    with pytest.raises(ValueError, match="at least 1h"):
+        orders.parse_expiry("10m", "7d", "30d", minimum=orders.min_expiry_for("mc"))
+
+
+def test_sell_rule_parses_a_trailing_stop_from_the_market_cap_now():
+    for at in ("trail 20%", "trail 20", "20% trailing", "TRAIL 20 %", "trailing 20%", "20%trail"):
+        r = orders.sell_rule(at, 250_000.0, 500_000.0, "entry")      # the anchor choice is ignored: trailing starts now
+        assert r == orders.Rule(metric="mc", direction="below", target=pytest.approx(400_000.0), spec="trail 20%",
+                                anchor_mc=500_000.0, anchor="now", trail_pct=20.0), at
+    r = orders.sell_rule("trail 12.5%", None, 200_000.0, "now")
+    assert r.spec == "trail 12.5%" and r.trail_pct == 12.5 and r.target == pytest.approx(175_000.0)
+    assert not orders.already_met(r.direction, 200_000.0, r.target)   # false by construction
+    assert orders.sell_rule("trail 5%", None, 100.0, "now").trail_pct == 5.0
+    assert orders.sell_rule("trail 60%", None, 100.0, "now").trail_pct == 60.0
+
+
+def test_sell_rule_refuses_a_trailing_stop_out_of_range_or_without_a_price():
+    for at in ("trail 0%", "trail 4.9%", "trail 90%", "trail 61%", "100% trailing"):
+        with pytest.raises(ValueError, match="between 5% and 60%"):
+            orders.sell_rule(at, 250_000.0, 500_000.0, "entry")
+    with pytest.raises(ValueError, match="no market cap to start"):
+        orders.sell_rule("trail 20%", 250_000.0, None, "entry")
+    with pytest.raises(ValueError, match="no market cap to start"):
+        orders.sell_rule("trail 20%", 250_000.0, 0.0, "now")
+    with pytest.raises(ValueError, match="Could not read"):
+        orders.sell_rule("trailer 20%", 250_000.0, 500_000.0, "entry")
+    assert orders.Rule("mc", "above", 1.0).trail_pct == 0.0             # plain rules never trail
+
+
+def test_rule_value_reads_each_metric_and_never_invents_a_number(clock):
+    o = make_order()
+    s = TokenSnapshot(mc=123.0, url="", updated_ts=T0, vol1h=456.0, liq_usd=20_000.0, buys_m5=7)
+    info = {"mc": 321.0, "vol1h": 654.0, "liq": 15_000.0, "buys_m5": 2}
+    assert orders.rule_value(o, snap=s) == 123.0
+    assert orders.rule_value(o, info=info) == 321.0
+    assert orders.rule_value(o, snap=s, info=info) == 123.0             # the snapshot wins when both are given
+    assert orders.rule_value(o) is None
+    o.metric = "vol1h"
+    assert orders.rule_value(o, snap=s) == 456.0 and orders.rule_value(o, info=info) == 654.0
+    assert orders.rule_value(o, snap=TokenSnapshot(mc=1.0, url="", updated_ts=T0)) is None
+    o.metric = "fill"
+    assert orders.rule_value(o, snap=s, info=info) is None
+    o.metric = "sideways"
+    assert orders.rule_value(o, snap=s, info=info) is None
+    # "now" is 1.0 only with a market cap and passing floors.
+    o = make_order(side="buy", metric="now", direction="above", target=0.0, size=5.0, min_liq=10_000.0, min_buyers=3)
+    assert orders.rule_value(o, snap=s) == 1.0
+    assert orders.rule_value(o, info=info) is None                      # buyers 2 < 3
+    assert orders.rule_value(o, snap=TokenSnapshot(mc=None, url="", updated_ts=T0, liq_usd=99_999.0, buys_m5=9)) is None
+    assert orders.rule_value(o) is None
+    assert orders.rule_value(make_order(side="buy", metric="now", direction="above", target=0.0, size=5.0),
+                             info={"mc": 5.0}) == 1.0
+
+
+def test_rule_value_move_comes_from_the_history_series(clock, monkeypatch):
+    from mccapbot import history
+    monkeypatch.setattr(history, "_series", {})
+    o = make_order(side="buy", metric="move", direction="above", target=25.0, size=10.0, window_sec=900)
+    assert orders.rule_value(o, now=T0) is None                          # no history yet
+    history.record(CA, 100_000.0, T0 - 900)
+    history.record(CA, 130_000.0, T0)
+    assert orders.rule_value(o, now=T0) == pytest.approx(30.0)
+    assert orders.rule_value(o) == pytest.approx(30.0)                  # the engine clock when now is omitted
+    assert orders.rule_value(make_order(side="buy", metric="move", direction="above", target=25.0, size=10.0), now=T0) is None
+
+
+def test_floors_ok_treats_zero_as_no_floor_and_unknown_as_failing():
+    plain = make_order(side="buy", direction="below", target=200_000.0, size=10.0)
+    assert orders.floors_ok(plain) and orders.floors_ok(plain, snap=TokenSnapshot(mc=None, url="", updated_ts=T0))
+    o = make_order(side="buy", direction="below", target=200_000.0, size=10.0, min_liq=10_000.0, min_buyers=3)
+    assert orders.floors_ok(o, snap=TokenSnapshot(mc=1.0, url="", updated_ts=T0, liq_usd=10_000.0, buys_m5=3))
+    assert not orders.floors_ok(o, snap=TokenSnapshot(mc=1.0, url="", updated_ts=T0, liq_usd=9_999.0, buys_m5=3))
+    assert not orders.floors_ok(o, snap=TokenSnapshot(mc=1.0, url="", updated_ts=T0, liq_usd=10_000.0, buys_m5=2))
+    assert not orders.floors_ok(o, snap=TokenSnapshot(mc=1.0, url="", updated_ts=T0, liq_usd=None, buys_m5=9))
+    assert not orders.floors_ok(o)
+    assert orders.floors_ok(o, info={"liq": 12_000.0, "buys_m5": 4})
+    assert not orders.floors_ok(o, info={"liq": 12_000.0})
+    assert not orders.floors_ok(o, info={"buys_m5": 4})
+    assert orders.floors_ok(make_order(side="buy", direction="below", target=1.0, size=1.0, min_liq=10_000.0),
+                            info={"liq": 10_000.0})
+
+
+@pytest.mark.asyncio
+async def test_floors_gate_a_buy_in_the_tick_and_again_on_the_fresh_read(world, clock):
+    eng, bot = engine()
+    world.mc_now = 150_000.0
+    o = await arm(side="buy", direction="below", target=200_000.0, size=10.0, min_liq=10_000.0, min_buyers=3)
+    await sample(eng, clock, 150_000.0, liq_usd=5_000.0, buys_m5=9)
+    await sample(eng, clock, 150_000.0, liq_usd=50_000.0, buys_m5=1)
+    await sample(eng, clock, 150_000.0, liq_usd=None, buys_m5=9)
+    await eng.drain()
+    assert eng._hits[o.id][0] == 0 and world.executed == []
+    # The cache passes but DexScreener's fresh payload is under the floor: a hold, not a fill.
+    world.liquidity = 5_000.0
+    await sample(eng, clock, 150_000.0, liq_usd=50_000.0, buys_m5=9)
+    await sample(eng, clock, 150_000.0, liq_usd=50_000.0, buys_m5=9)
+    await eng.drain()
+    assert world.executed == [] and o.status == "armed" and o.attempts == 0 and world.route_calls == 0
+    assert "fell under the rule's floor" in eng.held_for(o.id)[0]
+    # Floors pass everywhere: it fills. (World summaries carry no buys_m5; a floor of 0 on buyers is no floor.)
+    o.min_buyers = 0
+    world.liquidity = 50_000.0
+    await sample(eng, clock, 150_000.0, liq_usd=50_000.0, buys_m5=9)
+    await sample(eng, clock, 150_000.0, liq_usd=50_000.0, buys_m5=9)
+    await eng.drain()
+    assert len(world.executed) == 1 and storage.auto_orders == []
+    # Sells never carry floors, and a floor on a sell record is ignored.
+    s = await arm(min_liq=999_999_999.0)
+    world.mc_now = 600_000.0
+    await trigger(eng, clock)
+    assert len(world.executed) == 2 and s not in storage.auto_orders
+
+
+@pytest.mark.asyncio
+async def test_two_rising_samples_raise_the_high_and_the_target_one_spike_never_does(world, clock):
+    eng, bot = engine()
+    o = await arm(**trailing())
+    await sample(eng, clock, 900_000.0)                 # one print above the high: a candidate only
+    assert (o.high_mc, o.target) == (500_000.0, 400_000.0) and eng._trail_cand[o.id] == 900_000.0
+    await sample(eng, clock, 450_000.0)                 # back under: the spike is forgotten
+    assert (o.high_mc, o.target) == (500_000.0, 400_000.0) and o.id not in eng._trail_cand
+    await sample(eng, clock, 600_000.0)
+    await sample(eng, clock, 650_000.0)                 # two agreeing samples: the high is the lower of the two
+    assert o.high_mc == 600_000.0 and o.target == pytest.approx(480_000.0)
+    await sample(eng, clock, 700_000.0)                 # and it keeps following, one sample behind
+    assert o.high_mc == 650_000.0 and o.target == pytest.approx(520_000.0)
+    assert world.executed == [] and o.status == "armed"
+    assert orders.describe_rule(o) == "sell 100% PONS when MC ≤ $520K (trail 20% below its $650K high)"
+    # The same sample seen again, or a stale one, never moves anything.
+    await eng.tick()
+    snap_full(900_000.0, clock.t - orders.STALE_SECONDS - 1)
+    await eng.tick()
+    assert o.high_mc == 650_000.0 and eng._trail_cand[o.id] == 700_000.0
+
+
+@pytest.mark.asyncio
+async def test_a_lower_sample_never_lowers_the_high_or_the_target(world, clock):
+    eng, bot = engine()
+    o = await arm(**trailing())
+    await sample(eng, clock, 650_000.0)
+    await sample(eng, clock, 640_000.0)
+    assert o.high_mc == 640_000.0 and o.target == pytest.approx(512_000.0)
+    for mc in (620_000.0, 630_000.0, 635_000.0, 520_000.0, 515_000.0):
+        await sample(eng, clock, mc)
+        assert o.high_mc == 640_000.0 and o.target == pytest.approx(512_000.0), mc
+    assert world.executed == [] and o.status == "armed"
+    await sample(eng, clock, 641_000.0)
+    await sample(eng, clock, 641_000.0)                 # equal samples above the high agree too
+    assert o.high_mc == 641_000.0 and o.target == pytest.approx(512_800.0)
+
+
+@pytest.mark.asyncio
+async def test_a_drop_through_the_ratcheted_target_fires_against_the_target_the_tick_saw(world, clock, monkeypatch):
+    seen = []
+    real_fresh = orders.Engine._fresh
+
+    async def spy(self, o, target_seen=None):
+        seen.append((target_seen, o.target))
+        return await real_fresh(self, o, target_seen)
+    monkeypatch.setattr(orders.Engine, "_fresh", spy)
+    eng, bot = engine()
+    world.sell_route.amount_in = 36 * 10**18
+    o = await arm(**trailing())
+    await sample(eng, clock, 600_000.0)
+    await sample(eng, clock, 650_000.0)
+    assert o.target == pytest.approx(480_000.0)
+    world.mc_now = 470_000.0                            # DexScreener agrees with the cache at fire time
+    await sample(eng, clock, 470_000.0)                 # under the ratcheted stop, above the original 400K
+    await sample(eng, clock, 470_000.0)
+    await eng.drain()
+    assert len(world.executed) == 1 and storage.auto_orders == [] and on_disk() == []
+    assert seen == [(pytest.approx(480_000.0), pytest.approx(480_000.0))]
+    text = bot.channel.texts[-1]
+    assert f"🤖 `{o.id}` fired" in text and "✅ Sold" in text
+    assert "when MC ≤ $480K (trail 20% below its $600K high)" in text
+    assert world.last_extra["rule"] == "sell 100% PONS when MC ≤ $480K (trail 20% below its $600K high)"
+    assert o.id not in eng._trail_cand and o.id not in eng._trail_saved
+
+
+@pytest.mark.asyncio
+async def test_a_target_that_moved_under_a_fire_in_flight_is_a_hold(world, clock, monkeypatch):
+    eng, bot = engine()
+    o = await arm(**trailing())
+    with pytest.raises(orders._Hold, match="the level moved to \\$480K while this fire was in flight"):
+        o.target = 480_000.0
+        await eng._fresh(o, target_seen=400_000.0)
+    assert world.summary_calls == 0                     # decided before any request
+    o.target = 400_000.0
+    # End to end: the ratchet lands between the spawn and the fresh read.
+    real_preflight = orders.Engine._preflight
+
+    def preflight_then_ratchet(self, order):
+        w = real_preflight(self, order)
+        order.target = 480_000.0                        # what a concurrent tick's ratchet would do
+        return w
+    monkeypatch.setattr(orders.Engine, "_preflight", preflight_then_ratchet)
+    world.mc_now = 390_000.0
+    await sample(eng, clock, 390_000.0)
+    await sample(eng, clock, 390_000.0)
+    await eng.drain()
+    assert world.executed == [] and world.route_calls == 0 and o.status == "armed" and o.attempts == 0
+    assert o in storage.auto_orders and o.id not in eng._hits and bot.channel.sent == []
+    assert eng.held_for(o.id)[0] == "the level moved to $480K while this fire was in flight"
+    # A plain rule passes its own target through unchanged and fires as before.
+    monkeypatch.setattr(orders.Engine, "_preflight", real_preflight)
+    storage.auto_orders.clear()
+    world.mc_now = 600_000.0
+    p = await arm()
+    await trigger(eng, clock)
+    assert len(world.executed) == 1 and p not in storage.auto_orders
+
+
+@pytest.mark.asyncio
+async def test_fresh_read_hold_texts_follow_the_metric(world, clock):
+    eng, bot = engine()
+    o = make_order()
+    world.mc_now = 100_000.0
+    with pytest.raises(orders._Hold, match=r"the fresh read \(\$100K\) no longer met the level"):
+        await eng._fresh(o)
+    o = make_order(side="buy", metric="vol1h", direction="above", target=50_000.0, size=10.0)
+    world.vol1h = 100.0
+    with pytest.raises(orders._Hold, match=r"the fresh read \(\$100.00\) no longer met the level"):
+        await eng._fresh(o)
+    o = make_order(side="buy", metric="move", direction="above", target=25.0, size=10.0, window_sec=900)
+    with pytest.raises(orders._Hold, match=r"the fresh read \(—\) no longer met the move"):
+        await eng._fresh(o)
+
+
+@pytest.mark.asyncio
+async def test_ratchet_saves_once_per_tick_on_a_one_percent_rise_throttled_to_thirty_seconds(world, clock, monkeypatch):
+    saves = []
+    real_save = storage.save_orders
+
+    async def save():
+        saves.append(clock.t)
+        await real_save()
+    monkeypatch.setattr(storage, "save_orders", save)
+    eng, bot = engine()
+    o = await arm(**trailing())
+    saves.clear()
+
+    def disk_target():
+        return {d["id"]: d["target"] for d in on_disk()}[o.id]
+
+    await sample(eng, clock, 600_000.0)
+    assert saves == [] and disk_target() == 400_000.0
+    await sample(eng, clock, 600_000.0)                 # first ratchet: 400K -> 480K, written at once
+    assert saves == [clock.t] and disk_target() == pytest.approx(480_000.0)
+    await sample(eng, clock, 700_000.0)
+    await sample(eng, clock, 700_000.0)                 # 480K -> 560K inside 30s: memory only
+    assert o.target == pytest.approx(560_000.0) and len(saves) == 1 and disk_target() == pytest.approx(480_000.0)
+    await sample(eng, clock, 700_000.0)                 # 30s later, no new rise: the throttled save lands
+    assert len(saves) == 2 and disk_target() == pytest.approx(560_000.0)
+    await sample(eng, clock, 703_000.0)
+    await sample(eng, clock, 703_000.0)                 # 560K -> 562.4K is under 1%: not worth a write
+    clock.advance(orders.TRAIL_SAVE_SECONDS)
+    await sample(eng, clock, 703_000.0)
+    assert o.target == pytest.approx(562_400.0) and len(saves) == 2
+    await sample(eng, clock, 710_000.0)
+    await sample(eng, clock, 710_000.0)                 # 568K is over 1% above the 560K on disk: written
+    assert len(saves) == 3 and disk_target() == pytest.approx(568_000.0)
+    assert {d["id"]: d["high_mc"] for d in on_disk()}[o.id] == 710_000.0
+
+
+@pytest.mark.asyncio
+async def test_cancel_while_trailing_stops_everything(world, clock):
+    eng, bot = engine()
+    o = await arm(**trailing())
+    await sample(eng, clock, 600_000.0)
+    await sample(eng, clock, 650_000.0)
+    assert o.target == pytest.approx(480_000.0)
+    storage.auto_orders.remove(o)                       # /rh auto cancel
+    await storage.save_orders()
+    world.mc_now = 470_000.0
+    await sample(eng, clock, 470_000.0)
+    await sample(eng, clock, 470_000.0)
+    await sample(eng, clock, 900_000.0)
+    await sample(eng, clock, 900_000.0)
+    await eng.drain()
+    assert world.executed == [] and on_disk() == [] and bot.channel.sent == []
+    assert (o.high_mc, o.target) == (600_000.0, pytest.approx(480_000.0))   # nothing touched the dead record
+
+
+@pytest.mark.asyncio
+async def test_trailing_and_protection_fields_round_trip_and_old_files_load(world):
+    o = make_order(**trailing(), expires_ts=T0 + 3600, then="tp=2x:50,sl=-30%:100", origin="manual")
+    storage.auto_orders.append(o)
+    await storage.save_orders()
+    storage.auto_orders.clear()
+    await storage.load_orders()
+    back = storage.auto_orders[0]
+    assert (back.trail_pct, back.high_mc, back.spec, back.then) == (20.0, 500_000.0, "trail 20%", "tp=2x:50,sl=-30%:100")
+    assert orders.describe_rule(back) == orders.describe_rule(o)
+    # A file written before trailing stops and protection existed.
+    old = [{"ca": CA, "symbol": "PONS", "decimals": 18, "side": "sell", "metric": "mc", "direction": "above",
+            "target": 500000.0, "size": 50.0, "slippage_bps": 200, "user_id": USER, "guild_id": 1, "channel_id": 99,
+            "expires_ts": T0 + 3600, "spec": "2x", "anchor_mc": 250000.0, "anchor": "entry", "private": False,
+            "id": "old001", "created_ts": T0, "status": "armed", "tx": "", "fired_ts": 0.0, "attempts": 0,
+            "last_attempt_ts": 0.0, "last_error": ""}]
+    with open(storage.RHC_ORDERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(old, f)
+    storage.auto_orders.clear()
+    await storage.load_orders()
+    back = storage.auto_orders[0]
+    assert back.id == "old001" and back.trail_pct == 0.0 and back.high_mc == 0.0 and back.then == ""
+    assert back.min_liq == 0.0 and back.min_buyers == 0 and back.window_sec == 0
+    assert orders.describe_rule(back) == "sell 50% PONS when MC ≥ $500K (2x from your $250K entry)"
+    assert orders.rule_value(back, info={"mc": 1.0}) == 1.0 and orders.floors_ok(back)
+
+
+# ---------------- item 6 helpers: parse_then, room_for ----------------
+
+def test_parse_then_reads_the_default_and_rejects_junk():
+    assert orders.parse_then("tp=2x:50,sl=-30%:100") == [("2x", 50), ("-30%", 100)]
+    assert orders.parse_then(" TP = 2x : 50 , sl=-30% ") == [("2x", 50), ("-30%", 100)]   # a missing percent sells all
+    assert orders.parse_then("sl=-30%:100") == [("-30%", 100)]
+    assert orders.parse_then("tp=+50%:25") == [("+50%", 25)]
+    assert orders.parse_then("sl=trail 25%:100") == [("trail 25%", 100)]              # a trailing SL is a sell rule too
+    assert orders.parse_then("") == orders.parse_then(None) == orders.parse_then("none") == orders.parse_then("NONE") == []
+    for junk in ("junk", "tp=moon:50", "tp=2x:0", "tp=2x:101", "tp=2x:lots", "tp=-30%:50", "sl=2x:100",
+                 "tp=2x:50,tp=3x:50", "x=2x:50", "tp=500k:50", "tp=2x:50,,sl=:100"):
+        with pytest.raises(ValueError, match=r"Could not read|must sit|must be between|given twice|wrong way|relative"):
+            orders.parse_then(junk)
+    from mccapbot.config import RHC_AUTO_PROTECT_DEFAULT
+    assert orders.parse_then(RHC_AUTO_PROTECT_DEFAULT) == [("2x", 50), ("-30%", 100)]
+
+
+def test_room_for_uses_the_cog_limits_and_texts(world, monkeypatch):
+    monkeypatch.setattr(orders, "RHC_AUTO_MAX_PER_USER", 3)
+    monkeypatch.setattr(orders, "RHC_AUTO_MAX_TOTAL", 5)
+    assert orders.room_for(USER, 1) == (True, "")
+    assert orders.room_for(USER, 3) == (True, "")
+    assert orders.room_for(USER, 0) == (True, "")
+    storage.auto_orders.extend(make_order() for _ in range(3))
+    ok, text = orders.room_for(USER, 1)
+    assert not ok and text == ("You already have 3 auto-orders, the most one wallet can hold."
+                               f"{orders.SEP}`/rh auto cancel` frees a slot.")
+    assert orders.room_for(USER, 0) == (True, "")
+    assert orders.room_for(8, 1) == (True, "")
+    storage.auto_orders.pop()
+    ok, text = orders.room_for(USER, 2)
+    assert not ok and text.startswith("Only 1 slot left of the 3 auto-orders one wallet can hold; this needs 2.")
+    assert orders.room_for(USER, 1) == (True, "")
+    # The total wall counts everyone's rules.
+    storage.auto_orders.extend(make_order(user_id=8) for _ in range(3))
+    ok, text = orders.room_for(9, 1)
+    assert not ok and text == ("McCap is watching 5 auto-orders already, the most it polls for at once. "
+                               "Try again when one fills or expires.")
+    storage.auto_orders.pop()
+    ok, text = orders.room_for(9, 2)
+    assert not ok and text.startswith("McCap has 1 slot left of the 5 auto-orders it polls for at once; this needs 2.")
+    assert orders.room_for(9, 1) == (True, "")
+    monkeypatch.setattr(orders, "RHC_AUTO_ENABLE", False)
+    assert orders.room_for(9, 1) == (False, "🔒 Auto-orders are switched off (`RHC_AUTO_ENABLE=0`).")
+    assert orders.room_for(9, 0)[0] is False
+
+
+def test_the_cog_asks_room_for_rather_than_counting_slots_itself():
+    """One place decides whether a rule fits, and it is this module: the cog's
+    _auto_limits delegates, so a limit change cannot mean two different things."""
+    import inspect
+    from mccapbot.cogs import rhc as cog
+    src = inspect.getsource(cog.RhcCog._auto_limits)
+    assert "orders.room_for" in src
+    assert "RHC_AUTO_MAX_PER_USER" not in src and "RHC_AUTO_MAX_TOTAL" not in src, "no second copy of the arithmetic"
+    # ...and the refusals it sends are the ones room_for returns (texts asserted
+    # in test_room_for_uses_the_cog_limits_and_texts).
+    assert "self._send_private(inter, why)" in src

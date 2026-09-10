@@ -24,6 +24,8 @@ from discord.ext import commands
 
 from .. import rhchain, storage, views
 from ..config import (
+    FEED_ENABLE,
+    RHCHAIN_CACHE_SECONDS,
     RHC_AUTO_BUY_TTL,
     RHC_AUTO_MAX_PER_USER,
     RHC_AUTO_MAX_TOTAL,
@@ -44,10 +46,12 @@ from ..helpers import (
     NEUTRAL,
     SEP,
     UNKNOWN,
+    age,
     colour_for,
     eth_str,
     fit_lines,
     footer,
+    is_manager,
     mult,
     pct,
     plural,
@@ -70,6 +74,9 @@ CUSTODY_WARNING = tutorial.CUSTODY_WARNING
 # Prompts, refusals, the withdraw flow and the key export never use this: they
 # are always private.
 PRIVATE = not RHC_PUBLIC_REPLIES
+
+# Which GeckoTerminal trending duration backs each short board window.
+TRENDING_DURATIONS = {"m5": "5m", "m15": "1h", "m30": "1h", "h1": "1h"}
 
 # The tutorial's chapters; mccapbot/rhc/tutorial.py renders them.
 TUTORIAL_TOPICS = tutorial.TOPICS
@@ -259,15 +266,43 @@ class RhcCog(commands.Cog):
         if chain.is_address(q):
             sym, dec = await chain.erc20_meta(q)
             return chain.to_checksum(q), sym, dec
-        pools = await rhchain.top_pools()
-        matches = [t for t in rhchain.aggregate(pools) if t.symbol.upper() == q.upper()]
+        # Busiest pools first, then the newest, then the short-window trending
+        # list, then what the feed has posted: a symbol seen anywhere McCap
+        # shows tokens should resolve.
+        found = {}
+        for t in await self._known_tokens():
+            if t.symbol.upper() == q.upper():
+                found.setdefault(t.address.lower(), t)
+        matches = list(found.values())
         if len(matches) == 1:
-            addr = matches[0].address
-            sym, dec = await chain.erc20_meta(addr)
-            return chain.to_checksum(addr), sym or matches[0].symbol, dec
+            t = matches[0]
+            decimals = getattr(t, "decimals", 0)
+            if decimals:
+                return chain.to_checksum(t.address), t.symbol, int(decimals)
+            sym, dec = await chain.erc20_meta(t.address)
+            return chain.to_checksum(t.address), sym or t.symbol, dec
         if len(matches) > 1:
             raise ValueError(f"Several tokens use the symbol {q}; pass the contract address instead.")
         raise ValueError(f"Unknown token {q!r}. Pass a contract address (see /rh trending for the busy ones).")
+
+    @staticmethod
+    async def _known_tokens() -> list:
+        """Every token McCap has shown lately: busiest pools, newest pools, the 5m
+        trending list, and the feed's posts. Each source is best effort."""
+        from .. import discovery
+        out = []
+        for getter in (rhchain.top_pools, rhchain.new_pools, lambda: rhchain.trending_pools("5m")):
+            try:
+                out.extend(rhchain.aggregate(await getter()))
+            except Exception:
+                log.debug("Token source failed during symbol resolution", exc_info=True)
+        try:
+            for ca, (symbol, decimals) in discovery.recent_tokens().items():
+                out.append(rhchain.TokenActivity(symbol=symbol, name=symbol, address=ca))
+                out[-1].decimals = decimals
+        except Exception:
+            log.debug("Feed tokens unavailable during symbol resolution", exc_info=True)
+        return out
 
     async def _eth_usd(self) -> Optional[float]:
         return await trade.eth_usd()
@@ -792,12 +827,11 @@ class RhcCog(commands.Cog):
         lines = []
         for o in mine:
             snap = storage.cache_snapshot(o.ca)
-            now_val = None
-            if snap is not None:
-                now_val = snap.mc if o.metric == "mc" else snap.vol1h
+            now_val = orders.rule_value(o, snap=snap, now=time.time()) if o.metric in ("mc", "vol1h") else None
             icon = "⏳" if o.status == "pending" else icons.get(o.side, "🤖")
             waiting = engine.held_for(o.id) if engine is not None else None
             lines.append(footer(f"`{o.id}` {icon} {orders.describe_rule(o)}", f"now {usd_str(now_val)}",
+                                f"high {usd_str(o.high_mc)}" if o.trail_pct and o.high_mc else "",
                                 f"expires {when(o.expires_ts)}",
                                 f"⏸ held {when(waiting[1])}: {waiting[0]}" if waiting else ""))
         embed = discord.Embed(title=f"{inter.user.display_name}'s auto-orders", colour=NEUTRAL,
@@ -877,21 +911,14 @@ class RhcCog(commands.Cog):
         order, prompt = prepared
         await self._confirm_and_arm(inter, [order], prompt, info, PRIVATE or private)
 
-    async def _auto_limits(self, inter: discord.Interaction) -> bool:
-        """Reply and return True when another rule may not be added."""
+    async def _auto_limits(self, inter: discord.Interaction, n: int = 1) -> bool:
+        """Reply and return True when ``n`` more rules may not be added."""
         from ..rhc import orders
-        if not orders.RHC_AUTO_ENABLE:
-            await self._send_private(inter, "🔒 Auto-orders are switched off (`RHC_AUTO_ENABLE=0`).")
-            return True
-        if len(storage.orders_for(inter.user.id)) >= RHC_AUTO_MAX_PER_USER:
-            await self._send_private(inter, f"You already have {plural(RHC_AUTO_MAX_PER_USER, 'auto-order')}, the most one "
-                                            f"wallet can hold.{SEP}`/rh auto cancel` frees a slot.")
-            return True
-        if len(storage.auto_orders) >= RHC_AUTO_MAX_TOTAL:
-            await self._send_private(inter, f"McCap is watching {plural(RHC_AUTO_MAX_TOTAL, 'auto-order')} already, the most "
-                                            f"it polls for at once. Try again when one fills or expires.")
-            return True
-        return False
+        ok, why = orders.room_for(inter.user.id, n)
+        if ok:
+            return False
+        await self._send_private(inter, why)
+        return True
 
     async def _prepare_auto_sell(self, inter: discord.Interaction, w: wallets.Wallet, addr: str, sym: str, dec: int,
                                  pct_sold: int, at: str, anchor: str, bps: int, info: dict, expires_ts: float,
@@ -931,9 +958,13 @@ class RhcCog(commands.Cog):
         o = AutoOrder(ca=addr, symbol=sym, decimals=dec, side="sell", metric="mc", direction=rule.direction,
                       target=rule.target, size=float(pct_sold), slippage_bps=bps, user_id=uid, guild_id=inter.guild_id or 0,
                       channel_id=inter.channel_id or 0, expires_ts=expires_ts, spec=rule.spec, anchor_mc=rule.anchor_mc,
-                      anchor=anchor_used, private=private)
+                      anchor=anchor_used, private=private,
+                      trail_pct=float(getattr(rule, "trail_pct", 0.0) or 0.0),
+                      high_mc=float(mc_now or 0.0) if getattr(rule, "trail_pct", 0.0) else 0.0)
         arrow = "≥" if rule.direction == "above" else "≤"
-        if rule.spec and anchor_used == "entry":
+        if o.trail_pct:
+            basis = f"trail {o.trail_pct:g}% below its high ({usd_str(mc_now)} now); the stop rises with the price, never falls"
+        elif rule.spec and anchor_used == "entry":
             basis = f"{rule.spec} from your {usd_str(anchor_mc)} entry"
         elif rule.spec:
             basis = f"{rule.spec} from {usd_str(anchor_mc)} now" + ("" if anchor == "now" else " (McCap has no entry for you)")
@@ -1031,8 +1062,8 @@ class RhcCog(commands.Cog):
                                       ephemeral=True)
             return
         # Limits again: another rule may have been armed while the prompt sat there.
-        if len(storage.orders_for(uid)) + len(new_orders) > RHC_AUTO_MAX_PER_USER or \
-                len(storage.auto_orders) + len(new_orders) > RHC_AUTO_MAX_TOTAL:
+        ok, _why = orders.room_for(uid, len(new_orders))
+        if not ok:
             await inter.followup.send("🚫 The auto-order limit was reached while you were confirming; nothing was armed.",
                                       ephemeral=True)
             return
@@ -1146,6 +1177,117 @@ class RhcCog(commands.Cog):
         view = self._view("tutorial_row", tutorial.row_state(state))
         await inter.followup.send(embed=embed, ephemeral=not public, **self._view_kw(view))
 
+    # ---------------- discovery feed ----------------
+    # The bot finds it: new pairs, volume spikes and movers on Robinhood Chain,
+    # posted to one channel per server with the trade buttons. Manager-only,
+    # because it posts on its own. See mccapbot/discovery.py.
+
+    feed = app_commands.Group(name="feed", description="Robinhood Chain discovery feed: new pairs, spikes and movers",
+                              parent=rhc)
+
+    @staticmethod
+    async def _deny_manager(inter: discord.Interaction) -> bool:
+        if inter.guild_id is None:
+            await inter.response.send_message("The feed is a server setting; run this in the server.", ephemeral=True)
+            return True
+        if not is_manager(inter.user):
+            await inter.response.send_message("🔒 Only server managers can change the feed.", ephemeral=True)
+            return True
+        return False
+
+    @feed.command(name="on", description="Post new pairs, volume spikes and movers to a channel (server managers)")
+    @app_commands.describe(
+        channel="Where to post (default: this channel)", new_pairs="Post brand-new pairs that pass a second look",
+        spikes="Post 5-minute volume spikes", movers="Post 5-minute price movers",
+        min_liquidity="Ignore pools under this many dollars of liquidity (default 5000)",
+        min_buyers="Ignore tokens with fewer distinct buyers in 5 minutes (default 8)",
+        pace="Spike threshold: 5m volume at this many times the hour's pace (default 3)",
+        move_pct="Mover threshold: 5m price change in percent (default 25)",
+        max_per_hour="Most posts per hour, strongest first (default 10)",
+    )
+    async def feed_on(self, inter: discord.Interaction, channel: Optional[discord.TextChannel] = None,
+                      new_pairs: bool = True, spikes: bool = True, movers: bool = True,
+                      min_liquidity: Optional[int] = 5000, min_buyers: Optional[int] = 8, pace: Optional[float] = 3.0,
+                      move_pct: Optional[float] = 25.0, max_per_hour: Optional[int] = 10):
+        from .. import discovery
+        if await self._deny_manager(inter):
+            return
+        if not FEED_ENABLE:
+            await inter.response.send_message("🔒 The feed is switched off on this deployment (`FEED_ENABLE=0`).", ephemeral=True)
+            return
+        target = channel.id if channel is not None else inter.channel_id
+        cfg = discovery.FeedConfig(
+            guild_id=inter.guild_id, channel_id=target, enabled=True,
+            new_pairs=bool(new_pairs), spikes=bool(spikes), movers=bool(movers),
+            min_liq=float(max(0, min_liquidity if min_liquidity is not None else 5000)),
+            min_buyers=int(max(0, min_buyers if min_buyers is not None else 8)),
+            pace=float(max(1.0, pace if pace is not None else 3.0)),
+            move_pct=float(max(1.0, move_pct if move_pct is not None else 25.0)),
+            max_per_hour=int(max(1, min(60, max_per_hour if max_per_hour is not None else 10))),
+        )
+        discovery.set_config(cfg)          # keeps whatever this server had muted
+        await discovery.save_feed()
+        kinds = [k for k, on in (("new pairs", cfg.new_pairs), ("spikes", cfg.spikes), ("movers", cfg.movers)) if on]
+        await inter.response.send_message(
+            f"📡 Feed → <#{target}>{SEP}**on**\n"
+            + footer(", ".join(kinds) or "nothing selected", f"liq ≥ {usd_str(cfg.min_liq)}",
+                     f"buyers ≥ {cfg.min_buyers}", f"pace ≥ {cfg.pace:g}x", f"move ≥ {pct(cfg.move_pct, signed=False)}",
+                     f"cap {plural(cfg.max_per_hour, 'post')}/hour")
+            + f"\nEvery post carries the trade buttons; each opens the usual private quote and Confirm. "
+              f"`/rh feed status` shows how the calls did.",
+        )
+
+    @feed.command(name="off", description="Stop the discovery feed in this server (server managers)")
+    async def feed_off(self, inter: discord.Interaction):
+        from .. import discovery
+        if await self._deny_manager(inter):
+            return
+        cfg = discovery.config_for(inter.guild_id)
+        if cfg is None or not cfg.enabled:
+            await inter.response.send_message("The feed is not on here.", ephemeral=True)
+            return
+        cfg.enabled = False
+        await discovery.save_feed()
+        await inter.response.send_message("📡 Feed **off**. `/rh feed on` starts it again with the same settings.")
+
+    @feed.command(name="status", description="What the feed is posting and how its calls did")
+    async def feed_status(self, inter: discord.Interaction):
+        from .. import discovery
+        if inter.guild_id is None:
+            await inter.response.send_message("The feed is a server setting; run this in the server.", ephemeral=True)
+            return
+        # The feed writes its own status text (mccapbot/discovery.py): one place
+        # decides what "stale", "capped" or "paused" reads like. A server whose
+        # feed task never started still gets the settings and the grading.
+        engine = getattr(self.bot, "feed", None) or discovery.Feed(self.bot)
+        await inter.response.send_message(engine.status(inter.guild_id)["text"])
+
+    @feed.command(name="mute", description="Stop the feed posting one token for a while (server managers)")
+    @app_commands.describe(token="Contract address or a symbol the feed has posted", for_="How long (default 1d)")
+    @app_commands.rename(for_="for")
+    @app_commands.choices(for_=[
+        app_commands.Choice(name="1 hour", value="1h"), app_commands.Choice(name="6 hours", value="6h"),
+        app_commands.Choice(name="1 day", value="1d"), app_commands.Choice(name="7 days", value="7d"),
+    ])
+    async def feed_mute(self, inter: discord.Interaction, token: str, for_: Optional[app_commands.Choice[str]] = None):
+        from .. import discovery
+        if await self._deny_manager(inter):
+            return
+        cfg = discovery.config_for(inter.guild_id)
+        if cfg is None:
+            await inter.response.send_message("No feed here yet.", ephemeral=True)
+            return
+        await inter.response.defer(thinking=True)
+        try:
+            addr, sym, _dec = await self._resolve_token(token)
+        except (ValueError, chain.ChainError) as e:
+            await inter.followup.send(f"❌ {e}")
+            return
+        secs = {"1h": 3600, "6h": 21600, "1d": 86400, "7d": 604800}[for_.value if for_ else "1d"]
+        cfg.muted[addr.lower()] = time.time() + secs
+        await discovery.save_feed()
+        await inter.followup.send(f"🔇 The feed will not post **{sym}** until {when(time.time() + secs)}.")
+
     # ---------------- trending ----------------
 
     WINDOW_CHOICES = [
@@ -1176,7 +1318,7 @@ class RhcCog(commands.Cog):
     @rhc.command(name="trending", description="Busiest and fastest-moving tokens on Robinhood Chain")
     @app_commands.describe(
         window="Volume and market-cap change over 5m to 24h (default 24h)",
-        sort="volume (default), gainers, losers, or newest pools",
+        sort="volume (default), gainers, losers, newest pools, or active (most buyers)",
         count="How many to show (default 10, max 25)",
         include_majors="Also show WETH / USDG / stablecoin pools (hidden by default)",
         private="Reply only to you",
@@ -1188,6 +1330,7 @@ class RhcCog(commands.Cog):
             app_commands.Choice(name="gainers", value="gainers"),
             app_commands.Choice(name="losers", value="losers"),
             app_commands.Choice(name="new", value="new"),
+            app_commands.Choice(name="active", value="active"),
         ],
     )
     async def trending(
@@ -1222,11 +1365,22 @@ class RhcCog(commands.Cog):
         await inter.followup.send(embed=embed, ephemeral=True, **self._view_kw(self._view("board_view", "trending", top)))
 
     async def _board(self, w: str, mode: str, n: int, include_majors: bool):
-        """(embed, top tokens, None) for the trending board, or (None, None, why)."""
+        """(embed, top tokens, None) for the trending board, or (None, None, why).
+
+        Short windows also pull GeckoTerminal's own trending list for that
+        window, so a token that just started moving is not confined to the
+        40 busiest pools by 24h volume."""
         label = rhchain.WINDOW_LABELS[w]
-        pools = await rhchain.top_pools()
+        pools = list(await rhchain.top_pools())
         if not pools:
             return None, None, "Couldn't reach GeckoTerminal for Robinhood Chain pools. Try again shortly."
+        if w in TRENDING_DURATIONS:
+            try:
+                extra = await rhchain.trending_pools(TRENDING_DURATIONS[w])
+            except Exception:
+                extra = []
+            seen = {p.address for p in pools}
+            pools += [p for p in extra if p.address not in seen]
         tokens = rhchain.aggregate(pools)
         top = rhchain.rank(tokens, w, mode, include_majors=include_majors, n=n)
         if not top:
@@ -1235,90 +1389,120 @@ class RhcCog(commands.Cog):
         def mc(v: Optional[float]) -> str:
             return usd_str(v) if v else UNKNOWN
 
+        def name(t) -> str:
+            # Money moving much faster than the hour's pace is the thing to notice.
+            pace = t.volume_pace("m5", "h1") if w in ("h1", "h6", "h24") else t.volume_pace(w, "h1")
+            tag = f" ⚡{pace:.1f}x" if (mode == "volume" and pace is not None and pace >= 2 and w != "h1") else ""
+            return f"{t.symbol[:10]}{tag}"
+
         rows = [[
-            t.symbol[:10],
+            name(t),
             usd_str(t.volume(w)),
             pct(t.change(w)),
+            str(t.buyers(w)) if t.buyers(w) else UNKNOWN,
             mc(t.mc_usd),
-            usd_str(t.liq_usd),
         ] for t in top]
 
         shown_tokens = [t for t in tokens if include_majors or t.symbol.upper() not in rhchain.CHAIN_MAJORS]
         total_vol = sum(t.volume(w) for t in shown_tokens)
         venues = sorted({p.dex for t in shown_tokens for p in t.pools})
         titles = {"volume": f"busiest by {label} volume", "gainers": f"{label} gainers",
-                  "losers": f"{label} losers", "new": "newest of the busy pools"}
+                  "losers": f"{label} losers", "new": "newest of the busy pools", "active": f"most buyers in {label}"}
         desc = (f"**{usd_str(total_vol)}** traded in {label} across {plural(len(shown_tokens), 'token')}"
                 + (f"{SEP}{', '.join(venues)}" if venues else ""))
         if mode in ("gainers", "losers"):
             # "$800K to $1.1M inside the window" is the number people want for
-            # a mover, not just a percentage; say it for the top few.
-            movers = [f"{t.symbol[:10]} {mc(t.mc_before(w))} → {mc(t.mc_usd)} ({pct(t.change(w))})"
-                      for t in top[:3] if t.mc_usd and t.mc_before(w)]
+            # a mover, not just a percentage; say it for the top few, with who
+            # is actually trading it.
+            movers = [
+                footer(f"{t.symbol[:10]}{SEP}MC {mc(t.mc_before(w))} → **{mc(t.mc_usd)}** ({pct(t.change(w))})",
+                       f"{plural(t.buyers(w), 'buyer')}" if t.buyers(w) else "",
+                       f"{t.buys(w)}/{t.sells(w)} buys/sells" if (t.buys(w) or t.sells(w)) else "")
+                for t in top[:3] if t.mc_usd and t.mc_before(w)
+            ]
             if movers:
-                desc += "\n" + SEP.join(movers)
+                desc += "\n" + "\n".join(movers)
         embed = discord.Embed(title=f"Robinhood Chain{SEP}{titles[mode]}", colour=NEUTRAL, description=desc)
         shown, total = add_table_fields(
             embed, "Tokens",
-            ["Token", f"Vol {label}", label, "MC", "Liq"], rows,
+            ["Token", f"Vol {label}", label, "Buyers", "MC"], rows,
             ["l", "r", "r", "r", "r"], max_fields=3,
         )
         self._addresses_field(embed, top)
         embed.set_footer(text=footer(
             "GeckoTerminal",
+            self._stale_note(),
             "" if include_majors else "majors hidden (include_majors to show)",
             "/rh new for brand-new pairs",
             f"{plural(total - shown, 'row')} not shown" if shown < total else "",
         ))
         return embed, top, None
 
+    @staticmethod
+    def _stale_note() -> str:
+        """'list from 4m ago (GeckoTerminal unreachable)' when the last refresh failed and the served list is old."""
+        error = getattr(rhchain, "last_error", None)
+        ok_ts = getattr(rhchain, "last_ok_ts", 0.0) or 0.0
+        if error and ok_ts and time.time() - ok_ts > RHCHAIN_CACHE_SECONDS:
+            return f"list from {age(time.time() - ok_ts)} ago (GeckoTerminal unreachable)"
+        return ""
+
     @rhc.command(name="new", description="Brand-new pairs on Robinhood Chain, newest first")
     @app_commands.describe(
         count="How many to show (default 10, max 25)",
-        min_liquidity="Hide pools with less than this many dollars of liquidity (default 1000)",
+        min_liquidity="Hide pools with less than this many dollars of liquidity (default 5000)",
+        min_buyers="Hide pools with fewer distinct buyers in the last 5 minutes (default 5)",
         private="Reply only to you",
     )
-    async def new(self, inter: discord.Interaction, count: Optional[int] = 10, min_liquidity: Optional[int] = 1000,
-                  private: bool = False):
+    async def new(self, inter: discord.Interaction, count: Optional[int] = 10, min_liquidity: Optional[int] = 5000,
+                  min_buyers: Optional[int] = 5, private: bool = False):
         priv = PRIVATE or private
         await inter.response.defer(thinking=True, ephemeral=priv)
         n = max(1, min(int(count or 10), 25))
-        floor = max(0, int(min_liquidity if min_liquidity is not None else 1000))
+        floor = max(0, int(min_liquidity if min_liquidity is not None else 5000))
+        buyers_floor = max(0, int(min_buyers if min_buyers is not None else 5))
         pools = await rhchain.new_pools()
         if not pools:
             await inter.followup.send("Couldn't reach GeckoTerminal for new Robinhood Chain pools. Try again shortly.")
             return
         tokens = rhchain.aggregate(pools)
         tokens = [t for t in tokens if t.symbol.upper() not in rhchain.CHAIN_MAJORS]
-        kept = [t for t in tokens if t.liq_usd >= floor]
+        kept = [t for t in tokens if t.liq_usd >= floor and t.buyers("m5") >= buyers_floor]
         kept.sort(key=lambda t: -t.created_ts)
         top = kept[:n]
         if not top:
-            await inter.followup.send(f"No new pairs with at least {usd_str(floor)} of liquidity right now "
-                                      f"({len(tokens)} seen). Lower min_liquidity to see the dust.")
+            await inter.followup.send(f"No new pairs with at least {usd_str(floor)} of liquidity and "
+                                      f"{plural(buyers_floor, 'buyer')} in the last 5 minutes ({len(tokens)} seen). "
+                                      f"Lower min_liquidity or min_buyers to see the dust.")
             return
 
+        def name(t) -> str:
+            quote = t.reference.quote_symbol.upper()
+            return t.symbol[:10] + ("" if quote in rhchain.CHAIN_MAJORS else f" ({quote[:6]})")
+
         rows = [[
-            t.symbol[:10],
+            name(t),
             rhchain.age_str(t.created_ts),
             usd_str(t.liq_usd),
-            usd_str(t.volume("h1")),
+            str(t.buyers("m5")) if t.buyers("m5") else UNKNOWN,
             usd_str(t.mc_usd) if t.mc_usd else UNKNOWN,
         ] for t in top]
         embed = discord.Embed(
             title=f"Robinhood Chain{SEP}newest pairs",
             colour=NEUTRAL,
-            description=(f"{plural(len(kept), 'new pair')} with ≥ {usd_str(floor)} liquidity ({len(tokens)} seen){SEP}"
+            description=(f"{plural(len(kept), 'new pair')} with ≥ {usd_str(floor)} liquidity and ≥ "
+                         f"{plural(buyers_floor, 'buyer')} in 5m ({len(tokens)} seen){SEP}"
                          f"most are dust: check the sell-back line in /rh buy first"),
         )
         shown, total = add_table_fields(
             embed, "Pairs",
-            ["Token", "Age", "Liq", "Vol 1h", "MC"], rows,
+            ["Token", "Age", "Liq", "Buyers 5m", "MC"], rows,
             ["l", "r", "r", "r", "r"], max_fields=3,
         )
         self._addresses_field(embed, top)
         embed.set_footer(text=footer(
-            "GeckoTerminal new-pools feed", "majors hidden",
+            "GeckoTerminal new-pools feed", self._stale_note(), "majors hidden",
+            "a symbol in brackets is the quote token when it is not a major",
             f"{plural(total - shown, 'row')} not shown" if shown < total else "",
         ))
         await inter.followup.send(embed=embed, ephemeral=priv, **self._view_kw(self._view("board_view", "new", top)))

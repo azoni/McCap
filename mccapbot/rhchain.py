@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional
 
-from .config import RHCHAIN_CACHE_SECONDS, RHCHAIN_NETWORK, RHCHAIN_PAGES
+from .config import RHCHAIN_CACHE_SECONDS, RHCHAIN_NETWORK, RHCHAIN_NEW_PAGES, RHCHAIN_PAGES
 from .gecko import BASE, gecko_limiter
 from .helpers import UNKNOWN, age
 from .http import get_json
@@ -29,7 +29,9 @@ from .logging_setup import log
 WINDOWS = ("m5", "m15", "m30", "h1", "h6", "h24")
 WINDOW_LABELS = {"m5": "5m", "m15": "15m", "m30": "30m", "h1": "1h", "h6": "6h", "h24": "24h"}
 WINDOW_SECONDS = {"m5": 300, "m15": 900, "m30": 1800, "h1": 3600, "h6": 21600, "h24": 86400}
-SORTS = ("volume", "gainers", "losers", "new")
+SORTS = ("volume", "gainers", "losers", "new", "active")
+# GeckoTerminal's trending list accepts these windows.
+TRENDING_DURATIONS = ("5m", "1h", "6h", "24h")
 
 # The chain's plumbing rather than something to trade: hidden by default so the
 # board is not two-thirds WETH/USDG pools.
@@ -57,6 +59,10 @@ class Pool:
     # many distinct wallets, per window. Unique buyers in the last 5 minutes is
     # the cleanest "is anyone actually here" signal GeckoTerminal offers.
     tx: Dict[str, Dict[str, int]] = field(default_factory=dict)
+    # From the included base-token record. Decimals known here spare the
+    # symbol resolver an RPC call; 0 means "not reported", never "zero decimals".
+    base_decimals: int = 0
+    base_image_url: str = ""
 
     def url(self) -> str:
         return f"https://www.geckoterminal.com/{RHCHAIN_NETWORK}/pools/{self.address}"
@@ -229,7 +235,23 @@ def parse_pools(payload: Optional[Dict]) -> List[Pool]:
             sells_h24=int(_f(tx.get("sells")) or 0),
             created_ts=_ts(a.get("pool_created_at")),
             tx=per_window,
+            base_decimals=int(_f(base.get("decimals")) or 0),
+            base_image_url=str(base.get("image_url") or ""),
         ))
+    return out
+
+
+def dedup_pools(*lists: Iterable[Pool]) -> List[Pool]:
+    """Merge several pool lists keeping the first record per pool address, so
+    a pool present in both the trending and the busiest list counts once."""
+    seen: set = set()
+    out: List[Pool] = []
+    for pools in lists:
+        for p in pools:
+            if p.address in seen:
+                continue
+            seen.add(p.address)
+            out.append(p)
     return out
 
 
@@ -257,10 +279,13 @@ def rank(
 
     ``volume`` is what the board is for. ``gainers``/``losers`` use the deepest
     pool's change and skip tokens with none, rather than ranking them as flat.
-    ``new`` is by the earliest pool's creation time.
+    ``new`` is by the earliest pool's creation time. ``active`` is by distinct
+    buying wallets in the window: who is actually here, not how much money.
     """
     rows = [t for t in tokens if include_majors or t.symbol.upper() not in CHAIN_MAJORS]
-    if sort == "gainers":
+    if sort == "active":
+        rows.sort(key=lambda t: (t.buyers(window), t.volume(window)), reverse=True)
+    elif sort == "gainers":
         rows = [t for t in rows if t.change(window) is not None]
         rows.sort(key=lambda t: t.change(window), reverse=True)
     elif sort == "losers":
@@ -274,6 +299,33 @@ def rank(
 
 
 # ---------------- fetching ----------------
+
+# What the last request to GeckoTerminal did. Every fetcher below reports
+# through ``_fetch`` so a caller can tell "the list is empty" from "the refresh
+# failed and this is the cached list": the boards footer it, the feed skips a
+# tick on it. ``request_count`` lets the feed meter its own budget.
+last_ok_ts = 0.0
+last_error = ""          # "" while the most recent request succeeded
+last_error_ts = 0.0
+request_count = 0
+
+_INCLUDE = "include=base_token,quote_token,dex"
+
+
+async def _fetch(url: str) -> Optional[Dict]:
+    """One GeckoTerminal GET through the shared limiter, recording the outcome."""
+    global last_ok_ts, last_error, last_error_ts, request_count
+    request_count += 1
+    data = await get_json(url, limiter=gecko_limiter)
+    now = time.time()
+    if data is None:
+        last_error = "GeckoTerminal unreachable"
+        last_error_ts = now
+    else:
+        last_ok_ts = now
+        last_error = ""
+    return data
+
 
 _cache: List[Pool] = []
 _cached_at = 0.0
@@ -292,12 +344,8 @@ async def top_pools(force: bool = False) -> List[Pool]:
 
     fresh: List[Pool] = []
     for page in range(1, max(1, RHCHAIN_PAGES) + 1):
-        url = (
-            f"{BASE}/networks/{RHCHAIN_NETWORK}/pools"
-            f"?sort=h24_volume_usd_desc&page={page}&include=base_token,quote_token,dex"
-        )
-        data = await get_json(url, limiter=gecko_limiter)
-        pools = parse_pools(data)
+        url = f"{BASE}/networks/{RHCHAIN_NETWORK}/pools?sort=h24_volume_usd_desc&page={page}&{_INCLUDE}"
+        pools = parse_pools(await _fetch(url))
         if not pools:
             if page == 1:
                 log.debug("GeckoTerminal returned no %s pools", RHCHAIN_NETWORK)
@@ -305,33 +353,87 @@ async def top_pools(force: bool = False) -> List[Pool]:
         fresh.extend(pools)
 
     if fresh:
-        _cache[:] = fresh
+        _cache[:] = dedup_pools(fresh)
         _cached_at = now
     return _cache
 
 
 _new_cache: List[Pool] = []
 _new_cached_at = 0.0
+_new_cached_pages = 0
 
 
-async def new_pools(force: bool = False) -> List[Pool]:
-    """The chain's most recently created pools, newest first.
+async def new_pools(force: bool = False, pages: Optional[int] = None) -> List[Pool]:
+    """The chain's most recently created pools, newest first, ``pages`` deep
+    (default ``RHCHAIN_NEW_PAGES``; one page is 20 pools, about 75 seconds of
+    a chain that mints a pool every few seconds).
 
     A separate feed from the busiest pools: a pair minutes old has no volume
     yet, so it would never appear in ``top_pools``. Most of these are dust;
-    the caller decides what to hide.
+    the caller decides what to hide. Cached 60s; a cached list fetched with
+    fewer pages than asked for is refreshed, one with more is served as is.
     """
-    global _new_cached_at
+    global _new_cached_at, _new_cached_pages
+    pages = max(1, int(pages or RHCHAIN_NEW_PAGES))
     now = time.time()
-    if _new_cache and not force and (now - _new_cached_at) < RHCHAIN_CACHE_SECONDS:
+    if _new_cache and not force and (now - _new_cached_at) < RHCHAIN_CACHE_SECONDS and _new_cached_pages >= pages:
         return _new_cache
-    url = f"{BASE}/networks/{RHCHAIN_NETWORK}/new_pools?page=1&include=base_token,quote_token,dex"
-    pools = parse_pools(await get_json(url, limiter=gecko_limiter))
-    if pools:
-        pools.sort(key=lambda p: -p.created_ts)
-        _new_cache[:] = pools
+
+    fresh: List[Pool] = []
+    for page in range(1, pages + 1):
+        url = f"{BASE}/networks/{RHCHAIN_NETWORK}/new_pools?page={page}&{_INCLUDE}"
+        pools = parse_pools(await _fetch(url))
+        if not pools:
+            break
+        fresh.extend(pools)
+
+    if fresh:
+        fresh = dedup_pools(fresh)
+        fresh.sort(key=lambda p: -p.created_ts)
+        _new_cache[:] = fresh
         _new_cached_at = now
+        _new_cached_pages = pages
     return _new_cache
+
+
+_trending_cache: Dict[str, List[Pool]] = {}
+_trending_cached_at: Dict[str, float] = {}
+
+
+async def trending_pools(duration: str = "5m", force: bool = False) -> List[Pool]:
+    """GeckoTerminal's trending pools over a short window, cached 60s per window.
+
+    The busiest-by-24h list cannot see a pool that woke up five minutes ago;
+    this one is ranked on recent activity, which is where the feed's spikes
+    and movers come from. Same parser, same limiter, one request per window
+    per minute. A failed refresh keeps the previous list.
+    """
+    if duration not in TRENDING_DURATIONS:
+        raise ValueError(f"duration must be one of {', '.join(TRENDING_DURATIONS)}")
+    now = time.time()
+    cached = _trending_cache.get(duration)
+    if cached and not force and (now - _trending_cached_at.get(duration, 0.0)) < RHCHAIN_CACHE_SECONDS:
+        return cached
+    url = f"{BASE}/networks/{RHCHAIN_NETWORK}/trending_pools?duration={duration}&{_INCLUDE}"
+    pools = parse_pools(await _fetch(url))
+    if pools:
+        _trending_cache[duration] = dedup_pools(pools)
+        _trending_cached_at[duration] = now
+    return _trending_cache.get(duration, [])
+
+
+def clear_caches() -> None:
+    """Forget every cached list and the last-request state (tests, and a
+    manual refresh)."""
+    global _cached_at, _new_cached_at, _new_cached_pages, last_ok_ts, last_error, last_error_ts
+    _cache.clear()
+    _new_cache.clear()
+    _trending_cache.clear()
+    _trending_cached_at.clear()
+    _cached_at = _new_cached_at = 0.0
+    _new_cached_pages = 0
+    last_ok_ts = last_error_ts = 0.0
+    last_error = ""
 
 
 def age_str(created_ts: float, now: Optional[float] = None) -> str:

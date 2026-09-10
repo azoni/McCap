@@ -1,6 +1,7 @@
 """/rh_trending: DEX activity on the Robinhood chain, via GeckoTerminal."""
 
 import asyncio
+import time
 
 import pytest
 
@@ -206,14 +207,110 @@ def test_new_pools_feed_is_newest_first_and_cached(monkeypatch):
             gt_pool("0xn2", "NEWER", vol24=10, liq=3_000, created="2026-09-08T13:55:00Z"),
         ], "included": included("OLDER", "NEWER", "WETH")}
     monkeypatch.setattr(rhchain, "get_json", fake)
-    rhchain._new_cache.clear()
-    rhchain._new_cached_at = 0.0
-    pools = asyncio.run(rhchain.new_pools())
+    rhchain.clear_caches()
+    pools = asyncio.run(rhchain.new_pools(pages=1))
     assert "networks/robinhood/new_pools" in calls[0]
     assert [p.base_symbol for p in pools] == ["NEWER", "OLDER"]
-    asyncio.run(rhchain.new_pools())
+    asyncio.run(rhchain.new_pools(pages=1))
     assert len(calls) == 1
-    rhchain._new_cache.clear()
+    rhchain.clear_caches()
+
+
+def test_new_pools_walks_pages_and_dedups_a_pool_seen_twice(monkeypatch):
+    calls = []
+
+    async def fake(url, **kw):
+        calls.append(url)
+        page = int(url.split("page=")[1].split("&")[0])
+        if page == 1:
+            return {"data": [
+                gt_pool("0xn2", "NEWER", vol24=10, liq=3_000, created="2026-09-08T13:55:00Z"),
+                gt_pool("0xn1", "OLDER", vol24=10, liq=2_000, created="2026-09-08T13:00:00Z"),
+            ], "included": included("OLDER", "NEWER", "WETH")}
+        return {"data": [
+            gt_pool("0xn1", "OLDER", vol24=10, liq=2_000, created="2026-09-08T13:00:00Z"),   # the list moved under us
+            gt_pool("0xn0", "OLDEST", vol24=10, liq=1_000, created="2026-09-08T12:00:00Z"),
+        ], "included": included("OLDER", "OLDEST", "WETH")}
+
+    monkeypatch.setattr(rhchain, "get_json", fake)
+    rhchain.clear_caches()
+    pools = asyncio.run(rhchain.new_pools(pages=2))
+    assert len(calls) == 2 and "page=1" in calls[0] and "page=2" in calls[1]
+    assert [p.base_symbol for p in pools] == ["NEWER", "OLDER", "OLDEST"], "newest first, no duplicate"
+    asyncio.run(rhchain.new_pools(pages=2))
+    assert len(calls) == 2, "served from the cache"
+    asyncio.run(rhchain.new_pools(pages=1))
+    assert len(calls) == 2, "a deeper cached list satisfies a shallower request"
+    monkeypatch.setattr(rhchain, "RHCHAIN_NEW_PAGES", 3)
+    asyncio.run(rhchain.new_pools())
+    assert len(calls) == 5, "the default depth is RHCHAIN_NEW_PAGES, read at call time"
+    rhchain.clear_caches()
+
+
+def test_trending_pools_url_cache_and_failure_state(monkeypatch):
+    calls = []
+
+    async def fake(url, **kw):
+        calls.append(url)
+        return {"data": [gt_pool("0xt1", "HOT", vol24=10, liq=40_000)], "included": included("HOT", "WETH")}
+
+    monkeypatch.setattr(rhchain, "get_json", fake)
+    rhchain.clear_caches()
+    before = time.time()
+    pools = asyncio.run(rhchain.trending_pools("5m"))
+    assert [p.base_symbol for p in pools] == ["HOT"]
+    assert "networks/robinhood/trending_pools?duration=5m&include=base_token,quote_token,dex" in calls[0]
+    assert rhchain.last_ok_ts >= before and rhchain.last_error == ""
+    asyncio.run(rhchain.trending_pools("5m"))
+    assert len(calls) == 1, "one request per window per minute"
+    asyncio.run(rhchain.trending_pools("1h"))
+    assert len(calls) == 2 and "duration=1h" in calls[1], "each window has its own cache"
+    with pytest.raises(ValueError):
+        asyncio.run(rhchain.trending_pools("2h"))
+
+    async def down(url, **kw):
+        return None
+
+    monkeypatch.setattr(rhchain, "get_json", down)
+    kept = asyncio.run(rhchain.trending_pools("5m", force=True))
+    assert [p.base_symbol for p in kept] == ["HOT"], "a failed refresh keeps the previous list"
+    assert rhchain.last_error and rhchain.last_error_ts >= before, "and says so"
+    monkeypatch.setattr(rhchain, "get_json", fake)
+    asyncio.run(rhchain.trending_pools("5m", force=True))
+    assert rhchain.last_error == "", "the next good fetch clears it"
+    rhchain.clear_caches()
+
+
+def test_sixty_four_hex_pool_ids_survive_parsing():
+    """Uniswap V4 pools are identified by a 32-byte id, not a 20-byte address."""
+    pid = "0x" + "ab" * 32
+    pools = rhchain.parse_pools({"data": [gt_pool(pid, "V4TOK", vol24=10, liq=1_000)], "included": included("V4TOK", "WETH")})
+    assert len(pools) == 1 and pools[0].address == pid
+    assert pools[0].url().endswith(f"/pools/{pid}")
+
+
+def test_parse_reads_base_token_decimals_and_image():
+    inc = included("DEC", "WETH")
+    inc[0]["attributes"]["decimals"] = 6
+    inc[0]["attributes"]["image_url"] = "https://img/dec.png"
+    pools = rhchain.parse_pools({"data": [gt_pool("0xd1", "DEC", vol24=10)], "included": inc})
+    assert pools[0].base_decimals == 6 and pools[0].base_image_url == "https://img/dec.png"
+    plain = rhchain.parse_pools({"data": [gt_pool("0xd2", "NODEC", vol24=10)], "included": included("NODEC", "WETH")})
+    assert plain[0].base_decimals == 0, "unknown decimals read as 0, which the resolver treats as 'ask the chain'"
+
+
+def test_rank_active_is_by_distinct_buyers():
+    tokens = rhchain.aggregate(rhchain.parse_pools(PAYLOAD))
+    assert "active" in rhchain.SORTS
+    rows = rhchain.rank(tokens, "m5", "active")
+    assert rows[0].symbol == "PONS", "two pools' buyers add up"
+    assert [t.buyers("m5") for t in rows] == sorted((t.buyers("m5") for t in rows), reverse=True)
+
+
+def test_dedup_pools_keeps_the_first_record_per_address():
+    a = rhchain.parse_pools(PAYLOAD)
+    merged = rhchain.dedup_pools(a[:2], a[1:4])
+    assert [p.address for p in merged] == ["0xa1", "0xb1", "0xb2", "0xc1"]
 
 
 def test_age_str():

@@ -6,9 +6,10 @@ nothing at all. That is a Developer Portal toggle, so the cog checks at startup
 and warns loudly rather than sitting there looking healthy while doing nothing.
 
 The valuable part is not detection but scoring: every detection records the
-market cap at scan time, and a background loop tracks each token afterwards to
-find its peak. /scans report then answers the question no scanner bot answers —
-were the calls any good?
+market cap at scan time, and the shared tracker (mccapbot/tracker.py, started
+from bot.setup_hook whether or not this cog is loaded) re-checks each token
+afterwards to find its peak. /scans report then answers the question no
+scanner bot answers — were the calls any good?
 """
 
 import asyncio
@@ -34,7 +35,6 @@ from ..config import (
     SCAN_OPINION_MIN_SECONDS,
     SCAN_POST_OPINION,
     SCAN_TRACK_HOURS,
-    SCAN_TRACK_INTERVAL,
     SCAN_WATCH_ENABLE,
     SCANNER_BOT_IDS,
 )
@@ -49,7 +49,6 @@ from ..storage import (
     save_scans,
     save_watchlist,
     scan_events,
-    scans_to_track,
     watchlist,
 )
 from ..tables import add_table_fields
@@ -67,7 +66,6 @@ class ScansCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._last_opinion: Dict[int, float] = {}   # channel_id -> loop clock
-        self._tracker: Optional[asyncio.Task] = None
 
     # ---------------- lifecycle ----------------
 
@@ -91,13 +89,6 @@ class ScansCog(commands.Cog):
                 sorted(SCANNER_BOT_IDS) or "any bot",
                 sorted(SCAN_CHANNEL_IDS) or "all",
             )
-
-        if self._tracker is None:
-            self._tracker = asyncio.create_task(self._track_loop(), name="scan-tracker")
-
-    def cog_unload(self):
-        if self._tracker and not self._tracker.done():
-            self._tracker.cancel()
 
     # ---------------- detection ----------------
 
@@ -313,55 +304,6 @@ class ScansCog(commands.Cog):
             await message.reply(embed=embed, mention_author=False)
         except discord.HTTPException:
             log.debug("Could not reply in channel %s", message.channel.id, exc_info=True)
-
-    # ---------------- performance tracking ----------------
-
-    async def _track_loop(self) -> None:
-        await self.bot.wait_until_ready()
-        track_seconds = SCAN_TRACK_HOURS * 3600
-
-        while not self.bot.is_closed():
-            try:
-                await asyncio.sleep(SCAN_TRACK_INTERVAL)
-                await self._expire_auto_moves()
-
-                now = time.time()
-                live = scans_to_track(track_seconds, now)
-                if not live:
-                    continue
-
-                # One lookup per distinct token, not one per scan event.
-                changed = False
-                for ca in {s.ca for s in live}:
-                    summary = await token_summary(ca)
-                    if not summary or summary.get("mc") is None:
-                        continue
-                    mc = summary["mc"]
-                    for s in live:
-                        if s.ca != ca:
-                            continue
-                        s.last_mc = mc
-                        s.last_checked_ts = now
-                        if s.peak_mc is None or mc > s.peak_mc:
-                            s.peak_mc = mc
-                            s.peak_ts = now
-                        changed = True
-                if changed:
-                    await save_scans()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception("scan tracker loop error")
-
-    async def _expire_auto_moves(self) -> None:
-        now = time.time()
-        expired = [m for m in move_alerts if m.auto_expires_ts and m.auto_expires_ts <= now]
-        if not expired:
-            return
-        ids = {m.id for m in expired}
-        move_alerts[:] = [m for m in move_alerts if m.id not in ids]
-        await save_moves()
-        log.info("Expired %d auto-armed scan alert(s)", len(expired))
 
     # ---------------- commands ----------------
 

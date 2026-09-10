@@ -21,6 +21,7 @@ from ..helpers import (
     fit_lines,
     footer,
     human_window,
+    is_manager,
     parse_target,
     parse_window,
     pct,
@@ -174,9 +175,7 @@ class AlertsCog(commands.Cog):
 
     @staticmethod
     def _can_manage(user: discord.abc.User) -> bool:
-        return isinstance(user, discord.Member) and (
-            user.guild_permissions.manage_guild or user.guild_permissions.administrator
-        )
+        return is_manager(user)
 
     # ---------------- /mc ----------------
 
