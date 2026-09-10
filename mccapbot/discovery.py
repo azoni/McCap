@@ -23,8 +23,8 @@ What this module must never do:
   private quote + Confirm on the clicker's own wallet;
 - post before the seen-set is written and saved (a redeploy between the
   send and the save would re-post the same token);
-- post a token twice inside its cooldown, a major, a muted token, or more
-  than ``max_per_hour`` per server (strongest first when capped);
+- post a token twice inside its cooldown, a major, a muted token, or run an
+  hour past ``max_per_hour`` × ``OVERFLOW_MULT`` in one server;
 - keep polling GeckoTerminal when its bucket is under half — the boards and
   the momentum backfill come first;
 - rely on ``token_cache`` for anything: the alert watcher evicts feed tokens
@@ -32,6 +32,7 @@ What this module must never do:
 """
 
 import asyncio
+import io
 import statistics
 import time
 from collections import deque
@@ -40,7 +41,7 @@ from typing import Any, Awaitable, Callable, Deque, Dict, Iterable, List, Option
 
 import discord
 
-from . import alerts, gecko, rhchain, storage
+from . import alerts, chart, gecko, rhchain, storage
 from .config import FEED_ENABLE, FEED_MAX_PENDING, MAX_SCAN_EVENTS, RHC_DEX_CHAIN_ID, RHCHAIN_NETWORK, RHCHAIN_NEW_PAGES
 from .helpers import SEP, UNKNOWN, age, colour_for, footer, is_evm_address, mult, pct, plural, usd
 from .logging_setup import log
@@ -63,6 +64,9 @@ NEW_POST_QUIET = 600            # no spike inside 10 minutes of a new-pair post 
 SEEN_TTL = 7 * 86400
 POSTED_TTL = 86400
 MAX_CONFIRMS_PER_TICK = 20      # DexScreener reads per tick, however many candidates qualify
+OVERFLOW_MULT = 2.0             # a busy hour may run to this much of the cap, never past it
+OVERFLOW_BAR = 1.5              # ... and only for finds this much stronger than the hour's median
+OFF_HIGH_WORTH_SAYING = 5.0     # within 5% of its high, a token has no dip worth a sentence
 RATE_WINDOW = 300               # status shows request rates averaged over this
 
 
@@ -79,6 +83,7 @@ class FeedConfig:
     pace: float = 3.0
     move_pct: float = 25.0
     max_per_hour: int = 10
+    charts: bool = True                                     # the price line and the off-high figure
     muted: Dict[str, float] = field(default_factory=dict)   # ca -> until_ts
 
     def is_muted(self, ca: str, now: float) -> bool:
@@ -151,6 +156,7 @@ class PostedToken:
     ts: float
     kind: str
     guild_id: int = 0
+    score: float = 0.0          # how strong the find was, so the hour has a median to raise a bar against
 
 
 # ---------------- state (one process, one feed) ----------------
@@ -205,8 +211,14 @@ def recent_tokens(hours: float = 24) -> Dict[str, Tuple[str, int]]:
 
 
 def posts_last_hour(guild_id: int, now: Optional[float] = None) -> int:
+    return len(hour_scores(guild_id, now))
+
+
+def hour_scores(guild_id: int, now: Optional[float] = None) -> List[float]:
+    """How strong everything this server posted in the last hour was. The
+    selector raises its bar against the median of these."""
     now = time.time() if now is None else now
-    return sum(1 for p in posted if p.guild_id == guild_id and now - p.ts <= 3600)
+    return [float(p.score or 0.0) for p in posted if p.guild_id == guild_id and now - p.ts <= 3600]
 
 
 async def load_feed() -> None:
@@ -382,6 +394,35 @@ def rank(cands: List[Candidate], room: int) -> List[Candidate]:
     return sorted(cands, key=lambda c: (-c.score(), c.age_sec))[:room]
 
 
+def select(cands: List[Candidate], cfg: FeedConfig,
+           now: Optional[float] = None) -> Tuple[List[Candidate], List[Candidate]]:
+    """Split this tick's confirmed finds into what posts and what waits.
+
+    The hourly cap used to be a shutter: the first ``max_per_hour`` finds took
+    the slots and every later one was dropped however good it was, so a quiet
+    token at :01 could cost the server the run of the hour at :45. Past the cap
+    the feed no longer goes quiet, it gets picky — a find has to beat the
+    median of what the hour already carried by ``OVERFLOW_BAR``, and an hour
+    still cannot run past ``OVERFLOW_MULT`` × the cap however good the tape is.
+
+    Nothing held here is lost: it is never written to the seen-set, so the next
+    tick weighs it again against whatever the hour looks like by then, and the
+    tokens that arrive later have to be better than the ones already posted.
+    """
+    budget = max(0, int(cfg.max_per_hour))
+    ceiling = int(round(budget * OVERFLOW_MULT))
+    scores = hour_scores(cfg.guild_id, now)
+    picked: List[Candidate] = []
+    held: List[Candidate] = []
+    for cand in sorted(cands, key=lambda c: (-c.score(), c.age_sec)):
+        bar = statistics.median(scores) * OVERFLOW_BAR if scores else 0.0
+        room = len(scores) < budget or (len(scores) < ceiling and cand.score() >= bar)
+        (picked if room else held).append(cand)
+        if room:
+            scores.append(cand.score())
+    return picked, held
+
+
 def qualifies(cfg: FeedConfig, cand: Candidate, now: float) -> bool:
     """A server's thresholds against a candidate built elsewhere (a pending
     new pair that passed its second look)."""
@@ -417,14 +458,52 @@ async def _risk_line(ca: str) -> str:
         return _risk_placeholder()
 
 
+async def _links_line(ca: str) -> str:
+    """X, Telegram, the site, the chart, GMGN and the explorer, as links. The
+    same cached lookup the risk line uses, so it costs no extra request."""
+    try:
+        from .rhc import risk  # type: ignore
+        return risk.links_line(await risk.token_info(ca), ca)
+    except Exception:
+        return ""
+
+
 TITLES = {"new_pair": "🆕 New pair", "spike": "📈 Volume spike", "mover": "🚀 Mover"}
 
 
-async def build_embed(cand: Candidate, snap: Optional[TokenSnapshot]) -> discord.Embed:
+def _off_high_line(cand: Candidate, highs: Optional[rhchain.Highs]) -> str:
+    """Where this token sits against the best it has managed. A token coming
+    back to life well under its own high is a different trade from one making
+    a new high, and the post should not make the reader go and look."""
+    if highs is None:
+        return ""
+    off = highs.off_7d if highs.off_7d is not None else highs.off_24h
+    if off is None or off > -OFF_HIGH_WORTH_SAYING:
+        return ""
+    price = highs.high_7d if highs.off_7d is not None else highs.high_24h
+    peak = highs.mc_of(price, cand.mc)
+    span = "7d" if highs.hours >= 150 else f"{highs.hours}h"
+    return f"**{pct(off)}** off its {span} high" + (f" ({usd(peak)} MC)" if peak else "")
+
+
+def chart_png(cand: Candidate, highs: Optional[rhchain.Highs]) -> Optional[bytes]:
+    """The line behind the numbers, from the candles the off-high figure already
+    paid for. A pair minutes old has no shape yet and gets none."""
+    if highs is None or not highs.series or not cand.mc:
+        return None
+    points = [(ts, highs.mc_of(close, cand.mc) or 0.0) for ts, close in highs.series]
+    return chart.render(points, high=highs.mc_of(highs.high_7d, cand.mc))
+
+
+async def build_embed(cand: Candidate, snap: Optional[TokenSnapshot],
+                      highs: Optional[rhchain.Highs] = None) -> discord.Embed:
     """One post. Every figure through helpers; one bold figure per line."""
     lines = [f"MC **{usd(cand.mc)}**" + (
         f" (was {usd(cand.mc_before)} 5m ago)" if cand.kind == "mover" and cand.mc_before else ""
     )]
+    off_high = _off_high_line(cand, highs)
+    if off_high:
+        lines.append(off_high)
     lines.append(footer(f"Liq {usd(cand.liq)}", f"age {age(cand.age_sec)}" if cand.age_sec else "",
                         cand.venue, f"quote {cand.quote}" if cand.quote and cand.quote != "?" else ""))
     lines.append(footer(f"5m: **{plural(cand.buyers_m5, 'buyer')}**",
@@ -434,6 +513,9 @@ async def build_embed(cand: Candidate, snap: Optional[TokenSnapshot]) -> discord
     elif cand.kind == "mover":
         lines.append(f"5m **{pct(cand.change_m5)}**")
     lines.append(await _risk_line(cand.ca))
+    links = await _links_line(cand.ca)
+    if links:
+        lines.append(links)
     lines.append(f"`{cand.ca}`")
     embed = discord.Embed(
         title=f"{TITLES.get(cand.kind, cand.kind)}{SEP}{cand.symbol}",
@@ -477,6 +559,7 @@ class Feed:
         self.last_tick_ts = 0.0
         self.last_fetch_ts = 0.0
         self._capped: Dict[int, bool] = {}
+        self._held: Dict[int, List[Tuple[float, str]]] = {}     # gid -> (ts, symbol) waiting on the bar
         self._unreachable: Dict[int, float] = {}
         self._gecko_ts: Deque[float] = deque()
         self._dex_ts: Deque[float] = deque()
@@ -504,6 +587,7 @@ class Feed:
         self.last_tick_ts = now
         dirty = prune(now)
         self._capped.clear()
+        self._held.clear()
         active = [c for c in configs.values() if c.enabled]
         try:
             if not active:
@@ -544,10 +628,8 @@ class Feed:
             chosen: List[Tuple[FeedConfig, Candidate, TokenSnapshot]] = []
             for gid, items in per_guild.items():
                 cfg = configs[gid]
-                room = cfg.max_per_hour - posts_last_hour(gid, now)
-                picked = rank([c for c, _ in items], room)
-                if len(picked) < len(items):
-                    self._capped[gid] = True
+                picked, held = select([c for c, _ in items], cfg, now)
+                self._note_held(gid, held, now)
                 snaps = {c.ca: s for c, s in items}
                 chosen.extend((cfg, c, snaps[c.ca]) for c in picked)
 
@@ -557,7 +639,8 @@ class Feed:
                 for cfg, cand, snap in chosen:
                     seen[cand.seen_key()] = now
                     posted.append(PostedToken(ca=cand.ca, symbol=cand.symbol, decimals=cand.decimals,
-                                              ts=now, kind=cand.kind, guild_id=cfg.guild_id))
+                                              ts=now, kind=cand.kind, guild_id=cfg.guild_id,
+                                              score=cand.score()))
                     pending.pop(cand.ca, None)
                 await save_feed()
                 dirty = False
@@ -566,6 +649,18 @@ class Feed:
         finally:
             if dirty:
                 await save_feed()
+
+    def _note_held(self, guild_id: int, held: List[Candidate], now: float) -> None:
+        """What the bar turned away this hour, for ``/rh feed status``. These are
+        not dropped — they are simply not the strongest thing on the tape."""
+        rows = [(ts, sym) for ts, sym in self._held.get(guild_id, []) if now - ts <= 3600]
+        seen_syms = {sym for _, sym in rows}
+        rows += [(now, c.symbol) for c in held if c.symbol not in seen_syms]
+        self._held[guild_id] = rows[-25:]
+        self._capped[guild_id] = bool(rows)
+
+    def held_last_hour(self, guild_id: int, now: float) -> List[str]:
+        return [sym for ts, sym in self._held.get(guild_id, []) if now - ts <= 3600]
 
     async def _fetch(self, now: float) -> List[Pool]:
         before = rhchain.request_count
@@ -688,10 +783,18 @@ class Feed:
     async def _post(self, cfg: FeedConfig, cand: Candidate, snap: TokenSnapshot, now: float) -> None:
         cand = replace(cand, guild_id=cfg.guild_id, channel_id=cfg.channel_id)
         try:
-            embed = await build_embed(cand, snap)
+            # Two GeckoTerminal reads, cached ten minutes, for the two things a
+            # listing row cannot say: how far under its own high this is, and
+            # the shape that got it there. A brand-new pair has neither.
+            highs = await rhchain.price_highs(cand.ca) if cfg.charts else None
+            embed = await build_embed(cand, snap, highs)
+            png = await asyncio.to_thread(chart_png, cand, highs) if cfg.charts else None
             view = trade_view(cand.ca, snap)
             ch = await self.bot.fetch_channel(cfg.channel_id)
             kw: Dict[str, Any] = {"embed": embed}
+            if png:
+                kw["file"] = discord.File(io.BytesIO(png), filename="token.png")
+                embed.set_image(url="attachment://token.png")
             if view is not None:
                 kw["view"] = view
             msg = await ch.send(**kw)
@@ -749,8 +852,8 @@ class Feed:
             parts.append("paused (GeckoTerminal busy)")
         if rhchain.last_error:
             parts.append(f"stale: last refresh failed {_ago(now - rhchain.last_error_ts)} ago")
-        if self._capped.get(guild_id):
-            parts.append("capped")
+        if self.held_last_hour(guild_id, now):
+            parts.append("over cap")
         if guild_id in self._unreachable:
             parts.append("channel unreachable")
         return parts
@@ -771,6 +874,7 @@ class Feed:
         hit_2x = sum(1 for m in peaks if m >= 2.0)
         below = sum(1 for m in currents if m < 1.0)
         n_hour = posts_last_hour(cfg.guild_id, now)
+        held = self.held_last_hour(cfg.guild_id, now)
         state = self.state_parts(cfg.guild_id, now)
         kinds = ", ".join(k for k, on in (("new pairs", cfg.new_pairs), ("spikes", cfg.spikes),
                                           ("movers", cfg.movers)) if on) or "none"
@@ -779,7 +883,9 @@ class Feed:
             footer(f"Feed → <#{cfg.channel_id}>", f"**{'on' if cfg.enabled else 'off'}**", *state),
             footer(f"Kinds: {kinds}", f"liq ≥ {usd(cfg.min_liq)}", f"buyers ≥ {cfg.min_buyers}",
                    f"pace ≥ {mult(cfg.pace)}", f"move ≥ {pct(cfg.move_pct)}"),
-            footer(f"Last hour: **{n_hour}** {'post' if n_hour == 1 else 'posts'} (cap {cfg.max_per_hour})",
+            footer(f"Last hour: **{n_hour}** {'post' if n_hour == 1 else 'posts'} (cap {cfg.max_per_hour}"
+                   + (" · past it only stronger finds post)" if held else ")"),
+                   f"waiting on the bar: {', '.join(held[:5])}" if held else "",
                    f"pending {len(pending)}", fetch),
             footer(f"Last 24h: {plural(len(evs), 'post')}",
                    f"median peak **{mult(median_peak)}**" if median_peak is not None else "",
@@ -798,7 +904,9 @@ class Feed:
             "state": state,
             "paused": self.paused,
             "stale": bool(rhchain.last_error),
-            "capped": bool(self._capped.get(cfg.guild_id)),
+            "capped": bool(held),
+            "held": held,
+            "ceiling": int(round(cfg.max_per_hour * OVERFLOW_MULT)),
             "unreachable": cfg.guild_id in self._unreachable,
             "posts_last_hour": n_hour,
             "cap": cfg.max_per_hour,

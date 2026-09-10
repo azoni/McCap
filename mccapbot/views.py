@@ -28,12 +28,13 @@ What this module must never do:
 """
 
 import re
+import time
 from typing import Any, Callable, Coroutine, List, Optional, Sequence
 
 import discord
 
 from .config import RHC_BUTTON_USD_SIZES, RHC_MAX_TRADE_USD
-from .helpers import SEP, footer, is_evm_address, usd
+from .helpers import SEP, age, footer, is_evm_address, pct, usd
 from .logging_setup import log
 
 
@@ -352,9 +353,16 @@ class TokenPickSelect(discord.ui.DynamicItem[discord.ui.Select], template=r"rh:p
             if not _ADDRESS_RE.fullmatch(value):
                 await _private(inter, NOT_A_TOKEN_TEXT)
                 return
-            card = size_card(value)
+            # Picking a token is the moment somebody is deciding, so the cog
+            # spends a few requests on the full card. Without the cog loaded
+            # the buttons still work; only the context is missing.
+            cog = _cog(inter)
+            show = getattr(cog, "button_token_card", None) if cog is not None else None
+            if show is not None:
+                await show(inter, value, self._label_for(value))
+                return
             await inter.response.send_message(
-                f"**{self._label_for(value)}**{SEP}`{value}`\nHow much?", view=card, ephemeral=True,
+                f"**{self._label_for(value)}**{SEP}`{value}`\nHow much?", view=size_card(value), ephemeral=True,
             )
         await _safe(inter, body, self.custom_id)
 
@@ -557,6 +565,45 @@ def partial_sell_row(uid: int, token: str) -> discord.ui.View:
     return _view(SellPctButton(uid, token, 100, label="Sell rest"), TpSlButton(uid, token))
 
 
+def _call(t, name: str, *args, default=None):
+    """A TokenActivity method if this row has one; boards and tests also pass
+    plain stand-ins, and a picker must never be the thing that breaks."""
+    fn = getattr(t, name, None)
+    if not callable(fn):
+        return default
+    try:
+        return fn(*args)
+    except Exception:
+        return default
+
+
+def _pick_label(t, addr: str) -> str:
+    """The symbol, with how far it sits under its recent high: the number the
+    dip thesis turns on, in the part of the option Discord shows largest."""
+    symbol = (str(getattr(t, "symbol", "") or "") or addr[:8])
+    off = _call(t, "off_high")
+    tag = f"  {pct(off)} off high" if off is not None and off <= -1 else ""
+    return f"{symbol}{tag}"[:100]
+
+
+def _pick_description(t, kind: str) -> str:
+    """Under the symbol: who is trading it now, how deep the pool is, and for a
+    brand-new pair how old it is. Market cap alone said nothing about whether
+    the token could be sold or whether anyone was still there."""
+    buyers = _call(t, "buyers", "m5", default=0) or 0
+    sells = _call(t, "sells", "m5", default=0) or 0
+    depth = _call(t, "depth")
+    age_sec = getattr(t, "created_ts", 0.0)
+    parts = [
+        f"{usd(getattr(t, 'mc_usd', None))} MC",
+        f"{buyers} buyers 5m" if buyers else "quiet 5m",
+        f"{buyers}/{sells} buy/sell" if (kind == "new" and (buyers or sells)) else "",
+        f"liq {usd(getattr(t, 'liq_usd', None))}" + (f" ({pct(depth, signed=False)} of cap)" if depth else ""),
+        f"{age(time.time() - age_sec)} old" if (kind == "new" and age_sec) else "",
+    ]
+    return footer(*parts)[:100]
+
+
 @_factory
 def board_view(kind: str, tokens) -> discord.ui.View:
     """The picker under a trending / new board: one option per token (at most 25)."""
@@ -569,12 +616,8 @@ def board_view(kind: str, tokens) -> discord.ui.View:
         if not is_evm_address(addr) or addr.lower() in seen:
             continue
         seen.add(addr.lower())
-        label = (str(getattr(t, "symbol", "") or "") or addr[:8])[:100]
-        buyers = getattr(t, "buyers", None)
-        active = buyers("m5") if callable(buyers) else 0
-        desc = footer(f"{usd(getattr(t, 'mc_usd', None))} MC", f"{usd(getattr(t, 'liq_usd', None))} liq",
-                      f"{active} buyers" if active else "")[:100]
-        options.append(discord.SelectOption(label=label, value=addr, description=desc or None))
+        options.append(discord.SelectOption(label=_pick_label(t, addr), value=addr,
+                                            description=_pick_description(t, kind) or None))
     if not options:
         raise ValueError("no tokens to pick from")
     return _view(TokenPickSelect(kind, options))

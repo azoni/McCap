@@ -87,9 +87,9 @@ what you are actively trading here.
 | `/rh history [count] [public]` | Your recent buys, sells and withdrawals with status, relative time and transaction links. |
 | `/rh pnl [public]` | Net profit, per-token lines, gas spent, and a bar chart. |
 | `/rh stats` | Group metrics: wallets, trades, volume, gas spent, realized profit, best multiple. |
-| `/rh trending [window] [sort] [count] [include_majors]` | Busiest and fastest-moving tokens on the chain: volume, change, distinct buyers, market cap, with a ⚡ tag when the last five minutes ran at twice the hour's pace. Windows 5m to 24h; sort by volume, gainers (with then → now market caps and buys/sells), losers, newest, or active (most buyers). Short windows also pull GeckoTerminal's own trending list. |
+| `/rh trending [window] [sort] [count] [min_liquidity] [min_buyers] [include_majors]` | Busiest and fastest-moving tokens on the chain: volume, change, distinct buyers, market cap, with a ⚡ tag when the last five minutes ran at twice the hour's pace. Windows 5m to 24h; sort by volume, gainers (with then → now market caps and buys/sells), losers, newest, active (most buyers), or **retrace** — furthest below a recent high while still being bought, which swaps the volume and change columns for an *Off high* one. Retrace ignores anything under 20% or over 90% down: past 90% a chart is a rug, not a dip. Short windows also pull GeckoTerminal's own trending list. |
 | `/rh new [count] [min_liquidity] [min_buyers]` | Brand-new pairs, newest first, with age, liquidity, distinct buyers in the last 5 minutes and market cap. Defaults hide pools under $5K of liquidity or 5 buyers; a symbol in brackets is a non-major quote token. |
-| `/rh feed on [channel] [new_pairs] [spikes] [movers] [min_liquidity] [min_buyers] [pace] [move_pct] [max_per_hour]` | Server managers: post new pairs (after a second look a minute later), 5-minute volume spikes and 5-minute movers to one channel, strongest first, capped per hour, each with the trade buttons. |
+| `/rh feed on [channel] [new_pairs] [spikes] [movers] [min_liquidity] [min_buyers] [pace] [move_pct] [max_per_hour] [charts]` | Server managers: post new pairs (after a second look a minute later), 5-minute volume spikes and 5-minute movers to one channel, strongest first, each with the trade buttons, a line of the project's own links and — unless `charts` is off — how far the token is below its recent high plus the price line behind it. |
 | `/rh feed off` · `/rh feed status` · `/rh feed mute <token> [for]` | Stop it; see what it posted and how those calls did (median peak, 2x count); silence one token for a while. |
 | `/rh tutorial [topic] [public]` | How it all works, with a personal checklist (allowlist, wallet, funded, first trade) and buttons for the next step. Topics: getting started, buying, selling, buttons, auto-orders, safety. |
 | `/rh auto sell <token> <percent> <at> [anchor] [expires] [slippage_bps] [private]` | Take-profit or stop-loss: sell a percentage when the market cap reaches `2x`, `-30%` or `500k`, or `trail 20%` for a stop that rises with the price (ratchets only after two agreeing reads, never falls). Confirmed once, fires once without asking again. |
@@ -97,9 +97,18 @@ what you are actively trading here.
 | `/rh auto list [public]` | Your armed rules, what each waits for, and whether the engine is on hold. |
 | `/rh auto cancel <id>` | Remove one of your rules (refused while it is executing). |
 
+**The hourly cap is a bar, not a shutter.** `max_per_hour` (default 10) is the
+budget a server spends freely, strongest first. Past it the feed does not go
+quiet — it gets picky: a find has to beat the median strength of what the hour
+already carried by half again, and an hour still cannot run past twice the cap.
+Nothing turned away is dropped; it is simply not the best thing on the tape, and
+the next tick weighs it again. `/rh feed status` names what is waiting on the bar.
+
 **Buttons.** Every buy receipt carries **Sell 25% / Sell 50% / Sell all / TP · SL**;
-`/rh trending` and `/rh new` carry a token picker that leads to **Buy $5 / Buy $20 /
-Other amount**; an alert on a Robinhood Chain token carries **Buy $5 / Buy $20 /
+`/rh trending` and `/rh new` carry a token picker — each option labelled with how
+far the token sits below its high, and who is buying it — that leads to a token
+card (real hourly highs, holders and concentration, the project's links, and a
+price line) and then **Buy $5 / Buy $20 / Other amount**; an alert on a Robinhood Chain token carries **Buy $5 / Buy $20 /
 Sell 50% / Sell all**. Buttons are shortcuts into the same flow as the slash
 commands: each opens the same private quote and Confirm prompt, and they keep
 working after McCap restarts. Buttons that act on a position answer only to the

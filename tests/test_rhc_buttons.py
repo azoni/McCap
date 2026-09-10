@@ -10,6 +10,7 @@ The cog is a recording fake: the real one is wired by the integrator and its
 own flows are covered in test_rhc_cog_flows.py.
 """
 
+import time
 from types import SimpleNamespace
 
 import discord
@@ -413,9 +414,62 @@ def test_board_view_caps_at_25_options_and_describes_each():
     opts = sel.item.options
     assert len(opts) == 25
     assert opts[0].label == "T0" and opts[0].value == toks[0].address
-    assert opts[0].description == "$1M MC · $50K liq"
+    assert opts[0].description == "$1M MC · quiet 5m · liq $50K"
     assert sel.item.placeholder == "Pick a token to buy"
     assert all(len(o.label) <= 100 and len(o.description) <= 100 for o in opts)
+
+
+class _Row(SimpleNamespace):
+    """A stand-in for rhchain.TokenActivity with the signals the picker reads."""
+
+    def off_high(self):
+        return self._off_high
+
+    def depth(self):
+        return self._depth
+
+    def buyers(self, window="m5"):
+        return self._buyers
+
+    def sells(self, window="m5"):
+        return self._sells
+
+
+def test_the_picker_leads_with_how_far_a_token_is_off_its_high():
+    row = _Row(symbol="DIP", address=PONS, mc_usd=2_000_000, liq_usd=120_000, created_ts=0.0,
+               _off_high=-38.4, _depth=6.0, _buyers=12, _sells=4)
+    [sel] = views.board_view("trending", [row]).children
+    [opt] = sel.item.options
+    assert opt.label == "DIP  -38.4% off high"
+    assert opt.description == "$2M MC · 12 buyers 5m · liq $120K (6% of cap)"
+
+
+def test_a_brand_new_pair_shows_buy_sell_pressure_and_age():
+    row = _Row(symbol="FRESH", address=PONS, mc_usd=90_000, liq_usd=15_000,
+               created_ts=time.time() - 600, _off_high=None, _depth=None, _buyers=9, _sells=3)
+    [sel] = views.board_view("new", [row]).children
+    [opt] = sel.item.options
+    assert opt.label == "FRESH"
+    assert opt.description == "$90K MC · 9 buyers 5m · 9/3 buy/sell · liq $15K · 10m old"
+
+
+def test_a_row_whose_signals_raise_still_gets_a_picker_option():
+    class Broken(SimpleNamespace):
+        def off_high(self):
+            raise RuntimeError("no market data")
+
+        def depth(self):
+            raise RuntimeError("no market data")
+
+        def buyers(self, window="m5"):
+            raise RuntimeError("no market data")
+
+        def sells(self, window="m5"):
+            raise RuntimeError("no market data")
+
+    [sel] = views.board_view("trending", [Broken(symbol="OOPS", address=PONS, mc_usd=1_000, liq_usd=None)]).children
+    [opt] = sel.item.options
+    assert opt.label == "OOPS" and opt.value == PONS
 
 
 def test_board_view_skips_non_evm_addresses_and_duplicates():
@@ -609,5 +663,5 @@ def test_views_module_imports_stay_web3_free():
             modules.update(f"{n.module or ''}.{a.name}" for a in n.names)
     for banned in ("chain", "kyber", "swap", "trade", "cogs", "wallets", "web3"):
         assert not any(banned in m for m in modules), (banned, modules)
-    assert modules <= {"re", "typing", "discord", "config", "helpers", "logging_setup"} | {
+    assert modules <= {"re", "time", "typing", "discord", "config", "helpers", "logging_setup"} | {
         m for m in modules if m.startswith(("typing.", "config.", "helpers.", "logging_setup."))}

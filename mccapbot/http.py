@@ -7,7 +7,7 @@ outgoing request rate. One long-lived session plus a token bucket fixes both.
 
 import asyncio
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import aiohttp
 
@@ -89,6 +89,8 @@ class RateLimiter:
 
 dex_limiter = RateLimiter(DEX_MAX_REQUESTS_PER_MIN, burst=DEX_BURST)
 
+RETRY_429_DELAY = 2.5           # seconds before an opt-in second attempt
+
 
 async def get_json(
     url: str,
@@ -97,8 +99,37 @@ async def get_json(
     headers: Optional[Dict[str, str]] = None,
     params: Optional[Dict[str, str]] = None,
     timeout: Optional[int] = None,
+    retry_429: int = 0,
 ) -> Optional[Any]:
-    """GET a JSON document. Returns ``None`` on any non-200 or transport error."""
+    """GET a JSON document. Returns ``None`` on any non-200 or transport error.
+
+    ``retry_429`` is for the few reads whose absence a person would notice — a
+    token card losing the one figure it was opened for, say. Our own bucket
+    keeps us under the per-minute ceiling, but a provider that also measures a
+    shorter window can still refuse a burst it will happily serve a moment
+    later. Off by default: a caller with a cache or a next tick should not pay
+    for a second attempt.
+    """
+    for attempt in range(max(0, int(retry_429)) + 1):
+        if attempt:
+            await asyncio.sleep(RETRY_429_DELAY * attempt)
+        got, throttled = await _get_json_once(url, limiter=limiter, headers=headers,
+                                              params=params, timeout=timeout)
+        if not throttled:
+            return got
+    return None
+
+
+async def _get_json_once(
+    url: str,
+    *,
+    limiter: Optional[RateLimiter] = None,
+    headers: Optional[Dict[str, str]] = None,
+    params: Optional[Dict[str, str]] = None,
+    timeout: Optional[int] = None,
+) -> Tuple[Optional[Any], bool]:
+    """The document, and whether the provider refused it as too many requests
+    (the one failure worth trying again)."""
     if limiter is not None:
         await limiter.acquire()
     session = await get_session()
@@ -113,16 +144,16 @@ async def get_json(
         async with session.get(url, **kwargs) as r:
             if r.status == 429:
                 log.warning("Rate limited (429) on %s", url.split("?")[0])
-                return None
+                return None, True
             if r.status != 200:
                 log.debug("HTTP %s on %s", r.status, url.split("?")[0])
-                return None
-            return await r.json(content_type=None)
+                return None, False
+            return await r.json(content_type=None), False
     except asyncio.CancelledError:
         raise
     except Exception as e:
         log.debug("Request failed for %s: %s: %s", url.split("?")[0], type(e).__name__, e)
-        return None
+        return None, False
 
 
 async def post_json(

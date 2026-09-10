@@ -232,3 +232,56 @@ def test_is_honeypot_only_on_an_explicit_yes():
     assert is_honeypot(TokenInfo(honeypot="no")) is False
     assert is_honeypot(TokenInfo(honeypot="unknown")) is False
     assert is_honeypot(None) is False
+
+
+# ---------------- the links under a post ----------------
+
+
+def test_a_projects_own_links_are_read_and_normalised():
+    """GeckoTerminal stores a handle in one field and a full URL in another; a
+    post should not care which, and should never render a bare @name as a link."""
+    info = parse_info({"data": {"attributes": {
+        "twitter_handle": "@ponsdotfamily",
+        "telegram_handle": "https://t.me/ponschat/",
+        "discord_url": "https://discord.gg/pons",
+        "websites": ["https://ponsfamily.com", "https://backup.example"],
+    }}})
+    assert info.links == {
+        "X": "https://x.com/ponsdotfamily",
+        "Telegram": "https://t.me/ponschat/",     # a published URL is passed through as published
+        "Discord": "https://discord.gg/pons",
+        "Site": "https://ponsfamily.com",
+    }
+    assert list(info.links) == ["X", "Telegram", "Discord", "Site"], "a fixed order everywhere"
+    assert info.socials == 4
+
+
+def test_junk_link_fields_are_dropped_rather_than_rendered():
+    info = parse_info({"data": {"attributes": {
+        "twitter_handle": "   ", "telegram_handle": None, "discord_url": "not-a-url",
+        "websites": ["ftp://nope", 7],
+    }}})
+    assert info.links == {}
+
+
+def test_links_line_always_offers_the_chart_gmgn_and_the_explorer(monkeypatch):
+    monkeypatch.setattr(risk, "RHC_GMGN_SLUG", "robinhood")
+    info = parse_info({"data": {"attributes": {"twitter_handle": "pons"}}})
+    line = risk.links_line(info, PONS)
+    assert line.startswith("[X](https://x.com/pons)")
+    assert f"[Chart](https://www.geckoterminal.com/{risk.RHCHAIN_NETWORK}/tokens/{PONS})" in line
+    assert f"[GMGN](https://gmgn.ai/robinhood/token/{PONS})" in line
+    assert f"/token/{PONS})" in line and "[Explorer](" in line
+
+
+def test_the_gmgn_link_can_be_switched_off_without_a_deploy(monkeypatch):
+    """The chain's slug on GMGN cannot be verified from here — their site
+    answers 200 for any slug — so it is one env var, not a hard-coded URL."""
+    monkeypatch.setattr(risk, "RHC_GMGN_SLUG", "")
+    line = risk.links_line(None, PONS)
+    assert "GMGN" not in line and "[Chart](" in line and "[Explorer](" in line
+
+
+def test_no_address_means_no_line_at_all():
+    assert risk.links_line(None, "") == ""
+    assert risk.links_line(parse_info({"data": {"attributes": {"twitter_handle": "x"}}}), "") == "[X](https://x.com/x)"

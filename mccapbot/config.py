@@ -282,6 +282,10 @@ FEED_TRACK_MAX_TOKENS = _env_int("FEED_TRACK_MAX_TOKENS", 40)  # posts graded by
 FEED_FILE = str(DATA_DIR / "feed.json")
 # GeckoTerminal token info (holders, top-10 %, honeypot flag) is cached this long.
 RHC_RISK_CACHE_SECONDS = _env_int("RHC_RISK_CACHE_SECONDS", 600)
+# GMGN's path segment for this chain, used to link a token to its GMGN page.
+# Their site is client-rendered and answers 200 for any slug, so this could not
+# be verified from here: set it to the right one, or empty to drop the link.
+RHC_GMGN_SLUG = os.getenv("RHC_GMGN_SLUG", "robinhood").strip().strip("/")
 # Every automated buy arms these sells when it fills unless the user opts out.
 RHC_AUTO_PROTECT_DEFAULT = os.getenv("RHC_AUTO_PROTECT_DEFAULT", "tp=2x:50,sl=-30%:100")
 # Momentum-triggered buy rules with a window under 15 minutes poll fast; cap how many.

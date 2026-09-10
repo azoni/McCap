@@ -6,6 +6,7 @@ import time
 import pytest
 
 from mccapbot.config import DEX_BURST, DEX_MAX_REQUESTS_PER_MIN
+from mccapbot import http
 from mccapbot.http import RateLimiter
 
 DEX_HARD_LIMIT = 300  # DexScreener's documented token-endpoint limit, per minute
@@ -85,3 +86,80 @@ def test_available_applies_the_refill_without_consuming():
     assert lim.available() <= lim.capacity
     lim.updated = time.monotonic() - 60.0
     assert lim.available() == pytest.approx(lim.capacity), "capped at the burst"
+
+
+# ---------------- the one failure worth trying again ----------------
+
+
+class _Response:
+    def __init__(self, status, payload=None):
+        self.status = status
+        self._payload = payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def json(self, content_type=None):
+        return self._payload
+
+
+class _Session:
+    """Answers with the queued statuses in order, then repeats the last."""
+
+    def __init__(self, *statuses):
+        self.queue = list(statuses)
+        self.calls = 0
+
+    def get(self, url, **kw):
+        self.calls += 1
+        status = self.queue.pop(0) if len(self.queue) > 1 else self.queue[0]
+        return _Response(status, {"ok": status == 200})
+
+
+def _patch(monkeypatch, session):
+    async def get_session():
+        return session
+
+    async def no_sleep(_):
+        return None
+
+    monkeypatch.setattr(http, "get_session", get_session)
+    monkeypatch.setattr(http.asyncio, "sleep", no_sleep)
+
+
+@pytest.mark.asyncio
+async def test_a_throttled_read_is_not_retried_unless_the_caller_asked(monkeypatch):
+    """Almost every caller here has a cache or a next tick. Paying for a second
+    attempt by default would multiply exactly the traffic that caused the 429."""
+    session = _Session(429)
+    _patch(monkeypatch, session)
+    assert await http.get_json("https://example/x") is None
+    assert session.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_an_opt_in_retry_asks_again_and_takes_the_answer(monkeypatch):
+    session = _Session(429, 200)
+    _patch(monkeypatch, session)
+    assert await http.get_json("https://example/x", retry_429=1) == {"ok": True}
+    assert session.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_a_retry_gives_up_rather_than_hammering(monkeypatch):
+    session = _Session(429)
+    _patch(monkeypatch, session)
+    assert await http.get_json("https://example/x", retry_429=2) is None
+    assert session.calls == 3, "the first attempt plus the two that were asked for"
+
+
+@pytest.mark.asyncio
+async def test_a_plain_failure_is_never_retried_however_many_were_offered(monkeypatch):
+    """A 404 will still be a 404 in two seconds; only a rate limit changes."""
+    session = _Session(404)
+    _patch(monkeypatch, session)
+    assert await http.get_json("https://example/x", retry_429=3) is None
+    assert session.calls == 1

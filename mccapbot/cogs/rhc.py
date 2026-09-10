@@ -1203,12 +1203,13 @@ class RhcCog(commands.Cog):
         min_buyers="Ignore tokens with fewer distinct buyers in 5 minutes (default 8)",
         pace="Spike threshold: 5m volume at this many times the hour's pace (default 3)",
         move_pct="Mover threshold: 5m price change in percent (default 25)",
-        max_per_hour="Most posts per hour, strongest first (default 10)",
+        max_per_hour="Posts an hour before the bar rises; past it only stronger finds post (default 10)",
+        charts="Attach a price line and how far the token is off its high (default on)",
     )
     async def feed_on(self, inter: discord.Interaction, channel: Optional[discord.TextChannel] = None,
                       new_pairs: bool = True, spikes: bool = True, movers: bool = True,
                       min_liquidity: Optional[int] = 5000, min_buyers: Optional[int] = 8, pace: Optional[float] = 3.0,
-                      move_pct: Optional[float] = 25.0, max_per_hour: Optional[int] = 10):
+                      move_pct: Optional[float] = 25.0, max_per_hour: Optional[int] = 10, charts: bool = True):
         from .. import discovery
         if await self._deny_manager(inter):
             return
@@ -1224,6 +1225,7 @@ class RhcCog(commands.Cog):
             pace=float(max(1.0, pace if pace is not None else 3.0)),
             move_pct=float(max(1.0, move_pct if move_pct is not None else 25.0)),
             max_per_hour=int(max(1, min(60, max_per_hour if max_per_hour is not None else 10))),
+            charts=bool(charts),
         )
         discovery.set_config(cfg)          # keeps whatever this server had muted
         await discovery.save_feed()
@@ -1232,7 +1234,7 @@ class RhcCog(commands.Cog):
             f"📡 Feed → <#{target}>{SEP}**on**\n"
             + footer(", ".join(kinds) or "nothing selected", f"liq ≥ {usd_str(cfg.min_liq)}",
                      f"buyers ≥ {cfg.min_buyers}", f"pace ≥ {cfg.pace:g}x", f"move ≥ {pct(cfg.move_pct, signed=False)}",
-                     f"cap {plural(cfg.max_per_hour, 'post')}/hour")
+                     f"cap {plural(cfg.max_per_hour, 'post')}/hour", "charts" if cfg.charts else "no charts")
             + f"\nEvery post carries the trade buttons; each opens the usual private quote and Confirm. "
               f"`/rh feed status` shows how the calls did.",
         )
@@ -1318,8 +1320,10 @@ class RhcCog(commands.Cog):
     @rhc.command(name="trending", description="Busiest and fastest-moving tokens on Robinhood Chain")
     @app_commands.describe(
         window="Volume and market-cap change over 5m to 24h (default 24h)",
-        sort="volume (default), gainers, losers, newest pools, or active (most buyers)",
+        sort="volume (default), gainers, losers, newest pools, active (most buyers), or retrace (off its high)",
         count="How many to show (default 10, max 25)",
+        min_liquidity="Hide tokens with less than this many dollars of liquidity",
+        min_buyers="Hide tokens with fewer distinct buyers in the window",
         include_majors="Also show WETH / USDG / stablecoin pools (hidden by default)",
         private="Reply only to you",
     )
@@ -1331,6 +1335,7 @@ class RhcCog(commands.Cog):
             app_commands.Choice(name="losers", value="losers"),
             app_commands.Choice(name="new", value="new"),
             app_commands.Choice(name="active", value="active"),
+            app_commands.Choice(name="retrace (off its high)", value="retrace"),
         ],
     )
     async def trending(
@@ -1339,6 +1344,8 @@ class RhcCog(commands.Cog):
         window: Optional[app_commands.Choice[str]] = None,
         sort: Optional[app_commands.Choice[str]] = None,
         count: Optional[int] = 10,
+        min_liquidity: Optional[int] = None,
+        min_buyers: Optional[int] = None,
         include_majors: bool = False,
         private: bool = False,
     ):
@@ -1349,11 +1356,35 @@ class RhcCog(commands.Cog):
         mode = sort.value if sort else "volume"
         n = max(1, min(int(count or 10), 25))
 
-        embed, top, problem = await self._board(w, mode, n, include_majors)
+        embed, top, problem = await self._board(w, mode, n, include_majors,
+                                                min_liq=float(max(0, min_liquidity or 0)),
+                                                min_buyers=int(max(0, min_buyers or 0)))
         if embed is None:
             await inter.followup.send(problem, ephemeral=priv)
             return
         await inter.followup.send(embed=embed, ephemeral=priv, **self._view_kw(self._view("board_view", "trending", top)))
+
+    async def button_token_card(self, inter: discord.Interaction, ca: str, label: str = "") -> None:
+        """After picking a token on a board: what it is, how far it is off its
+        real high, who holds it, where to read about it, and the buy sizes.
+        Private, and the buttons still appear if any of the lookups fail."""
+        from .. import tokencard
+        await inter.response.defer(thinking=True, ephemeral=True)
+        text, png = "", None
+        try:
+            known = {t.address.lower(): t for t in await self._known_tokens()}
+            card = await tokencard.build(ca, known.get(ca.lower()))
+            text = card.text()
+            # The candles came with the off-high figure, so the line under the
+            # numbers is free; drawing it is the only part worth a thread.
+            png = await asyncio.to_thread(card.chart_png)
+        except Exception:
+            log.exception("Could not build the token card for %s", ca)
+        if not text:
+            text = f"**{label or short_ca(ca)}**{SEP}`{ca}`"
+        files = [discord.File(io.BytesIO(png), filename="token.png")] if png else []
+        await inter.followup.send(f"{text}\nHow much?", ephemeral=True, suppress_embeds=True,
+                                  files=files, **self._view_kw(self._view("size_card", ca)))
 
     async def button_trending(self, inter: discord.Interaction) -> None:
         """The Trending now button: the default board, privately, with its picker."""
@@ -1364,7 +1395,8 @@ class RhcCog(commands.Cog):
             return
         await inter.followup.send(embed=embed, ephemeral=True, **self._view_kw(self._view("board_view", "trending", top)))
 
-    async def _board(self, w: str, mode: str, n: int, include_majors: bool):
+    async def _board(self, w: str, mode: str, n: int, include_majors: bool,
+                     *, min_liq: float = 0.0, min_buyers: int = 0):
         """(embed, top tokens, None) for the trending board, or (None, None, why).
 
         Short windows also pull GeckoTerminal's own trending list for that
@@ -1382,6 +1414,8 @@ class RhcCog(commands.Cog):
             seen = {p.address for p in pools}
             pools += [p for p in extra if p.address not in seen]
         tokens = rhchain.aggregate(pools)
+        if min_liq or min_buyers:
+            tokens = [t for t in tokens if t.liq_usd >= min_liq and t.buyers(w) >= min_buyers]
         top = rhchain.rank(tokens, w, mode, include_majors=include_majors, n=n)
         if not top:
             return None, None, "Nothing to show for that filter."
@@ -1395,19 +1429,28 @@ class RhcCog(commands.Cog):
             tag = f" ⚡{pace:.1f}x" if (mode == "volume" and pace is not None and pace >= 2 and w != "h1") else ""
             return f"{t.symbol[:10]}{tag}"
 
-        rows = [[
-            name(t),
-            usd_str(t.volume(w)),
-            pct(t.change(w)),
-            str(t.buyers(w)) if t.buyers(w) else UNKNOWN,
-            mc(t.mc_usd),
-        ] for t in top]
+        # A retrace board is read for a different number: how far under its own
+        # recent high the token sits, and whether the pool can be sold back into.
+        if mode == "retrace":
+            headers = ["Token", "Off high", "Buyers", "Liq", "MC"]
+            rows = [[t.symbol[:10], pct(t.off_high()), str(t.buyers(w)) if t.buyers(w) else UNKNOWN,
+                     mc(t.liq_usd), mc(t.mc_usd)] for t in top]
+        else:
+            headers = ["Token", f"Vol {label}", label, "Buyers", "MC"]
+            rows = [[
+                name(t),
+                usd_str(t.volume(w)),
+                pct(t.change(w)),
+                str(t.buyers(w)) if t.buyers(w) else UNKNOWN,
+                mc(t.mc_usd),
+            ] for t in top]
 
         shown_tokens = [t for t in tokens if include_majors or t.symbol.upper() not in rhchain.CHAIN_MAJORS]
         total_vol = sum(t.volume(w) for t in shown_tokens)
         venues = sorted({p.dex for t in shown_tokens for p in t.pools})
         titles = {"volume": f"busiest by {label} volume", "gainers": f"{label} gainers",
-                  "losers": f"{label} losers", "new": "newest of the busy pools", "active": f"most buyers in {label}"}
+                  "losers": f"{label} losers", "new": "newest of the busy pools", "active": f"most buyers in {label}",
+                  "retrace": "furthest below a recent high, still being bought"}
         desc = (f"**{usd_str(total_vol)}** traded in {label} across {plural(len(shown_tokens), 'token')}"
                 + (f"{SEP}{', '.join(venues)}" if venues else ""))
         if mode in ("gainers", "losers"):
@@ -1425,14 +1468,15 @@ class RhcCog(commands.Cog):
         embed = discord.Embed(title=f"Robinhood Chain{SEP}{titles[mode]}", colour=NEUTRAL, description=desc)
         shown, total = add_table_fields(
             embed, "Tokens",
-            ["Token", f"Vol {label}", label, "Buyers", "MC"], rows,
-            ["l", "r", "r", "r", "r"], max_fields=3,
+            headers, rows, ["l", "r", "r", "r", "r"], max_fields=3,
         )
         self._addresses_field(embed, top)
         embed.set_footer(text=footer(
             "GeckoTerminal",
             self._stale_note(),
             "" if include_majors else "majors hidden (include_majors to show)",
+            f"liq ≥ {usd_str(min_liq)}" if min_liq else "",
+            f"buyers ≥ {min_buyers}" if min_buyers else "",
             "/rh new for brand-new pairs",
             f"{plural(total - shown, 'row')} not shown" if shown < total else "",
         ))

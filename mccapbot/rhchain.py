@@ -13,12 +13,14 @@ GeckoTerminal rate limiter with the momentum backfill so neither starves the
 other.
 """
 
+import math
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from .config import RHCHAIN_CACHE_SECONDS, RHCHAIN_NETWORK, RHCHAIN_NEW_PAGES, RHCHAIN_PAGES
+from . import gecko
 from .gecko import BASE, gecko_limiter
 from .helpers import UNKNOWN, age
 from .http import get_json
@@ -29,9 +31,16 @@ from .logging_setup import log
 WINDOWS = ("m5", "m15", "m30", "h1", "h6", "h24")
 WINDOW_LABELS = {"m5": "5m", "m15": "15m", "m30": "30m", "h1": "1h", "h6": "6h", "h24": "24h"}
 WINDOW_SECONDS = {"m5": 300, "m15": 900, "m30": 1800, "h1": 3600, "h6": 21600, "h24": 86400}
-SORTS = ("volume", "gainers", "losers", "new", "active")
+SORTS = ("volume", "gainers", "losers", "new", "active", "retrace")
 # GeckoTerminal's trending list accepts these windows.
 TRENDING_DURATIONS = ("5m", "1h", "6h", "24h")
+
+# A "retrace" row has to be at least this far under its high to be interesting,
+# and not so far under it that the token has simply gone to zero. The thesis is
+# that something which ran once can run again; a chart down 99% is not a dip in
+# a live token, it is a rug with its 24h buyer count still on the board.
+RETRACE_MIN_PCT = 20.0
+RETRACE_MAX_PCT = 90.0
 
 # The chain's plumbing rather than something to trade: hidden by default so the
 # board is not two-thirds WETH/USDG pools.
@@ -143,6 +152,55 @@ class TokenActivity:
 
     def sellers(self, window: str) -> int:
         return sum(p.count(window, "sellers") for p in self.pools)
+
+    def mc_path(self) -> List[Tuple[int, float]]:
+        """(seconds ago, market cap) at every point the listing lets us see:
+        now, and each window's start implied by its price change. Seven cheap
+        points, no extra request, enough to tell a token that is holding its
+        level from one that has already halved."""
+        mc = self.mc_usd
+        if not mc:
+            return []
+        out = [(0, mc)]
+        for w in WINDOWS:
+            before = self.mc_before(w)
+            if before:
+                out.append((WINDOW_SECONDS[w], before))
+        return out
+
+    def mc_high(self) -> Optional[float]:
+        """The highest market cap visible in the last 24 hours. An estimate: it
+        reads the window boundaries, so a spike that began and ended inside one
+        window is invisible. ``rhchain.price_highs`` buys the real figure."""
+        path = self.mc_path()
+        return max(v for _s, v in path) if path else None
+
+    def off_high(self) -> Optional[float]:
+        """How far under that high the token sits now, as a percent at or below
+        zero. -60% means it traded at 2.5x this price inside the day."""
+        mc, high = self.mc_usd, self.mc_high()
+        if not mc or not high or high <= 0:
+            return None
+        return (mc / high - 1.0) * 100.0
+
+    def buyer_share(self, window: str = "h1") -> Optional[float]:
+        """Share of the window's trading wallets that were buying, 0..100.
+        Above 50 means more wallets bought than sold — pressure, not price."""
+        buyers, sellers = self.buyers(window), self.sellers(window)
+        total = buyers + sellers
+        return (buyers / total * 100.0) if total else None
+
+    def turnover(self, window: str = "h24") -> Optional[float]:
+        """Window volume against liquidity: how many times the pool turned over.
+        A big pool nobody trades and a small one trading hard look identical by
+        volume alone."""
+        return (self.volume(window) / self.liq_usd) if self.liq_usd > 0 else None
+
+    def depth(self) -> Optional[float]:
+        """Liquidity as a share of market cap, 0..100. Low means most of the
+        'cap' cannot be sold into at anything like this price."""
+        mc = self.mc_usd
+        return (self.liq_usd / mc * 100.0) if mc and mc > 0 else None
 
     def volume_pace(self, short: str = "m5", long: str = "h1") -> Optional[float]:
         """How much faster money is moving now than over the longer window:
@@ -281,9 +339,18 @@ def rank(
     pool's change and skip tokens with none, rather than ranking them as flat.
     ``new`` is by the earliest pool's creation time. ``active`` is by distinct
     buying wallets in the window: who is actually here, not how much money.
+    ``retrace`` is for the dip thesis: tokens trading well under the high they
+    made today that still have buyers.
     """
     rows = [t for t in tokens if include_majors or t.symbol.upper() not in CHAIN_MAJORS]
-    if sort == "active":
+    if sort == "retrace":
+        # Well under its own recent high, but people are still trading it. The
+        # score blends the two so a token 40% down with fifty buyers outranks
+        # one 90% down with three; the board shows both figures either way.
+        rows = [t for t in rows if t.off_high() is not None
+                and -RETRACE_MAX_PCT <= t.off_high() <= -RETRACE_MIN_PCT]
+        rows.sort(key=lambda t: abs(t.off_high()) * math.sqrt(1 + t.buyers(window)), reverse=True)
+    elif sort == "active":
         rows.sort(key=lambda t: (t.buyers(window), t.volume(window)), reverse=True)
     elif sort == "gainers":
         rows = [t for t in rows if t.change(window) is not None]
@@ -441,3 +508,101 @@ def age_str(created_ts: float, now: Optional[float] = None) -> str:
     if not created_ts:
         return UNKNOWN
     return age((now if now is not None else time.time()) - created_ts)
+
+
+# ---------------- how far a token is off its real high ----------------
+
+# The board's off-high figure reads window boundaries and costs nothing. This
+# is the true one, from hourly candles, and costs two GeckoTerminal requests —
+# so it is fetched only for a token somebody actually picked, and cached.
+HIGHS_CACHE_SECONDS = 600
+HIGHS_HOURS = 168                      # a week of hourly candles
+_highs_cache: Dict[str, Tuple[float, "Highs"]] = {}
+
+
+@dataclass
+class Highs:
+    """Where a token trades now against the best it managed recently."""
+
+    price_now: Optional[float] = None
+    high_24h: Optional[float] = None
+    high_7d: Optional[float] = None
+    high_7d_ts: float = 0.0
+    hours: int = 0                     # candles actually seen; < 24 means "young"
+    series: List[Tuple[float, float]] = field(default_factory=list)   # (ts, close), oldest first
+
+    @staticmethod
+    def _off(now: Optional[float], high: Optional[float]) -> Optional[float]:
+        if not now or not high or high <= 0:
+            return None
+        return (now / high - 1.0) * 100.0
+
+    def mc_of(self, price: Optional[float], mc_now: Optional[float]) -> Optional[float]:
+        """One of these candle prices as a market cap, so a post can talk in the
+        units the rest of McCap uses. Supply does not move over a week, so the
+        ratio holds; converting against this series' own last close rather than
+        a listing price keeps the high and the figure it is measured from on
+        the same footing."""
+        if not price or not mc_now or not self.price_now or self.price_now <= 0:
+            return None
+        return mc_now * price / self.price_now
+
+    @property
+    def off_24h(self) -> Optional[float]:
+        return self._off(self.price_now, self.high_24h)
+
+    @property
+    def off_7d(self) -> Optional[float]:
+        return self._off(self.price_now, self.high_7d)
+
+
+def clear_highs_cache() -> None:
+    _highs_cache.clear()
+
+
+async def price_highs(ca: str, network: str = RHCHAIN_NETWORK, now: Optional[float] = None) -> Optional[Highs]:
+    """The token's real 24h and 7d highs against its price now, or None when
+    GeckoTerminal cannot say. Never raises: a board or a card renders without
+    the figure rather than failing."""
+    now = time.time() if now is None else now
+    key = f"{network}:{(ca or '').lower()}"
+    hit = _highs_cache.get(key)
+    if hit and now - hit[0] < HIGHS_CACHE_SECONDS:
+        return hit[1]
+    try:
+        # A card is opened for this figure, so a throttled read is worth one
+        # more try; every other GeckoTerminal caller here has a next tick.
+        pool = await gecko.top_pool(ca, network, retry_429=1)
+        addr = ((pool or {}).get("attributes") or {}).get("address")
+        if not addr:
+            return None
+        candles = await gecko.ohlcv(addr, "hour", 1, HIGHS_HOURS, network, retry_429=1)
+    except Exception:
+        log.debug("Could not read highs for %s", ca, exc_info=True)
+        return None
+    rows: List[List[float]] = []
+    for row in candles or []:
+        try:
+            rows.append([float(row[0]), float(row[2]), float(row[4])])   # ts, high, close
+        except (TypeError, ValueError, IndexError):
+            continue
+    if not rows:
+        return None
+    rows.sort(key=lambda r: -r[0])                                       # newest first
+    day = [r for r in rows if now - r[0] <= 86400] or rows[:24]
+    best = max(rows, key=lambda r: r[1])
+    highs = Highs(
+        price_now=rows[0][2],
+        high_24h=max(r[1] for r in day),
+        high_7d=best[1],
+        high_7d_ts=best[0],
+        hours=len(rows),
+        # The same candles drawn rather than reduced: a chart costs no request
+        # of its own, it is what this read already paid for.
+        series=[(r[0], r[2]) for r in reversed(rows)],
+    )
+    _highs_cache[key] = (now, highs)
+    if len(_highs_cache) > 300:
+        for old in list(_highs_cache)[:100]:
+            _highs_cache.pop(old, None)
+    return highs

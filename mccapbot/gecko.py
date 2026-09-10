@@ -42,13 +42,14 @@ def _timeframe_for(window_sec: int) -> Tuple[str, int, int]:
     return "hour", 4, 90              # 4h candles -> up to 15d
 
 
-async def top_pool(ca: str, network: str = "solana") -> Optional[Dict]:
+async def top_pool(ca: str, network: str = "solana", *, retry_429: int = 0) -> Optional[Dict]:
     """Deepest pool for a token, preferring a recognised quote asset.
 
     Same lesson as the 24h-change fix: the deepest pool overall can be quoted in
     a junk token, which makes its price series meaningless.
     """
-    data = await get_json(f"{BASE}/networks/{network}/tokens/{ca}/pools?page=1", limiter=gecko_limiter)
+    data = await get_json(f"{BASE}/networks/{network}/tokens/{ca}/pools?page=1",
+                          limiter=gecko_limiter, retry_429=retry_429)
     if not data or not data.get("data"):
         return None
 
@@ -75,13 +76,15 @@ async def ohlcv(
     aggregate: int,
     limit: int,
     network: str = "solana",
+    *,
+    retry_429: int = 0,
 ) -> List[List[float]]:
     """Return candles as [ts, open, high, low, close, volume], oldest last."""
     url = (
         f"{BASE}/networks/{network}/pools/{pool_address}/ohlcv/{timeframe}"
         f"?aggregate={aggregate}&limit={limit}"
     )
-    data = await get_json(url, limiter=gecko_limiter)
+    data = await get_json(url, limiter=gecko_limiter, retry_429=retry_429)
     if not data:
         return []
     try:

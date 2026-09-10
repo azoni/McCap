@@ -100,7 +100,7 @@ async def test_backfill_asks_geckoterminal_about_the_right_network(monkeypatch):
     from mccapbot import gecko
     urls = []
 
-    async def fake_get_json(url, limiter=None):
+    async def fake_get_json(url, limiter=None, **kw):
         urls.append(url)
         if "/tokens/" in url:
             return {"data": [{"attributes": {"address": "pool1", "name": "TOK / USDG", "reserve_in_usd": "1000"}}]}
@@ -124,7 +124,7 @@ async def test_tokens_multi_batches_addresses_into_one_request(monkeypatch):
     from mccapbot import gecko
     urls = []
 
-    async def fake_get_json(url, limiter=None):
+    async def fake_get_json(url, limiter=None, **kw):
         urls.append(url)
         return {"data": [
             {"id": "robinhood_0xa", "type": "token",
@@ -144,7 +144,7 @@ async def test_tokens_multi_batches_addresses_into_one_request(monkeypatch):
 
     assert await gecko.tokens_multi([]) == {} and len(urls) == 2, "nothing to ask, no request"
 
-    async def down(url, limiter=None):
+    async def down(url, limiter=None, **kw):
         return None
     monkeypatch.setattr(gecko, "get_json", down)
     assert await gecko.tokens_multi(["0xa"]) is None, "a failed request is None, not an empty answer"
@@ -154,7 +154,7 @@ async def test_tokens_multi_batches_addresses_into_one_request(monkeypatch):
 async def test_top_pool_treats_usdg_as_a_major_quote(monkeypatch):
     from mccapbot import gecko
 
-    async def fake_get_json(url, limiter=None):
+    async def fake_get_json(url, limiter=None, **kw):
         return {"data": [
             {"attributes": {"address": "weth", "name": "TOK / WETH", "reserve_in_usd": "20000"}},
             {"attributes": {"address": "usdg", "name": "TOK / USDG", "reserve_in_usd": "500000"}},

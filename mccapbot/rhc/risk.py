@@ -25,7 +25,13 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from .. import gecko
-from ..config import RHC_RISK_CACHE_SECONDS, RHCHAIN_NETWORK, TOP_HOLDER_WARN_PCT
+from ..config import (
+    RHC_EXPLORER,
+    RHC_GMGN_SLUG,
+    RHC_RISK_CACHE_SECONDS,
+    RHCHAIN_NETWORK,
+    TOP_HOLDER_WARN_PCT,
+)
 from ..helpers import UNKNOWN, footer, pct, plural
 from ..http import get_json
 from ..logging_setup import log
@@ -54,6 +60,9 @@ class TokenInfo:
     gt_score: Optional[float] = None
     verified: bool = False
     socials: int = 0
+    # label -> url for whatever the project published (X, Telegram, Discord,
+    # Site, ...), so a post can be clicked through instead of copied.
+    links: Dict[str, str] = field(default_factory=dict)
     categories: List[str] = field(default_factory=list)
     fetched_ts: float = 0.0
 
@@ -106,17 +115,49 @@ def _honeypot(v: Any) -> str:
 
 def _socials(a: Dict[str, Any]) -> int:
     """How many places the project can be reached: a website counts once."""
-    n = 0
+    return len(_links(a))
+
+
+# Where a handle turns into something clickable. A field already holding a URL
+# is used as it is; a bare handle gets its site's prefix.
+_LINK_SOURCES = (
+    ("X", "twitter_handle", "https://x.com/{}"),
+    ("Telegram", "telegram_handle", "https://t.me/{}"),
+    ("Discord", "discord_url", "{}"),
+    ("Farcaster", "farcaster_url", "{}"),
+    ("Zora", "zora_url", "{}"),
+)
+
+
+def _clean_handle(v: str) -> str:
+    v = v.strip().lstrip("@")
+    for prefix in ("https://x.com/", "https://twitter.com/", "https://t.me/", "http://t.me/"):
+        if v.lower().startswith(prefix):
+            v = v[len(prefix):]
+    return v.strip("/")
+
+
+def _links(a: Dict[str, Any]) -> Dict[str, str]:
+    """``{"X": "https://x.com/ponsdotfamily", "Site": "https://..."}`` — only
+    the ones the project actually published, in a fixed order so a feed post
+    and a token card list them the same way."""
+    out: Dict[str, str] = {}
+    for label, key, template in _LINK_SOURCES:
+        raw = a.get(key)
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        value = raw.strip()
+        url = value if value.lower().startswith("http") else template.format(_clean_handle(value))
+        if url.lower().startswith("http"):
+            out[label] = url
     sites = a.get("websites")
-    if isinstance(sites, list) and any(s for s in sites):
-        n += 1
-    elif isinstance(sites, str) and sites.strip():
-        n += 1
-    for key in ("discord_url", "telegram_handle", "twitter_handle", "farcaster_url", "zora_url"):
-        v = a.get(key)
-        if isinstance(v, str) and v.strip():
-            n += 1
-    return n
+    if isinstance(sites, str):
+        sites = [sites]
+    if isinstance(sites, list):
+        first = next((s.strip() for s in sites if isinstance(s, str) and s.strip().lower().startswith("http")), "")
+        if first:
+            out["Site"] = first
+    return out
 
 
 def parse_info(data: Any, now: Optional[float] = None) -> Optional[TokenInfo]:
@@ -165,6 +206,7 @@ def parse_info(data: Any, now: Optional[float] = None) -> Optional[TokenInfo]:
         gt_score=score,
         verified=bool(a.get("gt_verified") or a.get("verified") or False),
         socials=_socials(a),
+        links=_links(a),
         categories=cats,
         fetched_ts=now if now is not None else time.time(),
     )
@@ -292,7 +334,22 @@ def risk_line(info: Optional[TokenInfo]) -> str:
     return f"{prefix}Risk: {footer(*parts)}"
 
 
+def links_line(info: Optional[TokenInfo], ca: str = "", network: str = RHCHAIN_NETWORK) -> str:
+    """The token's own links plus the ones McCap can always build: its chart,
+    GMGN and the explorer. Markdown, so a post is one click from the project's
+    X account instead of a copy-paste. Empty only when there is no address."""
+    parts: List[str] = []
+    for label, url in (info.links if info is not None else {}).items():
+        parts.append(f"[{label}]({url})")
+    if ca:
+        parts.append(f"[Chart](https://www.geckoterminal.com/{network}/tokens/{ca})")
+        if RHC_GMGN_SLUG:
+            parts.append(f"[GMGN](https://gmgn.ai/{RHC_GMGN_SLUG}/token/{ca})")
+        parts.append(f"[Explorer]({RHC_EXPLORER}/token/{ca})")
+    return footer(*parts)
+
+
 __all__ = [
-    "TokenInfo", "token_info", "parse_info", "risk_line", "is_honeypot", "is_risky",
+    "TokenInfo", "token_info", "parse_info", "risk_line", "links_line", "is_honeypot", "is_risky",
     "clear_cache", "NEGATIVE_CACHE_SECONDS", "CACHE_MAX_ENTRIES", "MIN_LIMITER_TOKENS",
 ]

@@ -64,6 +64,16 @@ def cfg(**kw):
     return FeedConfig(**base)
 
 
+def candidate(kind, ca, symbol, *, buyers=10, pace=1.0, age=3600.0, liq=50_000.0):
+    """A Candidate straight from its fields, for the selector's own tests: what
+    it weighs is ``score()`` = buyers x pace, and nothing else here matters."""
+    return discovery.Candidate(
+        kind=kind, ca=ca, symbol=symbol, name=symbol.title(), pool=f"pool-{symbol}", decimals=18,
+        mc=400_000.0, mc_before=None, liq=liq, age_sec=age, buyers_m5=buyers, buys_m5=buyers, sells_m5=1,
+        vol_m5=1_000.0, vol_h1=2_000.0, pace=pace, change_m5=None, venue="Uniswap V3", quote="WETH", image_url="",
+    )
+
+
 def kinds(cands):
     return [(c.kind, c.symbol) for c in cands]
 
@@ -385,13 +395,80 @@ async def test_hourly_cap_posts_the_strongest_and_reports_capped(world):
     await feed.tick(NOW)
     assert [e.title for e in embeds(chan)] == ["📈 Volume spike · BIG", "📈 Volume spike · SPK"]
     st = feed.status(1, NOW)
-    assert st["capped"] and "capped" in st["text"] and st["posts_last_hour"] == 2
-    assert f"move:{CA3}" not in discovery.seen, "the dropped one may re-qualify next tick"
+    assert st["capped"] and "over cap" in st["text"] and st["posts_last_hour"] == 2
+    assert st["held"] == ["MOV"] and "waiting on the bar: MOV" in st["text"]
+    assert f"move:{CA3}" not in discovery.seen, "the held one may re-qualify next tick"
     await feed.tick(NOW + 60)
-    assert len(chan.sent) == 2, "the hour is full"
+    assert len(chan.sent) == 2, "past the cap a weaker find still does not clear the bar"
     await feed.tick(NOW + 3601)
     assert [e.title for e in embeds(chan)][-1] == "🚀 Mover · MOV"
     assert not feed.status(1, NOW + 3601)["capped"]
+
+
+def test_past_the_cap_only_a_stronger_find_gets_through(world):
+    """The cap is a bar, not a shutter: what the first hour posted sets the
+    price of admission, and nothing weaker than that buys its way in."""
+    c = cfg(max_per_hour=2)
+    discovery.posted.extend([
+        discovery.PostedToken(ca=CA2, symbol="A", decimals=18, ts=NOW, kind="spike", guild_id=1, score=100.0),
+        discovery.PostedToken(ca=CA3, symbol="B", decimals=18, ts=NOW, kind="spike", guild_id=1, score=200.0),
+    ])
+    weak = candidate("spike", CA4, "WEAK", buyers=10, pace=1.0)          # score 10
+    strong = candidate("spike", CA4, "STRONG", buyers=40, pace=10.0)     # score 400
+
+    picked, held = discovery.select([weak], c, NOW)
+    assert [x.symbol for x in picked] == [] and [x.symbol for x in held] == ["WEAK"]
+
+    picked, held = discovery.select([strong], c, NOW)
+    assert [x.symbol for x in picked] == ["STRONG"], "225 is the bar; 400 clears it"
+    assert held == []
+
+
+def test_an_hour_climbs_past_the_cap_one_stronger_find_at_a_time(world):
+    """Within one tick only the best find can clear the bar it sets, so a burst
+    of equally good tokens cannot all pile through at once."""
+    c = cfg(max_per_hour=2)
+    same = [candidate("spike", f"0x{i:040x}", f"T{i}", buyers=100, pace=100.0) for i in range(6)]
+    picked, held = discovery.select(same, c, NOW)
+    assert len(picked) == 2 and len(held) == 4, "nothing is stronger than itself"
+
+    discovery.posted.extend([
+        discovery.PostedToken(ca=CA2, symbol="A", decimals=18, ts=NOW, kind="spike", guild_id=1, score=100.0),
+        discovery.PostedToken(ca=CA3, symbol="B", decimals=18, ts=NOW, kind="spike", guild_id=1, score=100.0),
+    ])
+    # The hour's median is 100, so admission costs 150: a near-miss waits, a
+    # find several times better than the hour's typical post goes straight out.
+    picked, held = discovery.select([candidate("spike", CA4, "NEARLY", buyers=12, pace=10.0)], c, NOW)
+    assert picked == [] and [x.symbol for x in held] == ["NEARLY"], "120 does not clear 150"
+    picked, held = discovery.select([candidate("spike", CA4, "UP", buyers=40, pace=10.0)], c, NOW)
+    assert [x.symbol for x in picked] == ["UP"] and held == []
+
+
+def test_no_hour_can_run_past_twice_the_cap(world):
+    """However good the tape gets, the ceiling holds: a manager who asked for 2
+    an hour never wakes up to twenty."""
+    c = cfg(max_per_hour=2)
+    discovery.posted.extend([
+        discovery.PostedToken(ca=f"0x{i:040x}", symbol=f"P{i}", decimals=18, ts=NOW, kind="spike",
+                              guild_id=1, score=score)
+        for i, score in enumerate((100.0, 100.0, 400.0, 1_000.0))       # the hour already climbed to the ceiling
+    ])
+    huge = candidate("spike", CA4, "HUGE", buyers=100, pace=100.0)       # 10,000, and still not posted
+    picked, held = discovery.select([huge], c, NOW)
+    assert picked == [] and [x.symbol for x in held] == ["HUGE"]
+    assert len(discovery.hour_scores(1, NOW)) == 4 == int(c.max_per_hour * discovery.OVERFLOW_MULT)
+
+
+def test_an_empty_hour_spends_its_whole_budget_before_raising_the_bar(world):
+    c = cfg(max_per_hour=3)
+    cands = [candidate("spike", f"0x{i:040x}", f"T{i}", buyers=10 - i, pace=1.0) for i in range(3)]
+    picked, held = discovery.select(cands, c, NOW)
+    assert [x.symbol for x in picked] == ["T0", "T1", "T2"] and held == []
+
+
+def test_a_cap_of_zero_silences_the_feed_completely(world):
+    picked, held = discovery.select([candidate("spike", CA2, "ANY", buyers=99, pace=99.0)], cfg(max_per_hour=0), NOW)
+    assert picked == [] and len(held) == 1
 
 
 @pytest.mark.asyncio
