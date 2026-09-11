@@ -803,3 +803,73 @@ def test_the_tracker_takes_the_bot_first_so_it_cannot_sleep_on_it():
     assert asyncio.run(one_pass(12)) == [12]
     assert asyncio.run(one_pass(object())) == [SCAN_TRACK_INTERVAL], "a nonsense delay falls back, never spins"
 
+
+
+# ---------------- what a call records, and what votes do to the next one ----------------
+
+
+@pytest.mark.asyncio
+async def test_a_post_records_the_numbers_it_fired_on(world):
+    """Without this the record can say how a call did but never why it was
+    made, and no amount of grading tells a good threshold from a lucky one."""
+    m, chan, feed = world.market, world.chan, world.feed
+    discovery.configs[1] = cfg()
+    m.trending = [spike_pool()]
+    m.snaps[CA2] = snapshot(CA2, liq=50_000.0)
+    await feed.tick(NOW)
+    [ev] = [s for s in storage.scan_events if s.source == "feed"]
+    assert ev.signals["kind"] == "spike"
+    assert ev.signals["pace"] == pytest.approx(5.0)
+    assert ev.signals["buyers"] == 15
+    assert ev.signals["liq"] == pytest.approx(50_000.0)
+    assert ev.signals["stock"] == "no"
+    assert ev.signals["depth"] == pytest.approx(50_000.0 / 400_000.0 * 100)
+    assert ev.votes == {}
+
+
+def test_a_tokenized_share_is_recognised_by_its_suffix_not_the_word():
+    """"Robinhood Wallet" and "Robinhood Hat Strategy" are ordinary memecoins
+    that happen to be named after the company; NVDA is not."""
+    assert discovery.is_stock_token("NVIDIA • Robinhood Token")
+    assert discovery.is_stock_token("  tesla • robinhood token  ")
+    assert not discovery.is_stock_token("Robinhood Wallet")
+    assert not discovery.is_stock_token("Robinhood Hat Strategy")
+    assert not discovery.is_stock_token("")
+
+
+@pytest.mark.asyncio
+async def test_the_buttons_under_a_post_can_vote_on_that_exact_call(world):
+    m, chan, feed = world.market, world.chan, world.feed
+    discovery.configs[1] = cfg()
+    m.trending = [spike_pool()]
+    m.snaps[CA2] = snapshot(CA2, liq=50_000.0)
+    await feed.tick(NOW)
+    [ev] = [s for s in storage.scan_events if s.source == "feed"]
+    view = chan.sent[-1][1].get("view")
+    ids = [c.custom_id for c in view.children]
+    assert f"rh:vote:{ev.id}:up" in ids and f"rh:vote:{ev.id}:down" in ids
+
+
+def test_what_people_vote_down_ranks_lower_next_time(world):
+    """The whole point: a pattern the channel keeps marking down stops winning
+    the hour's budget, without anyone editing a threshold."""
+    from mccapbot import grading
+    grading.clear_cache()
+    good = candidate("spike", CA2, "GOOD", buyers=10, pace=1.0)
+    bad = candidate("mover", CA3, "BAD", buyers=10, pace=1.0)
+    assert good.score() == bad.score(), "identical on the rules alone"
+    assert discovery.strength(good) == pytest.approx(discovery.strength(bad)), "and identical with nothing learned"
+
+    n = grading.FEED_LEARN_MIN_SAMPLES
+    for _ in range(n):
+        storage.scan_events.append(discovery.ScanEvent(
+            ca=CA4, guild_id=1, channel_id=99, scanner_id=0, name="X", symbol="X", mc_at_scan=1e6,
+            ts=NOW - 7200, peak_mc=1e6, last_mc=1e6, source="feed", kind="mover",
+            signals={"kind": "mover"}, votes={"u1": -1, "u2": -1, "u3": -1},
+        ))
+    grading.clear_cache()
+    grading.table(storage.scan_events, force=True)
+    assert discovery.strength(bad) < discovery.strength(good)
+    picked, held = discovery.select([good, bad], cfg(max_per_hour=1), NOW)
+    assert [c.symbol for c in picked] == ["GOOD"] and [c.symbol for c in held] == ["BAD"]
+    grading.clear_cache()

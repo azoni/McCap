@@ -410,7 +410,43 @@ class NavButton(discord.ui.DynamicItem[discord.ui.Button],
         await _safe(inter, body, self.custom_id)
 
 
-DYNAMIC_ITEMS = (SellPctButton, SellMineButton, BuyUsdButton, BuyCustomButton, TpSlButton, TokenPickSelect, NavButton)
+class FeedVoteButton(discord.ui.DynamicItem[discord.ui.Button],
+                     template=r"rh:vote:(?P<eid>[0-9a-f]{6}):(?P<dir>up|down)"):
+    """👍 / 👎 under a feed post: was this call worth making?
+
+    Anyone may press it, and pressing the same side twice takes the vote back.
+    It is the one thing the tracker cannot measure for itself — a tokenized
+    stock drifting 2% and a rug that has not dumped yet both look fine on
+    price — so this is deliberately cheap to give and cheap to change.
+    """
+
+    def __init__(self, eid: str, direction: str, count: int = 0):
+        self.eid, self.direction, self.count = eid, direction, max(0, int(count))
+        up = direction == "up"
+        super().__init__(discord.ui.Button(
+            label=f"{'👍' if up else '👎'}{f' {self.count}' if self.count else ''}",
+            style=discord.ButtonStyle.success if up else discord.ButtonStyle.secondary,
+            custom_id=f"rh:vote:{eid}:{direction}", row=1,
+        ))
+
+    @classmethod
+    async def from_custom_id(cls, inter: discord.Interaction, item: discord.ui.Button, match: re.Match, /):
+        return cls(match["eid"], match["dir"])
+
+    async def callback(self, inter: discord.Interaction) -> None:
+        await _safe(inter, lambda: _vote_flow(inter, self.eid, self.direction), self.custom_id)
+
+
+async def _vote_flow(inter: discord.Interaction, eid: str, direction: str) -> None:
+    cog = _cog(inter)
+    if cog is None:
+        await _private(inter, NOT_LOADED_TEXT)
+        return
+    await cog.button_feed_vote(inter, eid, direction)
+
+
+DYNAMIC_ITEMS = (SellPctButton, SellMineButton, BuyUsdButton, BuyCustomButton, TpSlButton, TokenPickSelect,
+                 NavButton, FeedVoteButton)
 
 
 # ---------------- modals ----------------
@@ -629,6 +665,23 @@ def size_card(token: str) -> discord.ui.View:
     token = _require_token(token)
     items: List[discord.ui.Item] = [BuyUsdButton(token, _cents(s)) for s in _ladder()]
     items.append(BuyCustomButton(token))
+    return _view(*items)
+
+
+@_factory
+def feed_row(token: str, eid: str, ups: int = 0, downs: int = 0, *, trade: bool = True) -> discord.ui.View:
+    """Under a feed post: the alert buttons, and under them the two votes.
+
+    The tally lives in the labels, so the vote is visible to the channel rather
+    than a private thing each person does — which is the point: the second
+    person to look should be able to see that somebody already called it.
+    """
+    token = _require_token(token)
+    items: List[discord.ui.Item] = []
+    if trade:
+        items += [BuyUsdButton(token, _cents(s)) for s in _ladder()[:2]]
+        items += [SellMineButton(token, 50), SellMineButton(token, 100)]
+    items += [FeedVoteButton(eid, "up", ups), FeedVoteButton(eid, "down", downs)]
     return _view(*items)
 
 

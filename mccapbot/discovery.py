@@ -41,11 +41,11 @@ from typing import Any, Awaitable, Callable, Deque, Dict, Iterable, List, Option
 
 import discord
 
-from . import alerts, chart, gecko, rhchain, storage
+from . import alerts, chart, gecko, grading, rhchain, storage
 from .config import FEED_ENABLE, FEED_MAX_PENDING, MAX_SCAN_EVENTS, RHC_DEX_CHAIN_ID, RHCHAIN_NETWORK, RHCHAIN_NEW_PAGES
 from .helpers import SEP, UNKNOWN, age, colour_for, footer, is_evm_address, mult, pct, plural, usd
 from .logging_setup import log
-from .models import ScanEvent, TokenSnapshot
+from .models import ScanEvent, TokenSnapshot, new_id
 from .rhchain import CHAIN_MAJORS, Pool, TokenActivity, aggregate
 
 TICK_SECONDS = 60
@@ -121,6 +121,39 @@ class Candidate:
 
     def score(self) -> float:
         return self.buyers_m5 * max(1.0, self.pace or 1.0)
+
+    def signals(self, info=None) -> Dict[str, Any]:
+        """The numbers this call is being made on, frozen for the record.
+
+        Without these the feed can say how a call did but never why it was
+        made, which is the difference between a scoreboard and something that
+        can tell a good threshold from a lucky one. ``stock`` is here because a
+        tokenized equity tracks a share price and cannot behave like a
+        memecoin — rather than hard-coding that, let it be learned.
+        """
+        out: Dict[str, Any] = {
+            "kind": self.kind,
+            "venue": self.venue,
+            "stock": "yes" if is_stock_token(self.name) else "no",
+            "buyers": self.buyers_m5,
+            "liq": self.liq,
+            "age_h": round(self.age_sec / 3600.0, 3) if self.age_sec else 0.0,
+        }
+        if self.mc:
+            out["mc"] = self.mc
+            if self.liq:
+                out["depth"] = self.liq / self.mc * 100.0
+        if self.pace:
+            out["pace"] = self.pace
+        traders = self.buyers_m5 + max(0, self.sells_m5)
+        if traders:
+            out["buyer_share"] = self.buyers_m5 / traders * 100.0
+        if info is not None:
+            if getattr(info, "holders", None):
+                out["holders"] = float(info.holders)
+            if getattr(info, "top10_pct", None) is not None:
+                out["top10"] = float(info.top10_pct)
+        return out
 
     def seen_key(self) -> str:
         return f"new:{self.pool}" if self.kind == "new_pair" else f"{'spike' if self.kind == 'spike' else 'move'}:{self.ca}"
@@ -387,11 +420,18 @@ def evaluate(
     return out
 
 
+def strength(cand: Candidate) -> float:
+    """How strong a find is: the rule's own score, weighted by how calls that
+    looked like it have actually gone. With nothing learned yet the weight is
+    exactly 1.0, so this is the score it always was."""
+    return cand.score() * grading.weight(cand.signals(), grading.table(storage.scan_events))
+
+
 def rank(cands: List[Candidate], room: int) -> List[Candidate]:
-    """Strongest first (score, then youngest), at most ``room``."""
+    """Strongest first (strength, then youngest), at most ``room``."""
     if room <= 0:
         return []
-    return sorted(cands, key=lambda c: (-c.score(), c.age_sec))[:room]
+    return sorted(cands, key=lambda c: (-strength(c), c.age_sec))[:room]
 
 
 def select(cands: List[Candidate], cfg: FeedConfig,
@@ -414,12 +454,13 @@ def select(cands: List[Candidate], cfg: FeedConfig,
     scores = hour_scores(cfg.guild_id, now)
     picked: List[Candidate] = []
     held: List[Candidate] = []
-    for cand in sorted(cands, key=lambda c: (-c.score(), c.age_sec)):
+    for cand in sorted(cands, key=lambda c: (-strength(c), c.age_sec)):
+        mark = strength(cand)
         bar = statistics.median(scores) * OVERFLOW_BAR if scores else 0.0
-        room = len(scores) < budget or (len(scores) < ceiling and cand.score() >= bar)
+        room = len(scores) < budget or (len(scores) < ceiling and mark >= bar)
         (picked if room else held).append(cand)
         if room:
-            scores.append(cand.score())
+            scores.append(mark)
     return picked, held
 
 
@@ -436,6 +477,17 @@ def qualifies(cfg: FeedConfig, cand: Candidate, now: float) -> bool:
 
 
 # ---------------- the poller ----------------
+
+# Robinhood's own tokenized equities are named "NVIDIA • Robinhood Token".
+# The suffix is the test, not the word: "Robinhood Wallet" and "Robinhood Hat
+# Strategy" are ordinary memecoins that happen to be named after the company.
+STOCK_SUFFIX = "robinhood token"
+
+
+def is_stock_token(name: str) -> bool:
+    """A tokenized share rather than something that trades like a memecoin."""
+    return (name or "").strip().lower().endswith(STOCK_SUFFIX)
+
 
 def _ago(seconds: float) -> str:
     """23s under a minute, then the board's 4m / 2h / 3d."""
@@ -532,6 +584,31 @@ async def build_embed(cand: Candidate, snap: Optional[TokenSnapshot],
         "most new pairs are dust: check the sell-back line before buying",
     ))
     return embed
+
+
+def tradeable(ca: str, snap: Optional[TokenSnapshot]) -> bool:
+    """Whether the trade buttons belong under this token — the same gate
+    ``trade_view`` applies, named so the vote handler can ask it later without
+    having to keep the snapshot around."""
+    return (snap is not None and getattr(snap, "chain", "") == RHC_DEX_CHAIN_ID
+            and is_evm_address(ca))
+
+
+def feed_view(ca: str, eid: str, ups: int = 0, downs: int = 0,
+              *, trade: bool = True) -> Optional[discord.ui.View]:
+    """The buttons under a feed post: the trade row when the token is one McCap
+    can trade, and the two votes either way. One builder for the first post and
+    for every redraw after a vote, so a tally can never drift from the row it
+    sits under."""
+    try:
+        from . import views
+        maker = getattr(views, "feed_row", None)
+        if maker is None:
+            return None
+        return maker(ca, eid, ups, downs, trade=bool(trade))
+    except Exception:
+        log.exception("Could not build the feed's button row for %s", ca)
+        return None
 
 
 def trade_view(ca: str, snap: Optional[TokenSnapshot]) -> Optional[discord.ui.View]:
@@ -640,7 +717,7 @@ class Feed:
                     seen[cand.seen_key()] = now
                     posted.append(PostedToken(ca=cand.ca, symbol=cand.symbol, decimals=cand.decimals,
                                               ts=now, kind=cand.kind, guild_id=cfg.guild_id,
-                                              score=cand.score()))
+                                              score=strength(cand)))
                     pending.pop(cand.ca, None)
                 await save_feed()
                 dirty = False
@@ -676,9 +753,11 @@ class Feed:
         if cand.ca in pending:
             return False
         if len(pending) >= FEED_MAX_PENDING:
-            weakest = min(pending.values(), key=lambda p: (p.candidate().score() if p.candidate() else 0.0))
-            weakest_score = weakest.candidate().score() if weakest.candidate() else 0.0
-            if cand.score() <= weakest_score:
+            def mark(p) -> float:
+                got = p.candidate()
+                return strength(got) if got else 0.0
+            weakest = min(pending.values(), key=mark)
+            if strength(cand) <= mark(weakest):
                 return False
             del pending[weakest.ca]
         pending[cand.ca] = PendingNew(
@@ -782,6 +861,10 @@ class Feed:
 
     async def _post(self, cfg: FeedConfig, cand: Candidate, snap: TokenSnapshot, now: float) -> None:
         cand = replace(cand, guild_id=cfg.guild_id, channel_id=cfg.channel_id)
+        # The record's id is minted before the message so the vote buttons can
+        # name the call they belong to. Two servers getting the same token get
+        # two records and two tallies: they are two different calls.
+        eid = new_id()
         try:
             # Two GeckoTerminal reads, cached ten minutes, for the two things a
             # listing row cannot say: how far under its own high this is, and
@@ -789,7 +872,7 @@ class Feed:
             highs = await rhchain.price_highs(cand.ca) if cfg.charts else None
             embed = await build_embed(cand, snap, highs)
             png = await asyncio.to_thread(chart_png, cand, highs) if cfg.charts else None
-            view = trade_view(cand.ca, snap)
+            view = feed_view(cand.ca, eid, trade=tradeable(cand.ca, snap))
             ch = await self.bot.fetch_channel(cfg.channel_id)
             kw: Dict[str, Any] = {"embed": embed}
             if png:
@@ -806,12 +889,19 @@ class Feed:
                         cfg.channel_id, cfg.guild_id, type(e).__name__, e)
             return
         self._unreachable.pop(cfg.guild_id, None)
+        info = None
+        try:
+            from .rhc import risk  # type: ignore
+            info = await risk.token_info(cand.ca)          # the cached read the risk line just made
+        except Exception:
+            log.debug("No holder data for the record of %s", cand.ca, exc_info=True)
         ev = ScanEvent(
+            id=eid,
             ca=cand.ca, guild_id=cfg.guild_id, channel_id=cfg.channel_id, scanner_id=0,
             name=cand.name, symbol=cand.symbol, mc_at_scan=snap.mc,
             message_id=int(getattr(msg, "id", 0) or 0), ts=now,
             last_mc=snap.mc, peak_mc=snap.mc, peak_ts=now, last_checked_ts=now,
-            source="feed", kind=cand.kind,
+            source="feed", kind=cand.kind, signals=cand.signals(info),
         )
         storage.scan_events.insert(0, ev)
         del storage.scan_events[MAX_SCAN_EVENTS:]

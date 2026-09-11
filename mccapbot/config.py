@@ -290,3 +290,13 @@ RHC_GMGN_SLUG = os.getenv("RHC_GMGN_SLUG", "robinhood").strip().strip("/")
 RHC_AUTO_PROTECT_DEFAULT = os.getenv("RHC_AUTO_PROTECT_DEFAULT", "tp=2x:50,sl=-30%:100")
 # Momentum-triggered buy rules with a window under 15 minutes poll fast; cap how many.
 RHC_AUTO_MAX_FAST = _env_int("RHC_AUTO_MAX_FAST", 5)
+
+# ---- Learning from the feed's own calls (mccapbot/grading.py) ----
+# The feed grades every call it makes and lets people vote on it, then lets
+# that evidence reorder its queue. Bounded on purpose: a bucket needs
+# MIN_SAMPLES calls before it counts at all, and MAX_WEIGHT caps how far
+# evidence can move a candidate either way, so this changes what gets posted
+# first and never what is safe to trade.
+FEED_LEARN_ENABLE = _env_flag("FEED_LEARN_ENABLE", True)
+FEED_LEARN_MIN_SAMPLES = _env_int("FEED_LEARN_MIN_SAMPLES", 8)
+FEED_LEARN_MAX_WEIGHT = max(1.0, float(os.getenv("FEED_LEARN_MAX_WEIGHT", "2") or 2))

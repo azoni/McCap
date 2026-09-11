@@ -155,3 +155,91 @@ async def test_new_board_filters_on_buyers_and_marks_non_major_quotes(feed_state
     table = embed.fields[0].value
     assert "HOT (NVDA)" in table and "DUST" not in table and "Buyers 5m" in table
     assert "≥ 5 buyers" in embed.description
+
+
+# ---------------- voting on a call, and what /rh feed grade shows ----------------
+
+
+def a_call(eid="a1b2c3", **kw):
+    from mccapbot.models import ScanEvent
+    base = dict(ca=PONS, guild_id=1, channel_id=2, scanner_id=0, name="Pons", symbol="PONS",
+                mc_at_scan=1_000_000.0, source="feed", kind="spike", signals={"kind": "spike"})
+    base.update(kw)
+    return ScanEvent(id=eid, **base)
+
+
+async def vote(inter, eid, direction):
+    await cog.RhcCog.button_feed_vote(cog.RhcCog(bot=None), inter, eid, direction)
+
+
+@pytest.mark.asyncio
+async def test_a_vote_is_recorded_against_the_call_and_saved(feed_state, monkeypatch):
+    from mccapbot import storage
+    saved = []
+    monkeypatch.setattr(storage, "save_scans", lambda: saved.append(1) or _done())
+    ev = a_call()
+    storage.scan_events.insert(0, ev)
+    try:
+        inter = Manager()
+        await vote(inter, "a1b2c3", "up")
+        assert ev.votes == {str(USER): 1} and ev.ups() == 1
+        assert saved, "a vote that only lives in a button label is one McCap cannot learn from"
+        # Redrawn on the message, not answered privately: the next person to
+        # look at the post should be able to see that somebody already called it.
+        [edit] = inter.response.edited
+        labels = [c.item.label for c in edit["view"].children if hasattr(c, "direction")]
+        assert labels == ["👍 1", "👎"]
+    finally:
+        storage.scan_events.remove(ev)
+
+
+@pytest.mark.asyncio
+async def test_pressing_the_same_side_again_takes_the_vote_back(feed_state, monkeypatch):
+    from mccapbot import storage
+    monkeypatch.setattr(storage, "save_scans", lambda: _done())
+    ev = a_call()
+    storage.scan_events.insert(0, ev)
+    try:
+        await vote(Manager(), "a1b2c3", "up")
+        await vote(Manager(), "a1b2c3", "up")
+        assert ev.votes == {} and ev.vote_score() == 0
+        await vote(Manager(), "a1b2c3", "up")
+        await vote(Manager(), "a1b2c3", "down")
+        assert ev.votes == {str(USER): -1}, "changing your mind replaces, it does not stack"
+    finally:
+        storage.scan_events.remove(ev)
+
+
+@pytest.mark.asyncio
+async def test_one_person_gets_one_vote(feed_state, monkeypatch):
+    from mccapbot import storage
+    monkeypatch.setattr(storage, "save_scans", lambda: _done())
+    ev = a_call()
+    storage.scan_events.insert(0, ev)
+    try:
+        for uid in (USER, USER + 1, USER + 2):
+            await vote(Manager(user_id=uid), "a1b2c3", "up")
+        await vote(Manager(user_id=USER), "a1b2c3", "up")     # and again
+        assert ev.ups() == 2 and ev.vote_score() == 2
+    finally:
+        storage.scan_events.remove(ev)
+
+
+@pytest.mark.asyncio
+async def test_voting_on_a_call_that_has_aged_out_says_so_rather_than_failing(feed_state):
+    inter = Manager()
+    await vote(inter, "ffffff", "up")
+    assert "aged out" in inter.last
+
+
+@pytest.mark.asyncio
+async def test_feed_grade_reports_without_a_feed_configured(feed_state):
+    inter = Manager()
+    await cog.RhcCog.feed_grade.callback(cog.RhcCog(bot=None), inter, public=False)
+    assert inter.last and "call" in inter.last.lower()
+
+
+def _done():
+    async def noop():
+        return None
+    return noop()

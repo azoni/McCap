@@ -51,6 +51,7 @@ from ..helpers import (
     eth_str,
     fit_lines,
     footer,
+    is_evm_address,
     is_manager,
     mult,
     pct,
@@ -1263,6 +1264,47 @@ class RhcCog(commands.Cog):
         # feed task never started still gets the settings and the grading.
         engine = getattr(self.bot, "feed", None) or discovery.Feed(self.bot)
         await inter.response.send_message(engine.status(inter.guild_id)["text"])
+
+    @feed.command(name="grade", description="What McCap has learned from its own calls and your votes")
+    @app_commands.describe(public="Show it to the channel")
+    async def feed_grade(self, inter: discord.Interaction, public: bool = False):
+        from .. import grading
+        priv = PRIVATE or not public
+        lines = grading.report(storage.scan_events)
+        await inter.response.send_message(fit_lines(lines, 1900), ephemeral=priv, suppress_embeds=True)
+
+    async def button_feed_vote(self, inter: discord.Interaction, eid: str, direction: str) -> None:
+        """👍 / 👎 on one feed call. Pressing the same side again takes it back.
+
+        The tally is redrawn on the message itself rather than answered
+        privately: the point of a vote is that the next person to look sees it.
+        Saved before the redraw, because a vote that only exists in a button
+        label is a vote McCap cannot learn from."""
+        from .. import discovery, grading
+        ev = next((s for s in storage.scan_events if s.id == eid), None)
+        if ev is None:
+            await inter.response.send_message(
+                "That call has aged out of the record, so there is nothing left to vote on.", ephemeral=True)
+            return
+        uid, want = str(inter.user.id), (1 if direction == "up" else -1)
+        if ev.votes.get(uid) == want:
+            ev.votes.pop(uid, None)
+        else:
+            ev.votes[uid] = want
+        try:
+            await storage.save_scans()
+        except Exception:
+            log.exception("Could not save a feed vote on %s", eid)
+        grading.clear_cache()          # the next tick ranks on this vote, not a minute-old table
+        # The feed only ever posts chain tokens, and a stale row is worse than a
+        # button that refuses at click time — the trade path re-checks anyway.
+        view = discovery.feed_view(ev.ca, eid, ev.ups(), ev.downs(), trade=is_evm_address(ev.ca))
+        try:
+            await inter.response.edit_message(view=view)
+        except Exception:
+            log.exception("Could not redraw the vote row on %s", eid)
+            await inter.response.send_message(
+                f"Counted: 👍 {ev.ups()} / 👎 {ev.downs()} on **{ev.symbol}**.", ephemeral=True)
 
     @feed.command(name="mute", description="Stop the feed posting one token for a while (server managers)")
     @app_commands.describe(token="Contract address or a symbol the feed has posted", for_="How long (default 1d)")

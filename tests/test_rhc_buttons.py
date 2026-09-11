@@ -88,6 +88,10 @@ class FakeCog:
         self.calls.append(("modal_buy", inter.response.is_done(), token, usd_text, eth_text))
         await inter.followup.send("quote", ephemeral=True)
 
+    async def button_feed_vote(self, inter, eid, direction):
+        self.calls.append(("button_feed_vote", (eid, direction)))
+        await inter.response.send_message("counted", ephemeral=True)
+
     async def modal_tpsl(self, inter, uid, token, tp_at, tp_pct, sl_at, sl_pct):
         self.calls.append(("modal_tpsl", inter.response.is_done(), uid, token, tp_at, tp_pct, sl_at, sl_pct))
         await inter.followup.send("armed?", ephemeral=True)
@@ -146,6 +150,7 @@ GOOD_IDS = {
     views.TpSlButton: f"rh:tpsl:{USER}:{PONS}",
     views.TokenPickSelect: "rh:pick:trending",
     views.NavButton: "rh:nav:wallet_create",
+    views.FeedVoteButton: "rh:vote:a1b2c3:up",
 }
 
 BAD_IDS = [
@@ -162,6 +167,9 @@ BAD_IDS = [
     "rh:nav:wallet_delete",
     f"rh:sell:{USER}:{PONS}:25:extra",      # trailing junk
     f" rh:sell:{USER}:{PONS}:25",           # leading junk
+    "rh:vote:a1b2c3:sideways",              # not a direction
+    "rh:vote:NOTHEX:up",                    # event ids are hex
+    "rh:vote:a1b2c3d:up",                   # seven characters, not six
 ]
 
 
@@ -665,3 +673,46 @@ def test_views_module_imports_stay_web3_free():
         assert not any(banned in m for m in modules), (banned, modules)
     assert modules <= {"re", "time", "typing", "discord", "config", "helpers", "logging_setup"} | {
         m for m in modules if m.startswith(("typing.", "config.", "helpers.", "logging_setup."))}
+
+
+# ---------------- voting on a call ----------------
+
+
+@pytest.mark.asyncio
+async def test_a_vote_reaches_the_cog_with_the_call_it_belongs_to():
+    cog = FakeCog()
+    item = await build(views.FeedVoteButton, "rh:vote:a1b2c3:down")
+    inter = click(cog)
+    await item.callback(inter)
+    assert cog.calls == [("button_feed_vote", ("a1b2c3", "down"))]
+
+
+def test_the_vote_row_carries_its_tally_in_the_labels():
+    """The point of a vote is that the next person to look can see it."""
+    v = views.feed_row(PONS, "a1b2c3", 3, 1)
+    votes = [c for c in v.children if isinstance(c, views.FeedVoteButton)]
+    assert [c.item.label for c in votes] == ["👍 3", "👎 1"]
+    assert all(c.item.row == 1 for c in votes), "votes sit under the trade row, not in it"
+    assert [c.custom_id for c in votes] == ["rh:vote:a1b2c3:up", "rh:vote:a1b2c3:down"]
+
+
+def test_an_unvoted_call_shows_bare_thumbs():
+    v = views.feed_row(PONS, "a1b2c3")
+    assert [c.item.label for c in v.children if isinstance(c, views.FeedVoteButton)] == ["👍", "👎"]
+
+
+def test_a_token_mccap_cannot_trade_still_gets_its_votes():
+    """Whether a call was worth posting is a separate question from whether
+    this particular wallet can act on it."""
+    v = views.feed_row(PONS, "a1b2c3", trade=False)
+    kinds = [type(c).__name__ for c in v.children]
+    assert kinds == ["FeedVoteButton", "FeedVoteButton"]
+
+
+def test_the_vote_row_fits_discords_five_per_row_limit():
+    v = views.feed_row(PONS, "a1b2c3", 12, 34)
+    rows = {}
+    for c in v.children:
+        rows.setdefault(c.item.row, []).append(c)
+    assert all(len(items) <= 5 for items in rows.values()), rows
+    assert all(len(c.item.label) <= 80 for c in v.children)

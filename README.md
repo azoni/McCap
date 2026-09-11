@@ -91,6 +91,7 @@ what you are actively trading here.
 | `/rh new [count] [min_liquidity] [min_buyers]` | Brand-new pairs, newest first, with age, liquidity, distinct buyers in the last 5 minutes and market cap. Defaults hide pools under $5K of liquidity or 5 buyers; a symbol in brackets is a non-major quote token. |
 | `/rh feed on [channel] [new_pairs] [spikes] [movers] [min_liquidity] [min_buyers] [pace] [move_pct] [max_per_hour] [charts]` | Server managers: post new pairs (after a second look a minute later), 5-minute volume spikes and 5-minute movers to one channel, strongest first, each with the trade buttons, a line of the project's own links and — unless `charts` is off — how far the token is below its recent high plus the price line behind it. |
 | `/rh feed off` · `/rh feed status` · `/rh feed mute <token> [for]` | Stop it; see what it posted and how those calls did (median peak, 2x count); silence one token for a while. |
+| `/rh feed grade [public]` | What McCap has learned from its own calls and your votes: which patterns it is scoring up, which it is marking down, how many calls are behind each, and what it is still waiting for more of. |
 | `/rh tutorial [topic] [public]` | How it all works, with a personal checklist (allowlist, wallet, funded, first trade) and buttons for the next step. Topics: getting started, buying, selling, buttons, auto-orders, safety. |
 | `/rh auto sell <token> <percent> <at> [anchor] [expires] [slippage_bps] [private]` | Take-profit or stop-loss: sell a percentage when the market cap reaches `2x`, `-30%` or `500k`, or `trail 20%` for a stop that rises with the price (ratchets only after two agreeing reads, never falls). Confirmed once, fires once without asking again. |
 | `/rh auto buy <token> <usd> <condition> <value> [expires] [slippage_bps] [private]` | One-shot buy when the market cap is at or below / above a level, or the 1h volume is at or above one. Same caps and honeypot check as `/rh buy`, run again when it fires. |
@@ -103,6 +104,27 @@ quiet — it gets picky: a find has to beat the median strength of what the hour
 already carried by half again, and an hour still cannot run past twice the cap.
 Nothing turned away is dropped; it is simply not the best thing on the tape, and
 the next tick weighs it again. `/rh feed status` names what is waiting on the bar.
+
+**Votes, and what McCap does with them.** Every feed post carries **👍 / 👎**.
+Anyone may press one; pressing the same side again takes it back, and the tally
+sits in the button labels so the next person to look sees that somebody already
+called it. Each post also records the numbers it fired on — pace, buyers,
+liquidity, depth, holders, whether the token is a tokenized share — so the
+record can say not just how a call did but *why it was made*.
+
+`mccapbot/grading.py` turns those two things into a verdict per pattern
+("`kind mover` x0.50 over 14 calls", "`pace over 10x` x1.23 over 16"), and that
+verdict reorders the feed's queue. A vote outweighs the price on purpose: price
+says whether a token went up, a person says whether it was a call worth making,
+and a tokenized stock drifting 2% or a rug that has not dumped yet both look
+fine on price alone. Three limits keep it honest — a pattern needs
+`FEED_LEARN_MIN_SAMPLES` (8) calls before it counts at all, the multiplier is
+clamped to `FEED_LEARN_MAX_WEIGHT` (2x) either way, and a pattern with too
+little evidence counts as neutral rather than dropping out of the average,
+which would quietly turn "we don't know yet" into a bonus. **It reorders what
+gets posted first and never what is safe to trade** — every guard in
+`rhc/trade.py` is untouched by it. `/rh feed grade` prints the whole table, and
+`FEED_LEARN_ENABLE=0` switches the influence off while still collecting.
 
 **Buttons.** Every buy receipt carries **Sell 25% / Sell 50% / Sell all / TP · SL**;
 `/rh trending` and `/rh new` carry a token picker — each option labelled with how

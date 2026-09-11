@@ -1,7 +1,7 @@
 import secrets
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Dict, Optional
 
 
 def new_id() -> str:
@@ -200,6 +200,15 @@ class ScanEvent:
     # discovery feed; and for the feed, which rule fired (new_pair | spike | mover).
     source: str = ""
     kind: str = ""
+    # --- what the call was made on, and what people made of it ---
+    # ``signals`` is the numbers the rule fired on, frozen at post time. Without
+    # it the record can say how a call did but never why it was made, so no
+    # amount of grading could tell a good threshold from a lucky one.
+    signals: Dict[str, float] = field(default_factory=dict)
+    # user_id (as a string, because JSON) -> +1 or -1. A person sees things the
+    # price does not: a rug that has not dumped yet, or a token that should
+    # never have been posted at all.
+    votes: Dict[str, int] = field(default_factory=dict)
 
     def multiple(self) -> Optional[float]:
         """Peak gain as a multiple of the scan price (2.0 == a 2x)."""
@@ -211,6 +220,15 @@ class ScanEvent:
         if not self.mc_at_scan or self.mc_at_scan <= 0 or self.last_mc is None:
             return None
         return self.last_mc / self.mc_at_scan
+
+    def ups(self) -> int:
+        return sum(1 for v in self.votes.values() if v > 0)
+
+    def downs(self) -> int:
+        return sum(1 for v in self.votes.values() if v < 0)
+
+    def vote_score(self) -> int:
+        return self.ups() - self.downs()
 
 
 @dataclass
