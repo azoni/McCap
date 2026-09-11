@@ -91,6 +91,7 @@ what you are actively trading here.
 | `/rh new [count] [min_liquidity] [min_buyers]` | Brand-new pairs, newest first, with age, liquidity, distinct buyers in the last 5 minutes and market cap. Defaults hide pools under $5K of liquidity or 5 buyers; a symbol in brackets is a non-major quote token. |
 | `/rh feed on [channel] [new_pairs] [spikes] [movers] [min_liquidity] [min_buyers] [pace] [move_pct] [max_per_hour] [charts]` | Server managers: post new pairs (after a second look a minute later), 5-minute volume spikes and 5-minute movers to one channel, strongest first, each with the trade buttons, a line of the project's own links and — unless `charts` is off — how far the token is below its recent high plus the price line behind it. |
 | `/rh feed off` · `/rh feed status` · `/rh feed mute <token> [for]` | Stop it; see what it posted and how those calls did (median peak, 2x count); silence one token for a while. |
+| `/rh feed share [channel]` | Server managers: where the **📤 Share** button posts. Leave the channel empty to switch Share off. Works without a feed running. |
 | `/rh feed grade [public]` | What McCap has learned from its own calls and your votes: which patterns it is scoring up, which it is marking down, how many calls are behind each, and what it is still waiting for more of. |
 | `/rh tutorial [topic] [public]` | How it all works, with a personal checklist (allowlist, wallet, funded, first trade) and buttons for the next step. Topics: getting started, buying, selling, buttons, auto-orders, safety. |
 | `/rh auto sell <token> <percent> <at> [anchor] [expires] [slippage_bps] [private]` | Take-profit or stop-loss: sell a percentage when the market cap reaches `2x`, `-30%` or `500k`, or `trail 20%` for a stop that rises with the price (ratchets only after two agreeing reads, never falls). Confirmed once, fires once without asking again. |
@@ -125,6 +126,14 @@ which would quietly turn "we don't know yet" into a bonus. **It reorders what
 gets posted first and never what is safe to trade** — every guard in
 `rhc/trade.py` is untouched by it. `/rh feed grade` prints the whole table, and
 `FEED_LEARN_ENABLE=0` switches the influence off while still collecting.
+
+**📤 Share.** Feed posts and Robinhood Chain alerts carry a Share button that
+drops the contract address into the channel set by `/rh feed share`, so the
+token bot living there (Rick and friends) picks it up and posts its own card.
+The message is the address **on its own** — no symbol, no backticks, no "shared
+by" — because anything wrapped around it is what stops those bots triggering;
+who pressed it goes in the private reply instead. The same token will not be
+repeated into the channel within five minutes however many people press it.
 
 **Buttons.** Every buy receipt carries **Sell 25% / Sell 50% / Sell all / TP · SL**;
 `/rh trending` and `/rh new` carry a token picker — each option labelled with how

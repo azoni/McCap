@@ -91,6 +91,10 @@ class FeedConfig:
     move_pct: float = 25.0
     max_per_hour: int = 10
     charts: bool = True                                     # the price line and the off-high figure
+    # Where the 📤 Share button drops a bare contract address, for whatever
+    # token bot lives in that channel. 0 means nobody has chosen one, and the
+    # button says so rather than guessing at a channel.
+    share_channel_id: int = 0
     muted: Dict[str, float] = field(default_factory=dict)   # ca -> until_ts
 
     def is_muted(self, ca: str, now: float) -> bool:
@@ -229,12 +233,14 @@ def config_for(guild_id: int) -> Optional[FeedConfig]:
 
 
 def set_config(cfg: FeedConfig) -> FeedConfig:
-    """Install a server's feed settings, keeping whatever it had muted: the
-    manager re-running ``/rh feed on`` to change a threshold is not asking to
-    un-mute the tokens they silenced."""
+    """Install a server's feed settings, keeping the parts ``/rh feed on`` does
+    not ask about: a manager re-running it to change a threshold is not asking
+    to un-mute the tokens they silenced, or to forget where Share posts."""
     old = configs.get(int(cfg.guild_id))
     if old is not None and old.muted and not cfg.muted:
         cfg.muted = dict(old.muted)
+    if old is not None and old.share_channel_id and not cfg.share_channel_id:
+        cfg.share_channel_id = int(old.share_channel_id)
     configs[int(cfg.guild_id)] = cfg
     return cfg
 

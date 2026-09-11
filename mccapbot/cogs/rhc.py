@@ -16,7 +16,7 @@ import asyncio
 import io
 import os
 import time
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import discord
 from discord import app_commands
@@ -145,6 +145,14 @@ def deny_reason(user_id: int, guild_id: Optional[int]) -> Optional[Tuple[str, st
     if reason:
         return "gate", reason
     return None
+
+
+# The Share button drops a bare address into a channel other people read, so
+# the same token is not repeated within this window however many times the
+# button is pressed. In memory on purpose: a redeploy forgetting is harmless.
+SHARE_COOLDOWN = 300
+SHARE_MEMORY = 500
+_shared_recently: Dict[Tuple[int, str], float] = {}
 
 
 class RhcCog(commands.Cog):
@@ -1265,6 +1273,30 @@ class RhcCog(commands.Cog):
         engine = getattr(self.bot, "feed", None) or discovery.Feed(self.bot)
         await inter.response.send_message(engine.status(inter.guild_id)["text"])
 
+    @feed.command(name="share", description="Where the Share button posts a contract address (server managers)")
+    @app_commands.describe(channel="Channel to post into; leave empty to turn Share off")
+    async def feed_share(self, inter: discord.Interaction, channel: Optional[discord.TextChannel] = None):
+        from .. import discovery
+        if await self._deny_manager(inter):
+            return
+        if inter.guild_id is None:
+            await inter.response.send_message("This is a server setting; run it in the server.", ephemeral=True)
+            return
+        cfg = discovery.config_for(inter.guild_id)
+        if cfg is None:
+            # A server can want the Share button without running a feed, so this
+            # writes a config that is off rather than refusing.
+            cfg = discovery.FeedConfig(guild_id=inter.guild_id, channel_id=inter.channel_id, enabled=False)
+            discovery.set_config(cfg)
+        cfg.share_channel_id = int(channel.id) if channel is not None else 0
+        await discovery.save_feed()
+        if not cfg.share_channel_id:
+            await inter.response.send_message("📤 Share is off. `/rh feed share #channel` turns it back on.")
+            return
+        await inter.response.send_message(
+            f"📤 Share → <#{cfg.share_channel_id}>\nThe button posts the contract address on its own, "
+            f"so whatever token bot lives there picks it up.")
+
     @feed.command(name="grade", description="What McCap has learned from its own calls and your votes")
     @app_commands.describe(public="Show it to the channel")
     async def feed_grade(self, inter: discord.Interaction, public: bool = False):
@@ -1272,6 +1304,58 @@ class RhcCog(commands.Cog):
         priv = PRIVATE or not public
         lines = grading.report(storage.scan_events)
         await inter.response.send_message(fit_lines(lines, 1900), ephemeral=priv, suppress_embeds=True)
+
+    async def button_share(self, inter: discord.Interaction, ca: str) -> None:
+        """Post the bare contract address into the server's share channel.
+
+        The message is the address on its own — no symbol, no backticks, no
+        "shared by" — because the token bots that live in those channels
+        trigger on a plain address and anything wrapped around it is what stops
+        them firing. Who shared it goes in the private reply instead.
+        """
+        from .. import discovery
+        if inter.guild_id is None:
+            await inter.response.send_message("Share is a server thing; there is no channel to post to in a DM.",
+                                              ephemeral=True)
+            return
+        if not is_evm_address(ca):
+            await inter.response.send_message("That is not a Robinhood Chain token address.", ephemeral=True)
+            return
+        cfg = discovery.config_for(inter.guild_id)
+        target = int(getattr(cfg, "share_channel_id", 0) or 0)
+        if not target:
+            await inter.response.send_message(
+                "No share channel yet. A server manager can pick one with `/rh feed share #channel`.",
+                ephemeral=True)
+            return
+
+        key = (int(inter.guild_id), ca.lower())
+        now = time.time()
+        last = _shared_recently.get(key, 0.0)
+        if now - last < SHARE_COOLDOWN:
+            await inter.response.send_message(
+                f"Already shared to <#{target}> {age(now - last)} ago.", ephemeral=True)
+            return
+        # Claimed before the send, so two people pressing at once put one
+        # address in the channel rather than two.
+        _shared_recently[key] = now
+        if len(_shared_recently) > SHARE_MEMORY:
+            for old in sorted(_shared_recently, key=_shared_recently.get)[:SHARE_MEMORY // 2]:
+                _shared_recently.pop(old, None)
+
+        await inter.response.defer(thinking=True, ephemeral=True)
+        try:
+            ch = await self.bot.fetch_channel(target)
+            await ch.send(ca, allowed_mentions=discord.AllowedMentions.none())
+        except Exception as e:
+            _shared_recently.pop(key, None)          # it did not happen; let them try again
+            log.warning("Could not share %s to channel %s: %s: %s", ca, target, type(e).__name__, e)
+            await inter.followup.send(
+                f"Could not post to <#{target}> — McCap may not be able to send there. "
+                f"A manager can check its permissions or pick another channel with `/rh feed share`.",
+                ephemeral=True)
+            return
+        await inter.followup.send(f"📤 Shared to <#{target}>.", ephemeral=True)
 
     async def button_feed_vote(self, inter: discord.Interaction, eid: str, direction: str) -> None:
         """👍 / 👎 on one feed call. Pressing the same side again takes it back.

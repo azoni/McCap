@@ -410,6 +410,39 @@ class NavButton(discord.ui.DynamicItem[discord.ui.Button],
         await _safe(inter, body, self.custom_id)
 
 
+class ShareButton(discord.ui.DynamicItem[discord.ui.Button],
+                  template=rf"rh:share:(?P<token>{_EVM})"):
+    """Drop the bare contract address into the server's share channel.
+
+    The message is the address and nothing else, on purpose: the token bots
+    that live in those channels trigger on a plain address, and anything
+    wrapped around it — a name, a backtick, a "shared by" — is what stops them
+    firing. McCap's own context is already in the post this button sits under.
+    """
+
+    def __init__(self, token: str):
+        self.token = token
+        super().__init__(discord.ui.Button(
+            label="📤 Share", style=discord.ButtonStyle.secondary,
+            custom_id=f"rh:share:{token}", row=1,
+        ))
+
+    @classmethod
+    async def from_custom_id(cls, inter: discord.Interaction, item: discord.ui.Button, match: re.Match, /):
+        return cls(match["token"])
+
+    async def callback(self, inter: discord.Interaction) -> None:
+        await _safe(inter, lambda: _share_flow(inter, self.token), self.custom_id)
+
+
+async def _share_flow(inter: discord.Interaction, token: str) -> None:
+    cog = _cog(inter)
+    if cog is None:
+        await _private(inter, NOT_LOADED_TEXT)
+        return
+    await cog.button_share(inter, token)
+
+
 class FeedVoteButton(discord.ui.DynamicItem[discord.ui.Button],
                      template=r"rh:vote:(?P<eid>[0-9a-f]{6}):(?P<dir>up|down)"):
     """👍 / 👎 under a feed post: was this call worth making?
@@ -446,7 +479,7 @@ async def _vote_flow(inter: discord.Interaction, eid: str, direction: str) -> No
 
 
 DYNAMIC_ITEMS = (SellPctButton, SellMineButton, BuyUsdButton, BuyCustomButton, TpSlButton, TokenPickSelect,
-                 NavButton, FeedVoteButton)
+                 NavButton, FeedVoteButton, ShareButton)
 
 
 # ---------------- modals ----------------
@@ -681,7 +714,7 @@ def feed_row(token: str, eid: str, ups: int = 0, downs: int = 0, *, trade: bool 
     if trade:
         items += [BuyUsdButton(token, _cents(s)) for s in _ladder()[:2]]
         items += [SellMineButton(token, 50), SellMineButton(token, 100)]
-    items += [FeedVoteButton(eid, "up", ups), FeedVoteButton(eid, "down", downs)]
+    items += [FeedVoteButton(eid, "up", ups), FeedVoteButton(eid, "down", downs), ShareButton(token)]
     return _view(*items)
 
 
@@ -690,7 +723,7 @@ def alert_row(token: str) -> discord.ui.View:
     """Under a Robinhood Chain alert: the two smallest buy sizes plus [Sell 50%] [Sell all] for whoever clicks."""
     token = _require_token(token)
     items: List[discord.ui.Item] = [BuyUsdButton(token, _cents(s)) for s in _ladder()[:2]]
-    items += [SellMineButton(token, 50), SellMineButton(token, 100)]
+    items += [SellMineButton(token, 50), SellMineButton(token, 100), ShareButton(token)]
     return _view(*items)
 
 

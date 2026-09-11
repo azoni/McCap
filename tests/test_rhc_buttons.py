@@ -88,6 +88,10 @@ class FakeCog:
         self.calls.append(("modal_buy", inter.response.is_done(), token, usd_text, eth_text))
         await inter.followup.send("quote", ephemeral=True)
 
+    async def button_share(self, inter, ca):
+        self.calls.append(("button_share", ca))
+        await inter.response.send_message("shared", ephemeral=True)
+
     async def button_feed_vote(self, inter, eid, direction):
         self.calls.append(("button_feed_vote", (eid, direction)))
         await inter.response.send_message("counted", ephemeral=True)
@@ -151,6 +155,7 @@ GOOD_IDS = {
     views.TokenPickSelect: "rh:pick:trending",
     views.NavButton: "rh:nav:wallet_create",
     views.FeedVoteButton: "rh:vote:a1b2c3:up",
+    views.ShareButton: f"rh:share:{PONS}",
 }
 
 BAD_IDS = [
@@ -170,6 +175,8 @@ BAD_IDS = [
     "rh:vote:a1b2c3:sideways",              # not a direction
     "rh:vote:NOTHEX:up",                    # event ids are hex
     "rh:vote:a1b2c3d:up",                   # seven characters, not six
+    f"rh:share:{SOLANA}",                   # Solana address
+    "rh:share:",                            # no token at all
 ]
 
 
@@ -622,8 +629,9 @@ def test_alert_row_and_size_card_follow_the_ladder_under_the_cap(monkeypatch):
     monkeypatch.setattr(views, "RHC_MAX_TRADE_USD", 50.0)
     a = views.alert_row(PONS)
     assert [c.custom_id for c in a.children] == [
-        f"rh:buy:{PONS}:500", f"rh:buy:{PONS}:2000", f"rh:sellme:{PONS}:50", f"rh:sellme:{PONS}:100"]
-    assert [c.item.label for c in a.children] == ["Buy $5", "Buy $20", "Sell 50%", "Sell all"]
+        f"rh:buy:{PONS}:500", f"rh:buy:{PONS}:2000", f"rh:sellme:{PONS}:50", f"rh:sellme:{PONS}:100",
+        f"rh:share:{PONS}"]
+    assert [c.item.label for c in a.children] == ["Buy $5", "Buy $20", "Sell 50%", "Sell all", "📤 Share"]
     s = views.size_card(PONS)
     assert [c.custom_id for c in s.children] == [
         f"rh:buy:{PONS}:500", f"rh:buy:{PONS}:2000", f"rh:buy:{PONS}:4000", f"rh:buyx:{PONS}"]
@@ -706,7 +714,7 @@ def test_a_token_mccap_cannot_trade_still_gets_its_votes():
     this particular wallet can act on it."""
     v = views.feed_row(PONS, "a1b2c3", trade=False)
     kinds = [type(c).__name__ for c in v.children]
-    assert kinds == ["FeedVoteButton", "FeedVoteButton"]
+    assert kinds == ["FeedVoteButton", "FeedVoteButton", "ShareButton"]
 
 
 def test_the_vote_row_fits_discords_five_per_row_limit():
@@ -716,3 +724,12 @@ def test_the_vote_row_fits_discords_five_per_row_limit():
         rows.setdefault(c.item.row, []).append(c)
     assert all(len(items) <= 5 for items in rows.values()), rows
     assert all(len(c.item.label) <= 80 for c in v.children)
+
+
+@pytest.mark.asyncio
+async def test_the_share_button_hands_the_cog_the_token_it_sits_under():
+    cog = FakeCog()
+    item = await build(views.ShareButton, f"rh:share:{PONS}")
+    inter = click(cog)
+    await item.callback(inter)
+    assert cog.calls == [("button_share", PONS)]

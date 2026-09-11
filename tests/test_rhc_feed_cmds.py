@@ -243,3 +243,107 @@ def _done():
     async def noop():
         return None
     return noop()
+
+
+# ---------------- the Share button ----------------
+
+
+class Bot:
+    """A bot whose fetch_channel hands back a channel that records what it was sent."""
+
+    def __init__(self, fail=False):
+        self.fail = fail
+        self.sent = []
+        self.asked = []
+
+    async def fetch_channel(self, cid):
+        self.asked.append(cid)
+        if self.fail:
+            raise RuntimeError("missing permissions")
+        outer = self
+
+        class Ch:
+            async def send(self, content=None, **kw):
+                outer.sent.append((content, kw))
+        return Ch()
+
+
+async def share(inter, ca, bot):
+    await cog.RhcCog.button_share(cog.RhcCog(bot=bot), inter, ca)
+
+
+@pytest.fixture(autouse=True)
+def no_cooldown_carryover():
+    cog._shared_recently.clear()
+    yield
+    cog._shared_recently.clear()
+
+
+@pytest.mark.asyncio
+async def test_share_posts_the_address_on_its_own(feed_state):
+    """A symbol, a backtick or a "shared by" is exactly what stops the token
+    bots in those channels from firing, so the message is the address alone."""
+    discovery.set_config(discovery.FeedConfig(guild_id=1, channel_id=5, share_channel_id=777))
+    bot = Bot()
+    inter = Manager()
+    await share(inter, PONS, bot)
+    assert bot.asked == [777]
+    [(content, kw)] = bot.sent
+    assert content == PONS, "no name, no formatting, nothing wrapped around it"
+    assert "📤 Shared to <#777>" in inter.followup.sent[-1][0]
+
+
+@pytest.mark.asyncio
+async def test_share_needs_a_channel_to_have_been_chosen(feed_state):
+    discovery.set_config(discovery.FeedConfig(guild_id=1, channel_id=5))
+    bot = Bot()
+    inter = Manager()
+    await share(inter, PONS, bot)
+    assert bot.sent == [] and "/rh feed share" in inter.last
+
+
+@pytest.mark.asyncio
+async def test_the_same_token_is_not_repeated_into_the_channel(feed_state):
+    discovery.set_config(discovery.FeedConfig(guild_id=1, channel_id=5, share_channel_id=777))
+    bot = Bot()
+    await share(Manager(), PONS, bot)
+    second = Manager(user_id=USER + 1)
+    await share(second, PONS, bot)
+    assert len(bot.sent) == 1, "two people pressing is still one address in the channel"
+    assert "Already shared" in second.last
+
+
+@pytest.mark.asyncio
+async def test_a_channel_mccap_cannot_post_to_says_so_and_stays_retryable(feed_state):
+    discovery.set_config(discovery.FeedConfig(guild_id=1, channel_id=5, share_channel_id=777))
+    failing, inter = Bot(fail=True), Manager()
+    await share(inter, PONS, failing)
+    assert "Could not post" in inter.followup.sent[-1][0]
+    assert cog._shared_recently == {}, "it did not happen, so it must not be on cooldown"
+    working, again = Bot(), Manager()
+    await share(again, PONS, working)
+    assert [c for c, _ in working.sent] == [PONS]
+
+
+@pytest.mark.asyncio
+async def test_share_refuses_anything_that_is_not_a_chain_address(feed_state):
+    discovery.set_config(discovery.FeedConfig(guild_id=1, channel_id=5, share_channel_id=777))
+    bot, inter = Bot(), Manager()
+    await share(inter, "So11111111111111111111111111111111111111112", bot)
+    assert bot.sent == [] and "not a Robinhood Chain token" in inter.last
+
+
+@pytest.mark.asyncio
+async def test_choosing_a_share_channel_does_not_require_a_feed(feed_state):
+    inter = Manager()
+    ch = SimpleNamespace(id=4242)
+    await cog.RhcCog.feed_share.callback(cog.RhcCog(bot=None), inter, ch)
+    cfg = discovery.config_for(1)
+    assert cfg.share_channel_id == 4242 and cfg.enabled is False, "Share without running a feed"
+
+
+@pytest.mark.asyncio
+async def test_turning_the_feed_on_again_does_not_forget_where_share_posts(feed_state):
+    discovery.set_config(discovery.FeedConfig(guild_id=1, channel_id=5, share_channel_id=777))
+    await feed_on(Manager(), min_liquidity=9000)
+    assert discovery.config_for(1).share_channel_id == 777
