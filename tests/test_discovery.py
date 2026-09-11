@@ -213,6 +213,7 @@ def world(monkeypatch, tmp_path):
     monkeypatch.setattr(storage, "SCANS_FILE", str(tmp_path / "scans.json"))
     monkeypatch.setattr(storage, "DATA_DIR", tmp_path)
     monkeypatch.setattr(discovery, "FEED_ENABLE", True)
+    monkeypatch.setattr(discovery, "FETCH_SPACING", 0.0)   # the real one paces GeckoTerminal, not the suite
     discovery.configs.clear()
     discovery.seen.clear()
     discovery.pending.clear()
@@ -873,3 +874,54 @@ def test_what_people_vote_down_ranks_lower_next_time(world):
     picked, held = discovery.select([good, bad], cfg(max_per_hour=1), NOW)
     assert [c.symbol for c in picked] == ["GOOD"] and [c.symbol for c in held] == ["BAD"]
     grading.clear_cache()
+
+
+# ---------------- a refused request is not a blind tick ----------------
+
+
+@pytest.mark.asyncio
+async def test_a_tick_still_works_when_one_of_its_sources_was_refused(world):
+    """The provider refuses the tail of a burst, so the busiest-pools call was
+    losing every minute — and the tick threw away the sources that had already
+    answered. The feed went blind for the better part of an hour."""
+    m, chan, feed = world.market, world.chan, world.feed
+    discovery.configs[1] = cfg()
+    m.trending = [spike_pool()]
+    m.snaps[CA2] = snapshot(CA2, liq=50_000.0)
+    monkey_error(rhchain, "something was refused", ok_ts=NOW - 5)
+    await feed.tick(NOW)
+    assert len(chan.sent) == 1, "four good sources are still a listing"
+
+
+@pytest.mark.asyncio
+async def test_a_tick_stands_down_once_the_listing_is_genuinely_stale(world):
+    m, chan, feed = world.market, world.chan, world.feed
+    discovery.configs[1] = cfg()
+    m.trending = [spike_pool()]
+    m.snaps[CA2] = snapshot(CA2, liq=50_000.0)
+    monkey_error(rhchain, "everything is refused",
+                 ok_ts=NOW - discovery.FETCH_STALE_SECONDS - 1)
+    await feed.tick(NOW)
+    assert chan.sent == [], "this is history, not a listing"
+
+
+def monkey_error(mod, message, *, ok_ts):
+    mod.last_error = message
+    mod.last_error_ts = ok_ts
+    mod.last_ok_ts = ok_ts
+
+
+@pytest.mark.asyncio
+async def test_the_feed_paces_its_own_requests_rather_than_bursting(world, monkeypatch):
+    """It has a minute and spends about a second of it; the spacing is free."""
+    slept = []
+    monkeypatch.setattr(discovery, "FETCH_SPACING", 2.0)
+    monkeypatch.setattr(discovery.asyncio, "sleep", lambda s: slept.append(s) or _noop())
+    await world.feed._fetch(NOW)
+    assert slept == [2.0, 2.0], "between the three sources, not before the first"
+
+
+def _noop():
+    async def go():
+        return None
+    return go()

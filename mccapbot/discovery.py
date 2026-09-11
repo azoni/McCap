@@ -67,6 +67,13 @@ MAX_CONFIRMS_PER_TICK = 20      # DexScreener reads per tick, however many candi
 OVERFLOW_MULT = 2.0             # a busy hour may run to this much of the cap, never past it
 OVERFLOW_BAR = 1.5              # ... and only for finds this much stronger than the hour's median
 OFF_HIGH_WORTH_SAYING = 5.0     # within 5% of its high, a token has no dip worth a sentence
+# The tick has a minute and spends about a second of it. Presenting the provider
+# with five requests at once is what gets the last of them refused, and the tail
+# of the burst is the busiest-pools list the whole tick is built on.
+FETCH_SPACING = 2.0
+# How old the last good refresh may be before a tick is working from history
+# rather than a listing. One refused request out of five is not that.
+FETCH_STALE_SECONDS = 90
 RATE_WINDOW = 300               # status shows request rates averaged over this
 
 
@@ -676,8 +683,13 @@ class Feed:
 
             pools = await self._fetch(now)
             self.last_fetch_ts = now
-            if rhchain.last_error:
-                return                      # a cached list is not a fresh listing; status says stale
+            # A refusal on one of five requests used to throw away the four that
+            # worked: the tick bailed, and with the provider refusing the tail of
+            # every burst the feed went blind for the better part of an hour. What
+            # matters is whether this list is current, not whether every source
+            # answered — so bail when the last good refresh has actually aged out.
+            if not pools or (rhchain.last_error and now - (rhchain.last_ok_ts or 0.0) > FETCH_STALE_SECONDS):
+                return                      # working from history, not a listing; status says stale
             tokens = aggregate(pools)
             by_ca = {t.address: t for t in tokens}
 
@@ -741,11 +753,15 @@ class Feed:
 
     async def _fetch(self, now: float) -> List[Pool]:
         before = rhchain.request_count
-        new = await rhchain.new_pools(pages=RHCHAIN_NEW_PAGES)
-        trending = await rhchain.trending_pools("5m")
-        top = await rhchain.top_pools()
+        sources = []
+        for i, get in enumerate((lambda: rhchain.new_pools(pages=RHCHAIN_NEW_PAGES),
+                                 lambda: rhchain.trending_pools("5m"),
+                                 rhchain.top_pools)):
+            if i:
+                await asyncio.sleep(FETCH_SPACING)
+            sources.append(await get())
         self._count(self._gecko_ts, now, rhchain.request_count - before)
-        return rhchain.dedup_pools(new, trending, top)
+        return rhchain.dedup_pools(*sources)
 
     def _enqueue(self, cand: Candidate, now: float) -> bool:
         """A new pair at first sight goes to pending, never to the channel.
